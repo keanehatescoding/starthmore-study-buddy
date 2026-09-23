@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from sqlmodel import Session, select
 
 from app.llm import LLMClient
-from app.models import QuizItem, ReviewState
+from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic
 from app.srs import initial_ease_factor, next_interval_days, partial_credit_to_quality
 
 GRADE_SYSTEM = """You grade a student's short answer leniently on phrasing.
@@ -116,13 +116,32 @@ def submit_answer(
 
 
 def due_items(session: Session, user_id, limit: int = 20) -> list[QuizItem]:
-    """Review queue: new items (no ReviewState) first, then most-overdue."""
+    """Review queue: new items (no ReviewState) first, then most-overdue.
+
+    Scoped to the user's courses (owned or still-unclaimed pre-auth rows).
+    """
     now = datetime.now(timezone.utc)
+    owned_ids = {
+        c.id
+        for c in session.exec(
+            select(Course).where(
+                (Course.user_id == user_id) | (Course.user_id.is_(None))
+            )
+        ).all()
+    }
     states = {
         s.quiz_item_id: s
         for s in session.exec(select(ReviewState).where(ReviewState.user_id == user_id)).all()
     }
-    items = session.exec(select(QuizItem)).all()
+
+    def in_scope(item: QuizItem) -> bool:
+        chunk = session.get(Chunk, item.chunk_id)
+        resource = session.get(Resource, chunk.resource_id) if chunk else None
+        topic = session.get(Topic, resource.topic_id) if resource else None
+        course = session.get(Course, topic.course_id) if topic else None
+        return course is not None and course.id in owned_ids
+
+    items = [i for i in session.exec(select(QuizItem)).all() if in_scope(i)]
     new = [i for i in items if i.id not in states]
     overdue = sorted(
         (i for i in items if i.id in states and _aware(states[i.id].next_review_date) <= now),

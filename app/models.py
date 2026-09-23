@@ -28,9 +28,12 @@ class User(SQLModel, table=True):
 
 class Course(SQLModel, table=True):
     __tablename__ = "courses"
-    __table_args__ = (UniqueConstraint("source", "source_id", name="uq_courses_source"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "source", "source_id", name="uq_courses_user_source"),
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: Optional[uuid.UUID] = Field(default=None, foreign_key="users.id", index=True)
     source: str = Field(index=True)  # "moodle" | "classroom"
     source_id: str = Field(index=True)
     name: str

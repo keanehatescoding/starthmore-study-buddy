@@ -109,12 +109,19 @@ class SyncStats:
         return {f: getattr(self, f) for f in self.__dataclass_fields__}
 
 
-def _upsert_course(session: Session, source: str, data: CourseData) -> tuple[Course, bool]:
+def _upsert_course(
+    session: Session, source: str, user_id, data: CourseData
+) -> tuple[Course, bool]:
     course = session.exec(
-        select(Course).where(Course.source == source, Course.source_id == data.source_id)
+        select(Course).where(
+            Course.user_id == user_id,
+            Course.source == source,
+            Course.source_id == data.source_id,
+        )
     ).first()
     if course is None:
-        course = Course(source=source, source_id=data.source_id, name=data.name, code=data.code)
+        course = Course(user_id=user_id, source=source, source_id=data.source_id,
+                        name=data.name, code=data.code)
         session.add(course)
         session.commit()
         session.refresh(course)
@@ -127,7 +134,7 @@ def _upsert_course(session: Session, source: str, data: CourseData) -> tuple[Cou
 
 
 def sync_course(
-    session: Session, adapter: SourceAdapter, course_source_id: str
+    session: Session, adapter: SourceAdapter, course_source_id: str, user_id
 ) -> SyncStats:
     stats = SyncStats()
     source = adapter.source
@@ -137,7 +144,7 @@ def sync_course(
     )
     if course_data is None:
         raise ValueError(f"course {course_source_id!r} not found in source {source!r}")
-    course, is_new = _upsert_course(session, source, course_data)
+    course, is_new = _upsert_course(session, source, user_id, course_data)
     stats.courses_new += is_new
 
     topic_id_by_source: dict[str, Any] = {}
@@ -222,6 +229,6 @@ def sync_course(
     return stats
 
 
-def sync_all(session: Session, adapter: SourceAdapter) -> dict[str, SyncStats]:
-    return {c.source_id: sync_course(session, adapter, c.source_id)
+def sync_all(session: Session, adapter: SourceAdapter, user_id) -> dict[str, SyncStats]:
+    return {c.source_id: sync_course(session, adapter, c.source_id, user_id)
             for c in adapter.fetch_courses()}

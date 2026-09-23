@@ -2,17 +2,66 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, func, select
+from starlette.middleware.sessions import SessionMiddleware
 
+from app import auth as auth_mod
+from app.config import settings
 from app.db import get_session
 from app.grade import due_items, submit_answer
-from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic
-from app.stats import compute_stats, get_or_create_user
+from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic, User
+from app.stats import compute_stats
 
 app = FastAPI(title="Strathmore Study Buddy")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.secret_key,
+    same_site="lax",
+    https_only=settings.session_secure_cookie,
+)
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+
+
+def current_user(
+    request: Request, session: Session = Depends(get_session)
+) -> User:
+    user_id = request.session.get("user_id")
+    user = session.get(User, user_id) if user_id else None
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return user
+
+
+def owned_course(session: Session, user: User, course_id: UUID) -> Course:
+    course = session.get(Course, course_id)
+    if course is None or (
+        course.user_id is not None and course.user_id != user.id
+    ):
+        raise HTTPException(404, "course not found")
+    return course
+
+
+def owns_item(session: Session, user: User, item: QuizItem) -> bool:
+    chunk = session.get(Chunk, item.chunk_id)
+    resource = session.get(Resource, chunk.resource_id) if chunk else None
+    topic = session.get(Topic, resource.topic_id) if resource else None
+    course = session.get(Course, topic.course_id) if topic else None
+    return course is not None and (
+        course.user_id is None or course.user_id == user.id
+    )
+
+
+def _login_redirect(request: Request):
+    return RedirectResponse(url="/login", status_code=303)
+
+
+@app.exception_handler(401)
+async def unauthorized(request: Request, exc: HTTPException):
+    if request.url.path.startswith("/api"):
+        return HTMLResponse("login required", status_code=401)
+    return _login_redirect(request)
 
 
 @app.get("/health")
@@ -20,9 +69,58 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if request.session.get("user_id"):
+        return RedirectResponse(url="/", status_code=303)
+    return templates.TemplateResponse(request, "login.html", {})
+
+
+@app.get("/login/google")
+def login_google(request: Request):
+    state = auth_mod.new_state()
+    request.session["oauth_state"] = state
+    redirect_uri = str(request.url_for("auth_callback"))
+    return RedirectResponse(
+        auth_mod.login_url(settings.google_client_id, redirect_uri, state),
+        status_code=303,
+    )
+
+
+@app.get("/auth/callback")
+def auth_callback(
+    request: Request, session: Session = Depends(get_session),
+    code: str = "", state: str = "",
+):
+    if not code or state != request.session.pop("oauth_state", None):
+        raise HTTPException(400, "invalid oauth state")
+    redirect_uri = str(request.url_for("auth_callback"))
+    tokens = auth_mod.exchange_code(
+        settings.google_client_id, settings.google_client_secret, code, redirect_uri
+    )
+    email = auth_mod.fetch_email(tokens["access_token"])
+    user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
+    request.session["user_id"] = str(user.id)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
-def course_list(request: Request, session: Session = Depends(get_session)):
-    courses = session.exec(select(Course).order_by(Course.name)).all()
+def course_list(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    courses = session.exec(
+        select(Course)
+        .where((Course.user_id == user.id) | (Course.user_id.is_(None)))
+        .order_by(Course.name)
+    ).all()
     counts: dict[str, dict] = {}
     for c in courses:
         n_topics = session.exec(
@@ -42,11 +140,12 @@ def course_list(request: Request, session: Session = Depends(get_session)):
 
 @app.get("/courses/{course_id}", response_class=HTMLResponse)
 def course_detail(
-    course_id: UUID, request: Request, session: Session = Depends(get_session)
+    course_id: UUID,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
 ):
-    course = session.get(Course, course_id)
-    if course is None:
-        raise HTTPException(404, "course not found")
+    course = owned_course(session, user, course_id)
     topics = session.exec(
         select(Topic).where(Topic.course_id == course.id).order_by(Topic.order)
     ).all()
@@ -74,13 +173,18 @@ def course_detail(
 
 @app.get("/resources/{resource_id}", response_class=HTMLResponse)
 def resource_detail(
-    resource_id: UUID, request: Request, session: Session = Depends(get_session)
+    resource_id: UUID,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
 ):
     resource = session.get(Resource, resource_id)
-    if resource is None:
-        raise HTTPException(404, "resource not found")
-    topic = session.get(Topic, resource.topic_id)
+    topic = session.get(Topic, resource.topic_id) if resource else None
     course = session.get(Course, topic.course_id) if topic else None
+    if resource is None or course is None or (
+        course.user_id is not None and course.user_id != user.id
+    ):
+        raise HTTPException(404, "resource not found")
     chunks = session.exec(
         select(Chunk).where(Chunk.resource_id == resource.id).order_by(Chunk.order)
     ).all()
@@ -91,21 +195,23 @@ def resource_detail(
     )
 
 
-def _user(session: Session):
-    return get_or_create_user(session)
-
-
 @app.get("/review", response_class=HTMLResponse)
-def review_queue(request: Request, session: Session = Depends(get_session)):
-    user = _user(session)
+def review_queue(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
     return templates.TemplateResponse(
         request, "review.html", {"items": due_items(session, user.id)}
     )
 
 
 @app.get("/review/take", response_class=HTMLResponse)
-def review_take(request: Request, session: Session = Depends(get_session)):
-    user = _user(session)
+def review_take(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
     queue = due_items(session, user.id)
     if not queue:
         return templates.TemplateResponse(request, "review.html", {"items": []})
@@ -117,17 +223,18 @@ def review_take(request: Request, session: Session = Depends(get_session)):
 
 @app.post("/review/{item_id}/answer", response_class=HTMLResponse)
 async def review_answer(
-    item_id: UUID, request: Request, session: Session = Depends(get_session)
+    item_id: UUID,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
 ):
-    user = _user(session)
     form = await request.form()
     answer = str(form.get("answer", ""))
     item = session.get(QuizItem, item_id)
-    if item is None:
+    if item is None or not owns_item(session, user, item):
         raise HTTPException(404, "quiz item not found")
     llm = None
     if item.question_type == "short_answer":
-        from app.config import settings
         from app.llm import LLMClient
 
         llm = LLMClient(
@@ -142,8 +249,11 @@ async def review_answer(
 
 
 @app.get("/stats", response_class=HTMLResponse)
-def stats_page(request: Request, session: Session = Depends(get_session)):
-    user = _user(session)
+def stats_page(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
     return templates.TemplateResponse(
         request, "stats.html",
         {"stats": compute_stats(session, user.id),

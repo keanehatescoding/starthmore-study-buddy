@@ -36,16 +36,16 @@ podman-compose up -d db
 .venv/bin/uvicorn app.main:app --port 8000
 ```
 
-Sync one course, then run the pipeline:
+Sync one course, then run the pipeline (replace `YOU@X` with your login email):
 
 ```bash
-.venv/bin/python -m app.sync_cli --source moodle --course 7034
+.venv/bin/python -m app.sync_cli --source moodle --user YOU@X --course 7034
 .venv/bin/python -m app.pipeline --source moodle --course 7034
 .venv/bin/python -m app.worker   # send queued notifications
 ```
 
-Open http://localhost:8000 — courses → topics → resources/chunks, plus
-`/review` (due queue) and `/stats`.
+Open http://localhost:8000 — sign in with Google, then browse courses →
+topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 
 ## Configuration (.env)
 

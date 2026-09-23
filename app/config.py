@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     email_from: str = ""
     email_to: str = ""
+    secret_key: str = "dev-insecure-change-me"
+    session_secure_cookie: bool = False
 
 
 settings = Settings()

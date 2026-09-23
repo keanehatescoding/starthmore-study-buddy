@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.models import Assignment, Course, Resource, Topic
+from app.models import Assignment, Course, Resource, Topic, User
 from app.sync import (
     AssignmentData,
     CourseData,
@@ -13,6 +13,7 @@ from app.sync import (
     TopicData,
     content_hash,
     link_type,
+    sync_all,
     sync_course,
 )
 
@@ -53,8 +54,17 @@ def session():
         yield s
 
 
-def test_first_sync_inserts(session):
-    stats = sync_course(session, FakeAdapter(), "c1")
+@pytest.fixture()
+def user_id(session):
+    user = User(email="s@x.edu")
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user.id
+
+
+def test_first_sync_inserts(session, user_id):
+    stats = sync_course(session, FakeAdapter(), "c1", user_id)
     assert (stats.courses_new, stats.topics_new) == (1, 1)
     assert stats.resources_new == 3
     assert stats.assignments_new == 1
@@ -65,30 +75,43 @@ def test_first_sync_inserts(session):
     assert asg.title == "Assignment 1"  # deadlines never land in resources
 
 
-def test_second_sync_skips_everything(session):
+def test_second_sync_skips_everything(session, user_id):
     adapter = FakeAdapter()
-    sync_course(session, adapter, "c1")
-    stats = sync_course(session, adapter, "c1")
+    sync_course(session, adapter, "c1", user_id)
+    stats = sync_course(session, adapter, "c1", user_id)
     assert stats.resources_new == 0 and stats.resources_updated == 0
     assert stats.resources_skipped == 3
 
 
-def test_changed_content_requeues(session):
+def test_changed_content_requeues(session, user_id):
     adapter = FakeAdapter()
-    sync_course(session, adapter, "c1")
+    sync_course(session, adapter, "c1", user_id)
     adapter.resources[("c1", "t1")][0] = ResourceData(
         "t1", "r-file", "file", "trees.pdf",
         raw_url="https://x/f.pdf",
         content_bytes="v2 — lecturer updated slides".encode("utf-8"))
-    stats = sync_course(session, adapter, "c1")
+    stats = sync_course(session, adapter, "c1", user_id)
     assert (stats.resources_updated, stats.resources_skipped) == (1, 2)
     updated = session.exec(select(Resource).where(Resource.source_id == "r-file")).one()
     assert updated.status == "pending" and updated.extracted_text is None
 
 
-def test_unknown_course_raises(session):
+def test_unknown_course_raises(session, user_id):
     with pytest.raises(ValueError):
-        sync_course(session, FakeAdapter(), "nope")
+        sync_course(session, FakeAdapter(), "nope", user_id)
+
+
+def test_same_source_course_per_user(session, user_id):
+    other = User(email="other@x.edu")
+    session.add(other)
+    session.commit()
+    session.refresh(other)
+    sync_course(session, FakeAdapter(), "c1", user_id)
+    stats = sync_course(session, FakeAdapter(), "c1", other.id)
+    assert stats.courses_new == 1  # no unique-clash across users
+    mine = session.exec(
+        select(Course).where(Course.user_id == user_id)).all()
+    assert len(mine) == 1
 
 
 def test_link_type():
