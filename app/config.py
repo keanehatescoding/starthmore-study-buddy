@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     email_to: str = ""
     secret_key: str = "dev-insecure-change-me"
     session_secure_cookie: bool = False
+    allowed_emails: str = ""  # comma-separated; empty = any Google account may sign in
+    healthcheck_ping_url: str = ""  # e.g. healthchecks.io ping on worker success
 
 
 settings = Settings()

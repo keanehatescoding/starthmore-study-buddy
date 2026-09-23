@@ -49,6 +49,17 @@ Backups (nightly pg_dump, 14-day retention):
 - Rate limiting is per-process memory (120 POSTs/min/IP default). Behind
   multiple uvicorn workers put a shared limiter or a proxy limit in front,
   and set the client IP from `X-Forwarded-For` (currently `request.client`).
+- CI (`.github/workflows/ci.yml`) runs migrations + `alembic check` + the
+  full suite on Postgres 16 for every push/PR.
+- `/health` checks Postgres and returns 503 when unreachable — safe to use
+  for platform restart decisions.
+- Personal-tool mode: set `ALLOWED_EMAILS` to your address so random Google
+  accounts get 403 at the callback instead of an empty session.
+- Cron observability: set `HEALTHCHECK_PING_URL` (e.g. a healthchecks.io
+  check) — the worker pings it after every successful pass, so a silent
+  6am failure pages you instead of showing up as missing quizzes.
+  multiple uvicorn workers put a shared limiter or a proxy limit in front,
+  and set the client IP from `X-Forwarded-For` (currently `request.client`).
 - Web UI requires Google sign-in (`/login`). Generate a real secret:
   `openssl rand -hex 32` → `SECRET_KEY`. Set `SESSION_SECURE_COOKIE=true`
   behind HTTPS. The Google OAuth consent screen must list your production

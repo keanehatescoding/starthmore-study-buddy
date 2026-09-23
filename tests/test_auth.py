@@ -72,3 +72,75 @@ def test_cross_user_isolation(testapp):
         cid = str(course.id)
     assert client.get(f"/courses/{cid}").status_code == 404
     assert "Other course" not in client.get("/").text
+
+
+def _callback_client(email: str, monkeypatch):
+    """TestClient with a signed session holding oauth_state + mocked Google."""
+    import json
+    from base64 import b64encode
+
+    import itsdangerous
+    from fastapi.testclient import TestClient
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from app.config import settings
+    from app.db import get_session
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def override():
+        with Session(engine) as s:
+            yield s
+
+    app.dependency_overrides[get_session] = override
+    monkeypatch.setattr(
+        auth_mod, "exchange_code", lambda *a: {"access_token": "tok"}
+    )
+    monkeypatch.setattr(auth_mod, "fetch_email", lambda tok: email)
+    client = TestClient(app, follow_redirects=False)
+    signer = itsdangerous.TimestampSigner(str(settings.secret_key))
+    raw = b64encode(json.dumps({"oauth_state": "s1"}).encode()).decode()
+    client.cookies.set("session", signer.sign(raw).decode())
+    return client
+
+
+def test_allowlist_blocks_stranger(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "allowed_emails", "owner@x.edu")
+    client = _callback_client("stranger@x.com", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 403
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_allowlist_permits_owner(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "allowed_emails", "owner@x.edu")
+    client = _callback_client("owner@x.edu", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 303 and r.headers["location"] == "/"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_empty_allowlist_permits_anyone(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("anyone@x.com", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 303
+    finally:
+        app.dependency_overrides.clear()

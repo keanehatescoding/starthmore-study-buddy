@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import urllib.request
 
 from sqlmodel import Session, select
 
@@ -17,6 +18,18 @@ from app.db import engine
 from app.jobs import run_due
 from app.models import User
 from app.notify import check_review_due, send_pending
+
+
+def ping_healthcheck() -> None:
+    """Notify a dead-man's-switch monitor (e.g. healthchecks.io) on success.
+    Monitoring must never fail the run."""
+    url = settings.healthcheck_ping_url
+    if not url:
+        return
+    try:
+        urllib.request.urlopen(url, timeout=10).read()
+    except Exception:
+        pass
 
 
 def run_once() -> dict:
@@ -30,6 +43,7 @@ def run_once() -> dict:
             session, settings.resend_api_key, settings.email_from,
             settings.email_to,  # fallback only; owned events go to User.email
         )
+    ping_healthcheck()
     return summary
 
 

@@ -5,7 +5,7 @@ import hmac
 import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, func, select
 from starlette.middleware.sessions import SessionMiddleware
@@ -28,6 +28,14 @@ app.add_middleware(
     https_only=settings.session_secure_cookie,
 )
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+
+
+def allowed_emails() -> set[str]:
+    return {
+        e.strip().lower()
+        for e in settings.allowed_emails.split(",")
+        if e.strip()
+    }
 
 
 def current_user(
@@ -80,7 +88,14 @@ async def unauthorized(request: Request, exc: HTTPException):
 
 
 @app.get("/health")
-def health():
+def health(session: Session = Depends(get_session)):
+    # Platform restart decisions use this: verify Postgres is actually reachable.
+    try:
+        session.exec(select(User.id)).first()
+    except Exception:
+        return JSONResponse(
+            {"status": "degraded", "db": "unreachable"}, status_code=503
+        )
     return {"status": "ok"}
 
 
@@ -114,6 +129,9 @@ def auth_callback(
         settings.google_client_id, settings.google_client_secret, code, redirect_uri
     )
     email = auth_mod.fetch_email(tokens["access_token"])
+    allowed = allowed_emails()
+    if allowed and email.lower() not in allowed:
+        raise HTTPException(403, "sign-in not allowed for this account")
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
     request.session["user_id"] = str(user.id)
     return RedirectResponse(url="/", status_code=303)
