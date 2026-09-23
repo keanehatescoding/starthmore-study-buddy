@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Stats — Study Buddy{% endblock %}
+{% block body %}
+<h1>Stats</h1>
+<ul class="clean">
+<li>Quiz items: {{ stats.items_total }}</li>
+<li>Answered: {{ stats.answered }}</li>
+<li>Accuracy: {{ (stats.accuracy * 100)|round(1) ~ "%" if stats.accuracy is not none else "—" }}</li>
+<li>Streak: {{ stats.streak_days }} day(s)</li>
+<li>Lapses: {{ stats.lapses }}</li>
+<li>Due now: {{ due }}</li>
+</ul>
+{% endblock %}

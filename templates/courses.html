@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Courses — Study Buddy{% endblock %}
+{% block body %}
+<h1>Courses</h1>
+<ul class="clean">
+{% for c in courses %}
+<li><a href="/courses/{{ c.id }}">{{ c.name }}</a>
+  <span class="badge">{{ c.source }}</span>
+  {% if c.code %}<span class="badge">{{ c.code }}</span>{% endif %}
+  <small>({{ counts[c.id|string].topics }} topics, {{ counts[c.id|string].resources }} resources)</small></li>
+{% else %}
+<li>No courses synced yet. Run <code>python -m app.sync_cli --source moodle</code>.</li>
+{% endfor %}
+</ul>
+{% endblock %}

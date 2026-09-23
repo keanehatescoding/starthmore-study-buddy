@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Answer — Study Buddy{% endblock %}
+{% block body %}
+<p><small>{{ remaining }} due after this one · <a href="/review">queue</a></small></p>
+<h1>{{ item.question }}</h1>
+<p><span class="badge">{{ item.question_type }}</span>
+<span class="badge">{{ item.difficulty }}</span></p>
+
+{% if result %}
+<h2>{{ "✓ Correct" if result.correct else "✗ " + result.verdict|capitalize }}</h2>
+<p>{{ result.feedback }}</p>
+<p><small>Next review in {{ result.interval_days }} day(s).</small></p>
+<p><a href="/review/take">Next →</a></p>
+{% else %}
+<form method="post" action="/review/{{ item.id }}/answer">
+{% if item.question_type == "mcq" %}
+{% for o in item.options %}
+<label><input type="radio" name="answer" value="{{ loop.index0 }}" required> {{ o }}</label><br>
+{% endfor %}
+{% else %}
+<textarea name="answer" rows="4" cols="60" required placeholder="Type your answer…"></textarea><br>
+{% endif %}
+<button type="submit">Submit</button>
+</form>
+{% endif %}
+{% endblock %}

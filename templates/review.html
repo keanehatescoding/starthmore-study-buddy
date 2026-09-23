@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Review — Study Buddy{% endblock %}
+{% block body %}
+<h1>Review queue ({{ items|length }} due)</h1>
+{% if items %}
+<p><a href="/review/take">Start reviewing →</a></p>
+<ul class="clean">
+{% for i in items %}
+<li><span class="badge">{{ i.question_type }}</span>
+  <span class="badge">{{ i.difficulty }}</span>
+  {{ i.question[:100] }}{% if i.question|length > 100 %}…{% endif %}</li>
+{% endfor %}
+</ul>
+{% else %}
+<p>Nothing due. 🎉</p>
+{% endif %}
+{% endblock %}

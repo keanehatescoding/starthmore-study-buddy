@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Study Buddy{% endblock %}</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+a { color: #1a56db; } a:visited { color: #5b21b6; }
+.badge { display: inline-block; font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; background: #eee; }
+.badge.pending { background: #fef3c7; } .badge.extracted { background: #d1fae5; }
+.badge.failed, .badge.skipped { background: #fee2e2; }
+.topic { margin-top: 1.5rem; } .topic h2 { font-size: 1.1rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+ul.clean { list-style: none; padding-left: 0; } ul.clean li { margin: 0.3rem 0; }
+pre.text { white-space: pre-wrap; background: #f8f8f8; padding: 1rem; border-radius: 6px; max-height: 60vh; overflow: auto; }
+nav.breadcrumb { font-size: 0.85rem; color: #555; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<nav class="breadcrumb"><a href="/">Courses</a> · <a href="/review">Review</a> · <a href="/stats">Stats</a></nav>
+{% block body %}{% endblock %}
+</body>
+</html>

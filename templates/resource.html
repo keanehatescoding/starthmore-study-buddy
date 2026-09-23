@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ resource.title }} — Study Buddy{% endblock %}
+{% block body %}
+<nav class="breadcrumb"><a href="/">Courses</a> / <a href="/courses/{{ course.id }}">{{ course.name }}</a> / {{ resource.title }}</nav>
+<h1>{{ resource.title }}</h1>
+<p><span class="badge">{{ resource.type }}</span>
+<span class="badge {{ resource.status }}">{{ resource.status }}</span>
+{% if resource.mime_type %}<span class="badge">{{ resource.mime_type }}</span>{% endif %}</p>
+{% if resource.raw_url %}<p>Source: <a href="{{ resource.raw_url }}">{{ resource.raw_url[:80] }}</a></p>{% endif %}
+{% if resource.error %}<p><strong>Error:</strong> {{ resource.error }}</p>{% endif %}
+{% if resource.extracted_text %}
+<h2>Extracted text</h2>
+<pre class="text">{{ resource.extracted_text[:20000] }}</pre>
+{% else %}
+<p><small>No extracted text yet — extraction runs in Phase 2.</small></p>
+{% endif %}
+{% if chunks %}
+<h2>Chunks ({{ chunks|length }})</h2>
+<ul class="clean">
+{% for c in chunks %}
+<li><strong>{{ c.title }}</strong>
+  <small>({{ c.content|length }} chars{% if c.start_char is not none %}, source @{{ c.start_char }}–{{ c.end_char }}{% endif %})</small><br>
+  <small>{{ c.content[:220] }}{% if c.content|length > 220 %}…{% endif %}</small></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

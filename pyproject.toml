@@ -1,0 +1,38 @@
+[project]
+name = "starthmore-study-buddy"
+version = "0.1.0"
+description = "Study assistant pulling course material from Moodle + Classroom, with spaced-repetition quizzes."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlmodel>=0.0.22",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "pydantic-settings>=2.5",
+    "python-multipart>=0.0.18",
+    "jinja2>=3.1",
+    "httpx>=0.28",
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.0",
+    "pypdf>=4.0",
+    "python-pptx>=1.0",
+    "python-docx>=1.1",
+    "youtube-transcript-api>=1.0",
+    "pytest>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.alembic]
+script_location = "alembic"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

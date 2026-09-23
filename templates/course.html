@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ course.name }} — Study Buddy{% endblock %}
+{% block body %}
+<nav class="breadcrumb"><a href="/">Courses</a> / {{ course.name }}</nav>
+<h1>{{ course.name }}</h1>
+<p><span class="badge">{{ course.source }}</span>
+{% if course.code %}<span class="badge">{{ course.code }}</span>{% endif %}</p>
+
+{% for t in topics %}
+<div class="topic">
+<h2>{{ t.title }}</h2>
+<ul class="clean">
+{% for r in resources_by_topic[t.id|string] %}
+<li><a href="/resources/{{ r.id }}">{{ r.title }}</a>
+  <span class="badge">{{ r.type }}</span>
+  <span class="badge {{ r.status }}">{{ r.status }}</span></li>
+{% else %}
+<li><small>No resources.</small></li>
+{% endfor %}
+</ul>
+</div>
+{% endfor %}
+
+{% if assignments %}
+<h2>Assignments</h2>
+<ul class="clean">
+{% for a in assignments %}
+<li>{{ a.title }}{% if a.due_date %} — due {{ a.due_date.strftime('%Y-%m-%d %H:%M UTC') }}{% endif %}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}
