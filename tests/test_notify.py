@@ -1,5 +1,7 @@
 """Phase 6 tests: batching, threshold, dedupe, delivery (fake sender)."""
 
+import uuid
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -88,6 +90,43 @@ def test_send_failure_stays_queued(session, monkeypatch):
     user, course = _course_with_items(session, n_chunks=1)
     notify.enqueue_new_material(session, course.id, 2)
     out = notify.send_pending(session, "", "from@x", "to@x")
+    assert out == {"sent": 0, "failed": 1}
+    assert session.exec(select(NotificationEvent)).one().sent is False
+
+
+def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        notify, "send_email",
+        lambda api, frm, to, subj, body: seen.append(to),
+    )
+    other = User(email="other@x.edu")
+    session.add(other)
+    session.commit()
+    session.refresh(other)
+    owned = Course(user_id=other.id, source="moodle", source_id="owned",
+                   name="Owned", code="OWN")
+    session.add(owned)
+    session.commit()
+    session.refresh(owned)
+    event = notify.enqueue_new_material(session, owned.id, 3)
+    assert event.user_id == other.id
+    out = notify.send_pending(session, "key", "from@x", "fallback@x")
+    assert out == {"sent": 1, "failed": 0}
+    assert seen == ["other@x.edu"]
+
+
+def test_send_without_recipient_stays_queued(session, monkeypatch):
+    monkeypatch.setattr(
+        notify, "send_email",
+        lambda *a: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+    # stale reference: user row gone, no fallback -> cannot deliver
+    orphan = NotificationEvent(user_id=uuid.UUID(int=0),
+                               type="review_due", payload={"due_count": 9})
+    session.add(orphan)
+    session.commit()
+    out = notify.send_pending(session, "key", "from@x", "")
     assert out == {"sent": 0, "failed": 1}
     assert session.exec(select(NotificationEvent)).one().sent is False
 

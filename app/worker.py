@@ -25,7 +25,8 @@ def run_once() -> dict:
             if check_review_due(session, user.id) is not None:
                 summary["review_due_events"] += 1
         summary["send"] = send_pending(
-            session, settings.resend_api_key, settings.email_from, settings.email_to
+            session, settings.resend_api_key, settings.email_from,
+            settings.email_to,  # fallback only; owned events go to User.email
         )
     return summary
 

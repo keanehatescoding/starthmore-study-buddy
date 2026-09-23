@@ -1,5 +1,6 @@
 """Phase 5 tests: review queue, answering (MCQ), stats."""
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
@@ -32,6 +33,12 @@ def _seed(Session):
         return str(mcq.id)
 
 
+def _token(client):
+    page = client.get("/review/take")
+    assert page.status_code == 200
+    return re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+
+
 def test_review_flow(testapp):
     client, Session = testapp["client"], testapp["Session"]
     item_id = _seed(Session)
@@ -42,7 +49,8 @@ def test_review_flow(testapp):
     r = client.get("/review/take")
     assert r.status_code == 200 and 'name="answer"' in r.text
 
-    r = client.post(f"/review/{item_id}/answer", data={"answer": "1"})
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "1", "csrf_token": _token(client)})
     assert r.status_code == 200 and "Correct" in r.text and "Because b." in r.text
 
     r = client.get("/review")
@@ -55,7 +63,8 @@ def test_review_flow(testapp):
 def test_review_wrong_answer(testapp):
     client, Session = testapp["client"], testapp["Session"]
     item_id = _seed(Session)
-    r = client.post(f"/review/{item_id}/answer", data={"answer": "0"})
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "0", "csrf_token": _token(client)})
     assert "Incorrect" in r.text
 
 

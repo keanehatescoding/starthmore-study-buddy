@@ -13,6 +13,7 @@
 <p><a href="/review/take">Next →</a></p>
 {% else %}
 <form method="post" action="/review/{{ item.id }}/answer">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 {% if item.question_type == "mcq" %}
 {% for o in item.options %}
 <label><input type="radio" name="answer" value="{{ loop.index0 }}" required> {{ o }}</label><br>

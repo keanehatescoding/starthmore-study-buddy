@@ -56,12 +56,17 @@ def send_email(api_key: str, from_addr: str, to_addr: str, subject: str, body: s
 
 
 def enqueue_new_material(session: Session, course_id, new_items: int) -> NotificationEvent | None:
-    """One batched event per course. Returns None when nothing new."""
+    """One batched event per course, owned by the course owner. Returns None when nothing new."""
     if new_items <= 0:
         return None
     course = session.get(Course, course_id)
+    owner_id = (
+        course.user_id
+        if course is not None and course.user_id is not None
+        else _first_user_id(session)
+    )
     event = NotificationEvent(
-        user_id=_first_user_id(session),
+        user_id=owner_id,
         type="new_material",
         payload={"course": course.name if course else str(course_id),
                  "code": course.code if course else None,
@@ -125,13 +130,26 @@ def render(event: NotificationEvent) -> tuple[str, str]:
     raise EmailError(f"unknown event type {event.type!r}")
 
 
-def send_pending(session: Session, api_key: str, from_addr: str, to_addr: str) -> dict:
-    """Send all unsent events. Failures stay queued for the next pass."""
+def recipient_for(session: Session, event: NotificationEvent, fallback: str = "") -> str:
+    """Per-user recipient: the event owner's email, else the fallback."""
+    if event.user_id is not None:
+        user = session.get(User, event.user_id)
+        if user is not None and user.email:
+            return user.email
+    return fallback
+
+
+def send_pending(session: Session, api_key: str, from_addr: str, fallback_to: str = "") -> dict:
+    """Send all unsent events, each to its owner's email. Failures stay queued."""
     counts = {"sent": 0, "failed": 0}
     events = session.exec(
         select(NotificationEvent).where(NotificationEvent.sent == False)  # noqa: E712
     ).all()
     for event in events:
+        to_addr = recipient_for(session, event, fallback_to)
+        if not to_addr:
+            counts["failed"] += 1
+            continue
         try:
             subject, body = render(event)
             send_email(api_key, from_addr, to_addr, subject, body)

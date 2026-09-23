@@ -1,6 +1,9 @@
 from pathlib import Path
 from uuid import UUID
 
+import hmac
+import secrets
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -55,6 +58,15 @@ def owns_item(session: Session, user: User, item: QuizItem) -> bool:
 
 def _login_redirect(request: Request):
     return RedirectResponse(url="/login", status_code=303)
+
+
+def csrf_token(request: Request) -> str:
+    """Per-session CSRF token, minted lazily and checked on every POST."""
+    token = request.session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
 
 
 @app.exception_handler(401)
@@ -217,7 +229,8 @@ def review_take(
         return templates.TemplateResponse(request, "review.html", {"items": []})
     return templates.TemplateResponse(
         request, "take.html",
-        {"item": queue[0], "remaining": len(queue) - 1, "result": None},
+        {"item": queue[0], "remaining": len(queue) - 1, "result": None,
+         "csrf_token": csrf_token(request)},
     )
 
 
@@ -229,6 +242,10 @@ async def review_answer(
     user: User = Depends(current_user),
 ):
     form = await request.form()
+    submitted = str(form.get("csrf_token", ""))
+    expected = str(request.session.get("csrf_token", ""))
+    if not expected or not hmac.compare_digest(submitted, expected):
+        raise HTTPException(403, "invalid csrf token")
     answer = str(form.get("answer", ""))
     item = session.get(QuizItem, item_id)
     if item is None or not owns_item(session, user, item):
@@ -244,7 +261,8 @@ async def review_answer(
     queue = due_items(session, user.id)
     return templates.TemplateResponse(
         request, "take.html",
-        {"item": item, "remaining": len(queue), "result": result},
+        {"item": item, "remaining": len(queue), "result": result,
+         "csrf_token": csrf_token(request)},
     )
 
 
