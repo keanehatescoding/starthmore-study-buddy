@@ -40,14 +40,27 @@ def main() -> None:
     parser.add_argument("--source", choices=["moodle", "classroom"], required=True)
     parser.add_argument("--user", required=True, help="owner email for synced courses")
     parser.add_argument("--course", default=None, help="source course id (default: all)")
+    parser.add_argument("--enqueue", action="store_true",
+                        help="queue a sync job for the worker instead of running inline")
     args = parser.parse_args()
-
-    from app.sync import sync_all, sync_course
 
     with Session(engine) as session:
         user = session.exec(select(User).where(User.email == args.user)).first()
         if user is None:
             raise SystemExit(f"no such user {args.user} — log in via the web UI first")
+        if args.enqueue:
+            from app.jobs import enqueue
+
+            job = enqueue(session, "sync", {
+                "source": args.source,
+                "course_id": args.course,
+                "user_email": args.user,
+            })
+            print(f"enqueued {job.id} (run `python -m app.worker` to drain)")
+            return
+
+        from app.sync import sync_all, sync_course
+
         adapter = build_adapter(args.source, user)
         if args.course:
             stats = sync_course(session, adapter, args.course, user.id)

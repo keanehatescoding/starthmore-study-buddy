@@ -15,9 +15,12 @@ from app.config import settings
 from app.db import get_session
 from app.grade import due_items, submit_answer
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic, User
+from app.security import RateLimitMiddleware, SecurityHeadersMiddleware
 from app.stats import compute_stats
 
 app = FastAPI(title="Strathmore Study Buddy")
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.secret_key,

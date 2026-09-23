@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 
 from app.config import settings
 from app.db import engine
+from app.jobs import run_due
 from app.models import User
 from app.notify import check_review_due, send_pending
 
@@ -21,6 +22,7 @@ from app.notify import check_review_due, send_pending
 def run_once() -> dict:
     summary: dict = {"review_due_events": 0}
     with Session(engine) as session:
+        summary["jobs"] = run_due(session)  # queued sync/notify jobs first
         for user in session.exec(select(User)).all():
             if check_review_due(session, user.id) is not None:
                 summary["review_due_events"] += 1

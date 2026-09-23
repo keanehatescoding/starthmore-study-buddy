@@ -63,7 +63,8 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 - `app/sync.py`, `app/moodle.py`, `app/classroom.py` — ingestion
 - `app/extract.py`, `app/chunk.py`, `app/quiz.py` — learning pipeline
 - `app/grade.py`, `app/srs.py`, `app/stats.py` — review + scheduling
-- `app/notify.py`, `app/worker.py` — notifications
+- `app/notify.py`, `app/worker.py`, `app/jobs.py` — notifications + job queue
+- `app/auth.py`, `app/security.py` — Google sign-in, CSRF, rate limiting, headers
 - `app/main.py`, `templates/` — server-rendered UI
 - `alembic/versions/` — migrations (canonical schema)
 
