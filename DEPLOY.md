@@ -58,8 +58,6 @@ Backups (nightly pg_dump, 14-day retention):
 - Cron observability: set `HEALTHCHECK_PING_URL` (e.g. a healthchecks.io
   check) — the worker pings it after every successful pass, so a silent
   6am failure pages you instead of showing up as missing quizzes.
-  multiple uvicorn workers put a shared limiter or a proxy limit in front,
-  and set the client IP from `X-Forwarded-For` (currently `request.client`).
 - Web UI requires Google sign-in (`/login`). Generate a real secret:
   `openssl rand -hex 32` → `SECRET_KEY`. Set `SESSION_SECURE_COOKIE=true`
   behind HTTPS. The Google OAuth consent screen must list your production
