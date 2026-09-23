@@ -12,6 +12,7 @@ def test_security_headers_present(testapp):
     assert r.headers["X-Frame-Options"] == "DENY"
     assert r.headers["Referrer-Policy"] == "same-origin"
     assert "camera=()" in r.headers["Permissions-Policy"]
+    assert "frame-ancestors 'none'" in r.headers["Content-Security-Policy"]
 
 
 def test_post_rate_limit_429s_then_recovers(testapp):

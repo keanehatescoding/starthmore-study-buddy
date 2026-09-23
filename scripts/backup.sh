@@ -9,11 +9,14 @@ BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/backups}"
 KEEP_DAYS="${KEEP_DAYS:-14}"
 
 mkdir -p "$BACKUP_DIR"
-if [ -f "$APP_DIR/.env" ]; then
-    # shellcheck disable=SC1090
+# Ambient env wins; then .env; then the app default (see app/config.py).
+if [ -z "${DATABASE_URL:-}" ] && [ -f "$APP_DIR/.env" ]; then
     DATABASE_URL="$(grep -E '^DATABASE_URL=' "$APP_DIR/.env" | cut -d= -f2-)"
-    export DATABASE_URL
 fi
+DATABASE_URL="${DATABASE_URL:-postgresql+psycopg://studybuddy:studybuddy@localhost:5432/studybuddy}"
+# pg_dump wants a plain postgres:// URL, not the SQLAlchemy driver prefix.
+DATABASE_URL="$(echo "$DATABASE_URL" | sed 's|^postgresql+psycopg://|postgresql://|')"
+export DATABASE_URL
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 FILE="$BACKUP_DIR/studybuddy-$STAMP.dump"
