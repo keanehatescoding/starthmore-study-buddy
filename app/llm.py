@@ -16,6 +16,11 @@ class LLMError(RuntimeError):
     pass
 
 
+class QuotaExhaustedError(LLMError):
+    """Repeated 429s: the quota is gone, not a transient blip. Callers
+    should stop the run (work is resumable) instead of grinding chunks."""
+
+
 RETRYABLE = {429, 500, 502, 503, 504}
 
 
@@ -50,6 +55,7 @@ class LLMClient:
             method="POST",
         )
         last_error = None
+        quota_hits = 0
         for attempt in range(5):
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -59,13 +65,21 @@ class LLMClient:
                 last_error = e
                 if e.code not in RETRYABLE:
                     raise LLMError(f"chat completion failed: {e}") from e
-                if e.code == 429:  # honor server backoff hint
-                    try:
+                if e.code == 429:
+                    quota_hits += 1
+                    if quota_hits >= 3:
+                        raise QuotaExhaustedError(
+                            f"LLM quota exhausted (3 consecutive 429s): {e}"
+                        ) from e
+                    try:  # honor server backoff hint
                         time.sleep(min(int(e.headers.get("Retry-After", 0)), 120))
                     except (TypeError, ValueError):
                         pass
+                else:
+                    quota_hits = 0  # a 5xx is transient, not quota
             except Exception as e:  # network blip — retry
                 last_error = e
+                quota_hits = 0
             time.sleep([5, 15, 30, 60, 90][attempt])
         else:
             raise LLMError(f"chat completion failed after retries: {last_error}") from last_error

@@ -15,6 +15,7 @@ from app.chunk import chunk_resource
 from app.config import settings
 from app.db import engine
 from app.extract import ExtractError, SkipResource, extract_resource_text
+from app.llm import QuotaExhaustedError
 from app.models import Chunk, Course, QuizItem, Resource, Topic
 from app.quiz import chunk_needs_quiz, generate_for_chunk
 
@@ -70,6 +71,11 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 4.0) -> di
         )
         try:
             n = chunk_resource(session, r, llm)
+        except QuotaExhaustedError as e:
+            print(f"  quota exhausted, stopping run (resumable): {str(e)[:120]}",
+                  flush=True)
+            counts["quota_exhausted"] = True
+            break
         except Exception as e:
             counts["errors"] = counts.get("errors", 0) + 1
             print(f"  error on resource {r.id}: {str(e)[:120]}", flush=True)
@@ -110,6 +116,11 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
             continue
         try:
             items = generate_for_chunk(session, chunk, llm, attempt)
+        except QuotaExhaustedError as e:
+            print(f"  quota exhausted, stopping run (resumable): {str(e)[:120]}",
+                  flush=True)
+            counts["quota_exhausted"] = True
+            break
         except Exception as e:
             counts["errors"] = counts.get("errors", 0) + 1
             print(f"  error on chunk {chunk.id}: {str(e)[:120]}", flush=True)

@@ -34,6 +34,15 @@ Cron (daily 06:00 sync + notify, replace YOU@X with the login email):
 
 Long LLM pipeline runs (`app.pipeline` chunk/quiz backfills) stay
 operator-triggered — they run paced over hours and are not queue jobs yet.
+The quiz/chunk runners abort early with `quota_exhausted` when the LLM
+quota is gone; re-run the same command later to resume (completed chunks
+are skipped via generation keys).
+
+Backups (nightly pg_dump, 14-day retention):
+
+```
+0 2 * * * /srv/study-buddy/scripts/backup.sh >> /var/log/study-buddy-backup.log 2>&1
+```
 
 ## Notes
 
