@@ -16,6 +16,7 @@ from sqlmodel import Session, select
 
 from app.llm import LLMClient
 from app.models import QuizItem
+from sqlalchemy import or_
 
 SYSTEM = """You write quiz questions testing study material the lecturer covered.
 Rules:
@@ -50,23 +51,35 @@ def _valid(item: dict) -> bool:
     return False
 
 
+def _key_matches(column, key: str):
+    """Match bare key or key:<suffix> — but NOT key-prefix collisions.
+
+    Old code used ``LIKE '{key}%'`` so attempt=1 matched attempt=10.
+    Requiring the ':' delimiter fixes it while staying backward compatible
+    with both single-item rows (bare key) and multi-item rows (key:i).
+    """
+    return or_(column == key, column.like(f"{key}:%"))
+
+
 def generate_for_chunk(
     session: Session, chunk, llm: LLMClient, attempt: int = 1
 ) -> list[QuizItem]:
     """Generate quiz items for one chunk. Idempotent per (chunk, attempt)."""
     key = f"{chunk.id}:{attempt}"
     existing = session.exec(
-        select(QuizItem).where(QuizItem.generation_key.like(f"{key}%"))
+        select(QuizItem).where(
+            QuizItem.chunk_id == chunk.id, _key_matches(QuizItem.generation_key, key)
+        )
     ).all()
     if existing:
         return list(existing)
     data = llm.complete_json(
         SYSTEM, f"Write quiz questions for this study material:\n\n{chunk.content}"
     )
+    valid = [item for item in data.get("items", [])[:4] if _valid(item)]
     created = []
-    for i, item in enumerate(data.get("items", [])[:4]):
-        if not _valid(item):
-            continue
+    single = len(valid) <= 1
+    for i, item in enumerate(valid):
         qtype = item["question_type"]
         row = QuizItem(
             chunk_id=chunk.id,
@@ -77,7 +90,7 @@ def generate_for_chunk(
             grading_criteria=item.get("grading_criteria"),
             explanation=item.get("explanation"),
             difficulty=item["difficulty"],
-            generation_key=key if len(data.get("items", [])) <= 1 else f"{key}:{i}",
+            generation_key=key if single else f"{key}:{i}",
         )
         session.add(row)
         created.append(row)
@@ -86,9 +99,10 @@ def generate_for_chunk(
 
 
 def chunk_needs_quiz(session: Session, chunk_id, attempt: int = 1) -> bool:
+    key = f"{chunk_id}:{attempt}"
     return not session.exec(
         select(QuizItem).where(
             QuizItem.chunk_id == chunk_id,
-            QuizItem.generation_key.like(f"{chunk_id}:{attempt}%"),
+            _key_matches(QuizItem.generation_key, key),
         )
     ).first()
