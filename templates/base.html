@@ -1,23 +1,94 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}Study Buddy{% endblock %}</title>
-<style>
-body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
-a { color: #1a56db; } a:visited { color: #5b21b6; }
-.badge { display: inline-block; font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; background: #eee; }
-.badge.pending { background: #fef3c7; } .badge.extracted { background: #d1fae5; }
-.badge.failed, .badge.skipped { background: #fee2e2; }
-.topic { margin-top: 1.5rem; } .topic h2 { font-size: 1.1rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
-ul.clean { list-style: none; padding-left: 0; } ul.clean li { margin: 0.3rem 0; }
-pre.text { white-space: pre-wrap; background: #f8f8f8; padding: 1rem; border-radius: 6px; max-height: 60vh; overflow: auto; }
-nav.breadcrumb { font-size: 0.85rem; color: #555; margin-bottom: 1rem; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Strathmore Study Buddy{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
-<nav class="breadcrumb"><a href="/">Courses</a> · <a href="/review">Review</a> · <a href="/stats">Stats</a></nav>
-{% block body %}{% endblock %}
+  <!-- Header / Navigation Bar -->
+  <header class="app-header">
+    <div class="header-inner">
+      <a href="/" class="brand-wrapper" title="Strathmore Study Buddy Home">
+        <div class="brand-logo">
+          <!-- Academic / Cap Icon -->
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 10v6M2 10l10-5 10 5-10 5z"/>
+            <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+          </svg>
+        </div>
+        <div class="brand-info">
+          <span class="brand-title">Study Buddy</span>
+          <span class="brand-subtitle">Strathmore eLearning</span>
+        </div>
+      </a>
+
+      <!-- Primary Navigation -->
+      <nav class="app-nav">
+        <a href="/" class="nav-link {% if active_page == 'courses' %}active{% endif %}">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/>
+            <path d="M6 6h10"/>
+            <path d="M6 10h10"/>
+          </svg>
+          Courses
+        </a>
+        <a href="/review" class="nav-link {% if active_page == 'review' %}active{% endif %}">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m13 2-2 2.5h3L11 8"/>
+            <circle cx="12" cy="14" r="8"/>
+            <polyline points="12 10 12 14 16 14"/>
+          </svg>
+          Review
+          {% if due_count and due_count > 0 %}
+            <span class="nav-badge">{{ due_count }}</span>
+          {% endif %}
+        </a>
+        <a href="/stats" class="nav-link {% if active_page == 'stats' %}active{% endif %}">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 3v18h18"/>
+            <path d="m19 9-5 5-4-4-3 3"/>
+          </svg>
+          Stats
+        </a>
+
+        {% if user or request.session.get('user_id') %}
+        <div class="nav-user">
+          <span class="user-pill" title="Signed in as {{ user.email if user else 'Student' }}">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            {{ user.email if user else 'Account' }}
+          </span>
+          <a href="/logout" class="logout-link" title="Sign out of your session">Sign out</a>
+        </div>
+        {% elif active_page != 'login' %}
+        <div class="nav-user">
+          <a href="/login" class="btn btn-sm btn-primary">Sign in</a>
+        </div>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main View Container -->
+  <main class="app-container">
+    {% block breadcrumbs %}{% endblock %}
+    {% block body %}{% endblock %}
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <div>
+        <strong>Strathmore Study Buddy</strong> · AI-Powered Spaced Repetition (SM-2)
+      </div>
+      <div>
+        <span>Keyboard shortcuts: <kbd>1</kbd>-<kbd>4</kbd> select options · <kbd>Enter</kbd> submit / next</span>
+      </div>
+    </footer>
+  </main>
+
+  <script src="/static/js/app.js"></script>
 </body>
 </html>

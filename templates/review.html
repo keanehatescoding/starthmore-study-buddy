@@ -1,17 +1,80 @@
 {% extends "base.html" %}
-{% block title %}Review — Study Buddy{% endblock %}
+{% block title %}Review — Strathmore Study Buddy{% endblock %}
+
+{% block breadcrumbs %}
+<nav class="breadcrumb">
+  <a href="/">Courses</a>
+  <span class="breadcrumb-sep">/</span>
+  <span class="breadcrumb-current">Review Queue</span>
+</nav>
+{% endblock %}
+
 {% block body %}
-<h1>Review queue ({{ items|length }} due)</h1>
 {% if items %}
-<p><a href="/review/take">Start reviewing →</a></p>
-<ul class="clean">
-{% for i in items %}
-<li><span class="badge">{{ i.question_type }}</span>
-  <span class="badge">{{ i.difficulty }}</span>
-  {{ i.question[:100] }}{% if i.question|length > 100 %}…{% endif %}</li>
-{% endfor %}
-</ul>
+<!-- Active Review Hero -->
+<section class="review-hero">
+  <div class="review-hero-icon">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m13 2-2 2.5h3L11 8"/>
+      <circle cx="12" cy="14" r="8"/>
+      <polyline points="12 10 12 14 16 14"/>
+    </svg>
+  </div>
+  <h1 style="font-size: 2rem; margin-bottom: 0.5rem;">Review queue ({{ items|length }} due)</h1>
+  <p style="color: var(--text-muted); max-width: 520px; margin: 0 auto 1.75rem auto; font-size: 1rem;">
+    Active recall with the SM-2 algorithm. Answer items before intervals decay to solidify core concepts.
+  </p>
+  <p>
+    <a href="/review/take" class="btn btn-lg btn-accent" style="padding: 0.9rem 2.25rem; font-size: 1.1rem;">
+      Start reviewing →
+    </a>
+  </p>
+</section>
+
+<!-- Due Items Preview List -->
+<div style="margin-top: 2rem;">
+  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+    <h2 style="font-size: 1.2rem; margin: 0;">Items Due for Practice ({{ items|length }})</h2>
+    <span style="font-size: 0.85rem; color: var(--text-muted);">SM-2 Review Schedule</span>
+  </div>
+
+  <div class="queue-items-list">
+    {% for i in items %}
+    <div class="queue-item-card">
+      <div style="display: flex; align-items: center; gap: 0.75rem; flex: 1; min-width: 0;">
+        <span class="badge" style="font-weight: 700;">{{ i.question_type|upper }}</span>
+        <span class="badge difficulty">{{ i.difficulty }}</span>
+        <span style="color: var(--text-main); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+          {{ i.question[:100] }}{% if i.question|length > 100 %}…{% endif %}
+        </span>
+      </div>
+      <a href="/review/take" class="btn btn-sm btn-outline" style="flex-shrink: 0;">Review</a>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
 {% else %}
-<p>Nothing due. 🎉</p>
+<!-- All Caught Up Hero -->
+<section class="review-hero">
+  <div class="review-hero-icon" style="background: var(--success-bg); color: var(--success);">
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/>
+      <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/>
+      <path d="M4 22h16"/>
+      <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/>
+      <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/>
+      <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/>
+    </svg>
+  </div>
+  <h1 style="font-size: 2rem; margin-bottom: 0.5rem;">Nothing due. 🎉</h1>
+  <p style="color: var(--text-muted); max-width: 520px; margin: 0 auto 1.75rem auto; font-size: 1rem; line-height: 1.6;">
+    You're completely caught up! No flashcard reviews are due right now. Keep up your streak by checking in tomorrow or reviewing your performance statistics.
+  </p>
+  <div style="display: flex; align-items: center; justify-content: center; gap: 0.75rem; flex-wrap: wrap;">
+    <a href="/stats" class="btn btn-primary">View Study Stats</a>
+    <a href="/" class="btn btn-outline">Explore Courses</a>
+  </div>
+</section>
 {% endif %}
 {% endblock %}

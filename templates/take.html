@@ -1,27 +1,101 @@
 {% extends "base.html" %}
-{% block title %}Answer — Study Buddy{% endblock %}
-{% block body %}
-<p><small>{{ remaining }} due after this one · <a href="/review">queue</a></small></p>
-<h1>{{ item.question }}</h1>
-<p><span class="badge">{{ item.question_type }}</span>
-<span class="badge">{{ item.difficulty }}</span></p>
+{% block title %}Answer Question — Strathmore Study Buddy{% endblock %}
 
-{% if result %}
-<h2>{{ "✓ Correct" if result.correct else "✗ " + result.verdict|capitalize }}</h2>
-<p>{{ result.feedback }}</p>
-<p><small>Next review in {{ result.interval_days }} day(s).</small></p>
-<p><a href="/review/take">Next →</a></p>
-{% else %}
-<form method="post" action="/review/{{ item.id }}/answer">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-{% if item.question_type == "mcq" %}
-{% for o in item.options %}
-<label><input type="radio" name="answer" value="{{ loop.index0 }}" required> {{ o }}</label><br>
-{% endfor %}
-{% else %}
-<textarea name="answer" rows="4" cols="60" required placeholder="Type your answer…"></textarea><br>
-{% endif %}
-<button type="submit">Submit</button>
-</form>
-{% endif %}
+{% block breadcrumbs %}
+<nav class="breadcrumb">
+  <a href="/">Courses</a>
+  <span class="breadcrumb-sep">/</span>
+  <a href="/review">Review Queue</a>
+  <span class="breadcrumb-sep">/</span>
+  <span class="breadcrumb-current">Question Practice</span>
+</nav>
+{% endblock %}
+
+{% block body %}
+<div class="quiz-container">
+  <!-- Session Status -->
+  <div class="quiz-progress-bar">
+    <span>
+      <small>{{ remaining }} due after this one · <a href="/review">queue</a></small>
+    </span>
+    {% if not result and item.question_type == "mcq" %}
+    <span style="font-size: 0.8rem; color: var(--text-faint);">
+      Tip: Press keys <kbd>1</kbd>–<kbd>{{ item.options|length }}</kbd> to choose
+    </span>
+    {% endif %}
+  </div>
+
+  <!-- Main Question Card -->
+  <div class="quiz-card">
+    <div class="quiz-header">
+      <span class="badge" style="font-weight: 700;">{{ item.question_type|upper }}</span>
+      <span class="badge difficulty">{{ item.difficulty }}</span>
+    </div>
+
+    <h1 class="quiz-question">{{ item.question }}</h1>
+
+    {% if result %}
+    <!-- Result / Evaluation Feedback Panel -->
+    <div class="result-panel {% if result.correct %}correct{% elif result.verdict == 'partial' %}partial{% else %}incorrect{% endif %}">
+      <h2 class="result-title">
+        {{ "✓ Correct" if result.correct else "✗ " + result.verdict|capitalize }}
+      </h2>
+      <div class="feedback-text">{{ result.feedback }}</div>
+      <p style="margin-bottom: 0;">
+        <small class="next-review-info">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="18" x="3" y="4" rx="2" ry="2"/>
+            <line x1="16" y1="2" x2="16" y2="6"/>
+            <line x1="8" y1="2" x2="8" y2="6"/>
+            <line x1="3" y1="10" x2="21" y2="10"/>
+          </svg>
+          Next review in {{ result.interval_days }} day(s).
+        </small>
+      </p>
+    </div>
+
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 1.75rem; flex-wrap: wrap; gap: 1rem;">
+      <a id="next-question-btn" href="/review/take" class="btn btn-lg btn-primary">
+        Next →
+      </a>
+      <span style="font-size: 0.85rem; color: var(--text-faint);">
+        Press <kbd>Enter</kbd> or <kbd>Space</kbd> to advance
+      </span>
+    </div>
+
+    {% else %}
+    <!-- Answer Submission Form -->
+    <form method="post" action="/review/{{ item.id }}/answer">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      {% if item.question_type == "mcq" %}
+      <div class="options-group">
+        {% set letters = ["A", "B", "C", "D", "E", "F"] %}
+        {% for o in item.options %}
+        <label class="option-label">
+          <input type="radio" name="answer" value="{{ loop.index0 }}" required>
+          <span class="option-badge">{{ letters[loop.index0] if loop.index0 < 6 else loop.index }}</span>
+          <span style="flex: 1;">{{ o }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div style="margin-bottom: 1.5rem;">
+        <textarea name="answer" class="answer-textarea" rows="4" cols="60" required placeholder="Type your answer…"></textarea>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.35rem; margin-bottom: 0;">
+          The AI grader checks your conceptual understanding leniently on phrasing.
+        </p>
+      </div>
+      {% endif %}
+
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 1rem; flex-wrap: wrap; gap: 0.75rem;">
+        <button type="submit" class="btn btn-lg btn-primary">
+          Submit
+        </button>
+        <a href="/review" class="btn btn-outline">Back to Queue</a>
+      </div>
+    </form>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}

@@ -6,6 +6,7 @@ import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, func, select
 from starlette.middleware.sessions import SessionMiddleware
@@ -28,6 +29,9 @@ app.add_middleware(
     https_only=settings.session_secure_cookie,
 )
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+static_dir = Path(__file__).parent.parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 def allowed_emails() -> set[str]:
@@ -166,8 +170,17 @@ def course_list(
             .where(Topic.course_id == c.id)
         ).one()
         counts[str(c.id)] = {"topics": n_topics, "resources": n_resources}
+    due_count = len(due_items(session, user.id))
     return templates.TemplateResponse(
-        request, "courses.html", {"courses": courses, "counts": counts}
+        request,
+        "courses.html",
+        {
+            "courses": courses,
+            "counts": counts,
+            "user": user,
+            "due_count": due_count,
+            "active_page": "courses",
+        },
     )
 
 
@@ -200,6 +213,8 @@ def course_detail(
             "topics": topics,
             "resources_by_topic": resources_by_topic,
             "assignments": assignments,
+            "user": user,
+            "active_page": "courses",
         },
     )
 
@@ -224,7 +239,14 @@ def resource_detail(
     return templates.TemplateResponse(
         request,
         "resource.html",
-        {"resource": resource, "topic": topic, "course": course, "chunks": chunks},
+        {
+            "resource": resource,
+            "topic": topic,
+            "course": course,
+            "chunks": chunks,
+            "user": user,
+            "active_page": "courses",
+        },
     )
 
 
@@ -235,7 +257,13 @@ def review_queue(
     user: User = Depends(current_user),
 ):
     return templates.TemplateResponse(
-        request, "review.html", {"items": due_items(session, user.id)}
+        request,
+        "review.html",
+        {
+            "items": due_items(session, user.id),
+            "user": user,
+            "active_page": "review",
+        },
     )
 
 
@@ -247,11 +275,20 @@ def review_take(
 ):
     queue = due_items(session, user.id)
     if not queue:
-        return templates.TemplateResponse(request, "review.html", {"items": []})
+        return templates.TemplateResponse(
+            request, "review.html", {"items": [], "user": user, "active_page": "review"}
+        )
     return templates.TemplateResponse(
-        request, "take.html",
-        {"item": queue[0], "remaining": len(queue) - 1, "result": None,
-         "csrf_token": csrf_token(request)},
+        request,
+        "take.html",
+        {
+            "item": queue[0],
+            "remaining": len(queue) - 1,
+            "result": None,
+            "csrf_token": csrf_token(request),
+            "user": user,
+            "active_page": "review",
+        },
     )
 
 
@@ -281,9 +318,16 @@ async def review_answer(
     result = submit_answer(session, user.id, item.id, answer, llm)
     queue = due_items(session, user.id)
     return templates.TemplateResponse(
-        request, "take.html",
-        {"item": item, "remaining": len(queue), "result": result,
-         "csrf_token": csrf_token(request)},
+        request,
+        "take.html",
+        {
+            "item": item,
+            "remaining": len(queue),
+            "result": result,
+            "csrf_token": csrf_token(request),
+            "user": user,
+            "active_page": "review",
+        },
     )
 
 
@@ -294,7 +338,12 @@ def stats_page(
     user: User = Depends(current_user),
 ):
     return templates.TemplateResponse(
-        request, "stats.html",
-        {"stats": compute_stats(session, user.id),
-         "due": len(due_items(session, user.id))},
+        request,
+        "stats.html",
+        {
+            "stats": compute_stats(session, user.id),
+            "due": len(due_items(session, user.id)),
+            "user": user,
+            "active_page": "stats",
+        },
     )

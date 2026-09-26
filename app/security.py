@@ -27,9 +27,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Permissions-Policy"] = (
             "camera=(), microphone=(), geolocation=()"
         )
-        # Safe: templates contain no inline scripts or external resources.
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; frame-ancestors 'none'"
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
         )
         if settings.session_secure_cookie:
             response.headers["Strict-Transport-Security"] = (
