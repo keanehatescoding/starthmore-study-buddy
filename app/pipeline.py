@@ -44,7 +44,8 @@ def chunkable_resources(session: Session, course_id=None):
 
 def run_extraction(session: Session, downloader, course_id=None) -> dict:
     counts = {"extracted": 0, "skipped": 0, "failed": 0}
-    for r in pending_resources(session, course_id):
+    resources = pending_resources(session, course_id)
+    for i, r in enumerate(resources, 1):
         try:
             r.extracted_text = extract_resource_text(r, downloader)
             r.status = "extracted"
@@ -60,12 +61,14 @@ def run_extraction(session: Session, downloader, course_id=None) -> dict:
             counts["failed"] += 1
         session.add(r)
         session.commit()
+        print(f"  extract {i}/{len(resources)} {r.status}: {r.title[:60]}", flush=True)
     return counts
 
 
 def run_chunking(session: Session, llm, course_id=None, pace: float = 4.0) -> dict:
     counts = {"chunks": 0, "cached": 0, "resources": 0}
-    for r in chunkable_resources(session, course_id):
+    resources = chunkable_resources(session, course_id)
+    for i, r in enumerate(resources, 1):
         n_existing = len(
             session.exec(select(Chunk).where(Chunk.resource_id == r.id)).all()
         )
@@ -81,6 +84,7 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 4.0) -> di
             print(f"  error on resource {r.id}: {str(e)[:120]}", flush=True)
             continue
         counts["chunks"] += n
+        print(f"  chunk {i}/{len(resources)} +{n}: {r.title[:60]}", flush=True)
         if n == 0 and n_existing:
             counts["cached"] += 1
         elif n:
