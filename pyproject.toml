@@ -18,6 +18,7 @@ dependencies = [
     "google-api-python-client>=2.0",
     "google-auth-oauthlib>=1.0",
     "pypdf>=4.0",
+    "fonttools>=4.0",  # pypdf needs it to decode CFF Type1 fonts (math symbols)
     "python-pptx>=1.0",
     "python-docx>=1.1",
     "youtube-transcript-api>=1.0",
