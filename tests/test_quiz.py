@@ -91,3 +91,37 @@ def test_new_attempt_generates_more(setup):
     generate_for_chunk(s, chunk, llm, attempt=2)
     assert s.exec(select(QuizItem)).all().__len__() == 4
     assert uuid.uuid4()  # keys are unique per attempt
+
+
+def test_attempt_1_does_not_reuse_attempt_10(setup):
+    # Regression: LIKE '{chunk}:1%' used to match '{chunk}:10...' rows.
+    s, chunk = setup
+    llm = FakeLLM(GOOD)
+    tenth = generate_for_chunk(s, chunk, llm, attempt=10)
+    assert all(i.generation_key.startswith(f"{chunk.id}:10") for i in tenth)
+    assert chunk_needs_quiz(s, chunk.id, attempt=1)
+    first = generate_for_chunk(s, chunk, llm, attempt=1)
+    assert llm.calls == 2
+    assert not {i.id for i in first} & {i.id for i in tenth}
+    assert sorted(i.generation_key for i in first) == [
+        f"{chunk.id}:1:0", f"{chunk.id}:1:1"
+    ]
+
+
+def test_keys_index_valid_items_not_raw_positions(setup):
+    # Invalid items first: raw-index keys would be :1/:3, valid-index keys :0/:1.
+    s, chunk = setup
+    llm = FakeLLM([GOOD[2], GOOD[0], GOOD[3], GOOD[1]])
+    items = generate_for_chunk(s, chunk, llm)
+    assert [i.generation_key for i in items] == [
+        f"{chunk.id}:1:0", f"{chunk.id}:1:1"
+    ]
+
+
+def test_single_valid_item_gets_bare_key(setup):
+    # One valid item among invalid ones: counting raw items would add ':i'.
+    s, chunk = setup
+    llm = FakeLLM([GOOD[2], GOOD[0], GOOD[3]])
+    items = generate_for_chunk(s, chunk, llm)
+    assert [i.generation_key for i in items] == [f"{chunk.id}:1"]
+    assert not chunk_needs_quiz(s, chunk.id)
