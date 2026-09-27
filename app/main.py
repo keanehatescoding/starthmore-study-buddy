@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session, func, select
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -82,6 +83,20 @@ def csrf_token(request: Request) -> str:
         token = secrets.token_urlsafe(32)
         request.session["csrf_token"] = token
     return token
+
+
+async def checked_form(request: Request):
+    """Parsed POST form, after verifying its CSRF token."""
+    form = await request.form()
+    submitted = str(form.get("csrf_token", ""))
+    expected = str(request.session.get("csrf_token", ""))
+    if not expected or not hmac.compare_digest(submitted, expected):
+        raise HTTPException(403, "invalid csrf token")
+    return form
+
+
+def _flash(request: Request, kind: str, text: str) -> None:
+    request.session["flash"] = {"kind": kind, "text": text}
 
 
 @app.exception_handler(401)
@@ -347,3 +362,107 @@ def stats_page(
             "active_page": "stats",
         },
     )
+
+
+@app.get("/settings/moodle", response_class=HTMLResponse)
+def moodle_settings(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    from app.moodle_tokens import decrypt_token, token_for
+
+    own = decrypt_token(user.moodle_token) is not None
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {
+            "connected": own,
+            "shared": not own and token_for(user) is not None,
+            "stale": bool(user.moodle_token) and not own,
+            "moodle_url": settings.moodle_base_url,
+            "flash": request.session.pop("flash", None),
+            "csrf_token": csrf_token(request),
+            "user": user,
+            "due_count": len(due_items(session, user.id)),
+            "active_page": "settings",
+        },
+    )
+
+
+def _connect_moodle(session: Session, user: User, token: str) -> str:
+    """Verify `token`, store it encrypted, queue a first sync; returns the Moodle name."""
+    from app.jobs import enqueue
+    from app.moodle_tokens import encrypt_token, verify_token
+
+    info = verify_token(settings.moodle_base_url, token)
+    user.moodle_token = encrypt_token(token)
+    session.add(user)
+    session.commit()
+    enqueue(session, "sync", {
+        "source": "moodle", "course_id": None, "user_email": user.email,
+    })
+    return str(info.get("fullname") or info.get("username") or "your account")
+
+
+async def _connect_and_redirect(request, session, user, get_token) -> RedirectResponse:
+    from app.moodle import MoodleError
+
+    try:
+        token = await run_in_threadpool(get_token)
+        name = await run_in_threadpool(_connect_moodle, session, user, token)
+    except MoodleError as e:
+        _flash(request, "error", f"Moodle said: {e}")
+    else:
+        _flash(request, "success",
+               f"Connected as {name}. Your courses will sync in the next few minutes.")
+    return RedirectResponse("/settings/moodle", status_code=303)
+
+
+@app.post("/settings/moodle/login")
+async def moodle_login(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    from app.moodle_tokens import fetch_token
+
+    form = await checked_form(request)
+    username = str(form.get("username", "")).strip()
+    password = str(form.get("password", ""))
+    if not username or not password:
+        _flash(request, "error", "Enter your Moodle username and password.")
+        return RedirectResponse("/settings/moodle", status_code=303)
+    return await _connect_and_redirect(
+        request, session, user,
+        lambda: fetch_token(settings.moodle_base_url, username, password),
+    )
+
+
+@app.post("/settings/moodle/token")
+async def moodle_token(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    form = await checked_form(request)
+    token = str(form.get("token", "")).strip()
+    if not token:
+        _flash(request, "error", "Paste your Moodle mobile web service key.")
+        return RedirectResponse("/settings/moodle", status_code=303)
+    return await _connect_and_redirect(request, session, user, lambda: token)
+
+
+@app.post("/settings/moodle/disconnect")
+async def moodle_disconnect(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    await checked_form(request)
+    user.moodle_token = None
+    session.add(user)
+    session.commit()
+    _flash(request, "success",
+           "Disconnected. Already-synced courses stay; new material won't sync.")
+    return RedirectResponse("/settings/moodle", status_code=303)

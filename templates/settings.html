@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Moodle — Strathmore Study Buddy{% endblock %}
+
+{% block body %}
+<section class="page-hero">
+  <div class="hero-content">
+    <h1 class="hero-title">Connect Moodle</h1>
+    <p class="hero-subtitle">
+      Study Buddy syncs your own Strathmore eLearning courses using a Moodle access key for your account.
+    </p>
+  </div>
+</section>
+
+{% if flash %}
+<div class="notice notice-{{ flash.kind }}" role="status">{{ flash.text }}</div>
+{% endif %}
+
+<div class="card settings-card">
+  <div class="card-header">
+    <h2 class="card-title">Status</h2>
+    {% if connected %}
+      <span class="badge status-ok">Connected</span>
+    {% else %}
+      <span class="badge status-off">Not connected</span>
+    {% endif %}
+  </div>
+  {% if connected %}
+    <p class="settings-text">Your Moodle key is stored encrypted. Your courses sync daily.</p>
+    <form method="post" action="/settings/moodle/disconnect">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-sm btn-outline">Disconnect Moodle</button>
+    </form>
+  {% elif shared %}
+    <p class="settings-text">You're using the app's shared Moodle key. Connect your own account below so syncs run as you.</p>
+  {% elif stale %}
+    <p class="settings-text">Your saved key can't be read any more. Connect again below.</p>
+  {% else %}
+    <p class="settings-text">Connect with one of the options below to sync your courses.</p>
+  {% endif %}
+</div>
+
+<div class="settings-grid">
+  <div class="card settings-card">
+    <div class="card-header"><h2 class="card-title">Sign in with Moodle</h2></div>
+    <p class="settings-text">
+      We send your username and password to {{ moodle_url }} once to get an access key.
+      Your password is never saved.
+    </p>
+    <form method="post" action="/settings/moodle/login" autocomplete="off">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="field-label" for="moodle-username">Moodle username</label>
+      <input class="text-input" id="moodle-username" name="username" autocomplete="username" required>
+      <label class="field-label" for="moodle-password">Password</label>
+      <input class="text-input" id="moodle-password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit" class="btn btn-primary">Connect</button>
+    </form>
+  </div>
+
+  <div class="card settings-card">
+    <div class="card-header"><h2 class="card-title">Paste an access key</h2></div>
+    <p class="settings-text">
+      In Moodle, open <strong>Preferences → Security keys</strong> and copy the key for
+      <em>Moodle mobile web service</em>. (If it isn't listed, open the Moodle app once, or use sign-in instead.)
+    </p>
+    <form method="post" action="/settings/moodle/token" autocomplete="off">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="field-label" for="moodle-token">Access key</label>
+      <input class="text-input" id="moodle-token" name="token" spellcheck="false" required>
+      <button type="submit" class="btn btn-primary">Save key</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

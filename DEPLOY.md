@@ -8,11 +8,19 @@
    `EMAIL_FROM`, `EMAIL_TO`. Note: `DATABASE_URL` must use the `psycopg`
    driver as-is; no code change needed.
 3. Services from `Procfile`: `web` (FastAPI) and `worker` (hourly notification pass).
-4. Sync on a schedule with a Railway cron service, daily (replace
-   `YOU@X` with the owner's login email). Syncs go through the job queue —
-   enqueue, then the worker drains them and sends notifications:
+4. Each user connects their own Moodle account at **Moodle** in the nav
+   (`/settings/moodle`: sign in once via `login/token.php`, or paste their
+   mobile web service key). Tokens are stored encrypted with a key derived
+   from `SECRET_KEY` — rotating `SECRET_KEY` means everyone reconnects, and
+   the worker and cron services need the same `SECRET_KEY` as web
+   (`scripts/railway-sync-cron-env.sh <service>` references it).
+   The global `MOODLE_TOKEN` is only used for `MOODLE_TOKEN_OWNER` (set it to
+   that token's owner, or every user without their own token syncs as them).
+5. Sync on a schedule with a Railway cron service, daily. Syncs go through
+   the job queue — one job per connected user, then the worker drains them
+   and sends notifications:
    ```
-   python -m app.sync_cli --source moodle --user YOU@X --enqueue && python -m app.worker
+   python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.worker
    ```
    Run chunking/quiz generation paced (`--pace 45`) afterwards — the free
    Gemini tier rate-limits hard, so don't bundle them into the same cron slot.
@@ -26,10 +34,10 @@ podman-compose up -d db
 nohup .venv/bin/uvicorn app.main:app --port 8000 &
 ```
 
-Cron (daily 06:00 sync + notify, replace YOU@X with the login email):
+Cron (daily 06:00 sync + notify for every connected user):
 
 ```
-0 6 * * * cd /srv/study-buddy && .venv/bin/python -m app.sync_cli --source moodle --user YOU@X --enqueue && .venv/bin/python -m app.worker
+0 6 * * * cd /srv/study-buddy && .venv/bin/python -m app.sync_cli --source moodle --all-users --enqueue && .venv/bin/python -m app.worker
 ```
 
 Long LLM pipeline runs (`app.pipeline` chunk/quiz backfills) stay

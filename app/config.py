@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://studybuddy:studybuddy@localhost:5432/studybuddy"
     moodle_base_url: str = "https://elearning.strathmore.edu"
     moodle_token: str = ""
+    moodle_token_owner: str = ""  # email allowed to use MOODLE_TOKEN; empty = anyone
     google_client_id: str = ""
     google_client_secret: str = ""
     google_refresh_token: str = ""
