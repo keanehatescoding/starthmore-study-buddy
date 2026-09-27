@@ -124,7 +124,7 @@ def test_pipeline_downloads_as_course_owner(testapp, shared_token):
         assert alice_dl.__self__.token == "ALICE"
         assert downloader_for(s.get(Resource, resources["bob@x.edu"])) is None
 
-        counts = run_extraction(s, None, downloader_for=lambda r: None)
+        counts = run_extraction(s, None, downloader_for=lambda r: None).counts
         assert counts["no_token"] == 2
         assert all(s.get(Resource, rid).status == "pending" for rid in resources.values())
 

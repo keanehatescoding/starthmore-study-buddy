@@ -57,6 +57,7 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN` | Classroom OAuth (Web app, Testing mode) |
 | `LLM_BASE_URL`, `LLM_API_KEY` | OpenAI-compatible endpoint |
 | `LLM_CHUNK_MODEL`, `LLM_QUIZ_MODEL`, `LLM_GRADE_MODEL` | Per-stage models (cheap → quality) |
+| `LLM_PACE` | Seconds between pipeline LLM calls (default 0; `--pace` overrides) |
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_TO` | Notifications (Resend free tier) |
 
 ## Layout
