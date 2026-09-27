@@ -1,2 +1,2 @@
-web: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+web: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --forwarded-allow-ips "*"
 worker: python -m app.worker --loop 3600
