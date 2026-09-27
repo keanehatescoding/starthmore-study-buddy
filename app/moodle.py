@@ -94,13 +94,41 @@ from app.sync import (  # noqa: E402
 )
 
 
+def _file_fingerprint(c: dict) -> str:
+    """Change marker from core_course_get_contents file metadata, so sync
+    never downloads files (extraction fetches bytes later via raw_url).
+
+    The API exposes no content hash, but fileurl embeds the module revision
+    (.../mod_resource/content/<rev>/...), which Moodle bumps on every save, so
+    a replaced file changes the marker even at the same size and mtime.
+    """
+    return "|".join(
+        str(c.get(k) or "") for k in ("fileurl", "filesize", "timemodified")
+    )
+
+
 class MoodleAdapter:
-    """Maps Moodle API shapes onto the normalized sync dataclasses."""
+    """Maps Moodle API shapes onto the normalized sync dataclasses.
+
+    Course contents and page texts are fetched once per course and reused by
+    fetch_topics/fetch_resources/fetch_assignments. fetch_topics (the first
+    call sync makes per course) refreshes the snapshot.
+    """
 
     source = "moodle"
 
     def __init__(self, client: MoodleClient):
         self.client = client
+        self._contents: dict[str, list] = {}
+        self._pages: dict[str, dict[int, str | None] | None] = {}
+
+    def _course_contents(self, course_source_id: str, refresh: bool = False) -> list:
+        if refresh or course_source_id not in self._contents:
+            self._contents[course_source_id] = self.client.get_course_contents(
+                int(course_source_id)
+            )
+            self._pages.pop(course_source_id, None)
+        return self._contents[course_source_id]
 
     def fetch_courses(self) -> list[CourseData]:
         info = self.client.site_info()
@@ -115,7 +143,7 @@ class MoodleAdapter:
         ]
 
     def fetch_topics(self, course_source_id: str) -> list[TopicData]:
-        sections = self.client.get_course_contents(int(course_source_id))
+        sections = self._course_contents(course_source_id, refresh=True)
         topics = []
         for i, s in enumerate(sections):
             name = (s.get("name") or "").strip()
@@ -130,22 +158,25 @@ class MoodleAdapter:
 
     def _page_text(self, course_source_id: str, module_id: int) -> str | None:
         """Best-effort page content. Returns None if the function isn't allowed."""
-        try:
-            pages = self.client.call(
-                "mod_page_get_pages_by_courses",
-                **{"courseids[0]": int(course_source_id)},
-            )
-        except MoodleError:
-            return None
-        for p in pages.get("pages", []):
-            if p.get("coursemodule") == module_id:
-                return p.get("content")
-        return None
+        if course_source_id not in self._pages:
+            try:
+                pages = self.client.call(
+                    "mod_page_get_pages_by_courses",
+                    **{"courseids[0]": int(course_source_id)},
+                )
+                self._pages[course_source_id] = {
+                    p.get("coursemodule"): p.get("content")
+                    for p in pages.get("pages", [])
+                }
+            except MoodleError:
+                self._pages[course_source_id] = None
+        by_module = self._pages[course_source_id]
+        return None if by_module is None else by_module.get(module_id)
 
     def fetch_resources(
         self, course_source_id: str, topic_source_id: str
     ) -> list[ResourceData]:
-        sections = self.client.get_course_contents(int(course_source_id))
+        sections = self._course_contents(course_source_id)
         section = next((s for s in sections if str(s["id"]) == topic_source_id), None)
         if section is None:
             return []
@@ -158,7 +189,6 @@ class MoodleAdapter:
                 for c in mod.get("contents", []):
                     if c.get("type") != "file":
                         continue
-                    blob, mime = self.client.download(c["fileurl"])
                     out.append(
                         ResourceData(
                             topic_source_id=topic_source_id,
@@ -166,8 +196,8 @@ class MoodleAdapter:
                             type="file",
                             title=c["filename"],
                             raw_url=c["fileurl"],
-                            mime_type=mime or c.get("mimetype"),
-                            content_bytes=blob,
+                            mime_type=c.get("mimetype"),
+                            fingerprint=_file_fingerprint(c),
                         )
                     )
             elif modname == "url":
@@ -207,7 +237,6 @@ class MoodleAdapter:
                     continue
                 if len(files) == 1:
                     c = files[0]
-                    blob, mime = self.client.download(c["fileurl"])
                     out.append(
                         ResourceData(
                             topic_source_id=topic_source_id,
@@ -215,13 +244,12 @@ class MoodleAdapter:
                             type="file",
                             title=mod.get("name") or c["filename"],
                             raw_url=c["fileurl"],
-                            mime_type=mime or c.get("mimetype"),
-                            content_bytes=blob,
+                            mime_type=c.get("mimetype"),
+                            fingerprint=_file_fingerprint(c),
                         )
                     )
                 else:  # same per-file treatment as folders
                     for c in files:
-                        blob, mime = self.client.download(c["fileurl"])
                         out.append(
                             ResourceData(
                                 topic_source_id=topic_source_id,
@@ -229,17 +257,21 @@ class MoodleAdapter:
                                 type="file",
                                 title=c["filename"],
                                 raw_url=c["fileurl"],
-                                mime_type=mime or c.get("mimetype"),
-                                content_bytes=blob,
+                                mime_type=c.get("mimetype"),
+                                fingerprint=_file_fingerprint(c),
                             )
                         )
             # else: unknown modname — skip silently in v1 (visible via counts)
         return out
 
+    def fetch_content(self, data: ResourceData) -> bytes:
+        """File bytes; sync uses this only to verify legacy content hashes."""
+        return self.client.download(data.raw_url)[0]
+
     def fetch_assignments(self, course_source_id: str) -> list[AssignmentData]:
         from datetime import datetime, timezone
 
-        sections = self.client.get_course_contents(int(course_source_id))
+        sections = self._course_contents(course_source_id)
         cmid_to_section = {
             str(mod["id"]): str(s["id"])
             for s in sections

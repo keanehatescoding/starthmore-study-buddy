@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.models import Assignment, Course, Resource, Topic, User
+from app.models import Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 from app.sync import (
     AssignmentData,
     CourseData,
@@ -40,7 +40,9 @@ class FakeAdapter:
                                   datetime(2026, 10, 1, tzinfo=timezone.utc), "Do trees")]
         }
 
-    def fetch_courses(self): return self.courses
+    def fetch_courses(self):
+        self.course_fetches = getattr(self, "course_fetches", 0) + 1
+        return self.courses
     def fetch_topics(self, cid): return self.topics[cid]
     def fetch_resources(self, cid, tid): return self.resources[(cid, tid)]
     def fetch_assignments(self, cid): return self.assignments[cid]
@@ -119,3 +121,164 @@ def test_link_type():
     assert link_type("https://youtu.be/abc") == "video"
     assert link_type("https://example.com/notes") == "link"
     assert content_hash(ResourceData("t", "s", "link", "L")) is None
+
+
+def _derive(session, resource, user_id, tag):
+    chunk = Chunk(resource_id=resource.id, title=tag, content=tag)
+    session.add(chunk)
+    session.commit()
+    item = QuizItem(chunk_id=chunk.id, question="q", question_type="mcq",
+                    correct_answer="0", generation_key=f"{tag}:1:0")
+    session.add(item)
+    session.commit()
+    session.add(ReviewState(user_id=user_id, quiz_item_id=item.id,
+                            next_review_date=datetime.now(timezone.utc)))
+    session.commit()
+
+
+def _resource(session, source_id):
+    return session.exec(select(Resource).where(Resource.source_id == source_id)).one()
+
+
+def test_changed_content_purges_derived_rows(session, user_id):
+    adapter = FakeAdapter()
+    sync_course(session, adapter, "c1", user_id)
+    _derive(session, _resource(session, "r-file"), user_id, "file")
+    _derive(session, _resource(session, "r-page"), user_id, "page")
+    adapter.resources[("c1", "t1")][0].content_bytes = b"v2"
+    sync_course(session, adapter, "c1", user_id)
+    session.expire_all()
+    assert [c.title for c in session.exec(select(Chunk)).all()] == ["page"]
+    assert len(session.exec(select(QuizItem)).all()) == 1
+    assert len(session.exec(select(ReviewState)).all()) == 1
+
+
+def test_title_only_change_updates_without_reset(session, user_id):
+    adapter = FakeAdapter()
+    adapter.resources[("c1", "t1")].append(
+        ResourceData("t1", "r-nohash", "link", "Old", raw_url="https://a"))
+    sync_course(session, adapter, "c1", user_id)
+    _derive(session, _resource(session, "r-page"), user_id, "page")
+    res = adapter.resources[("c1", "t1")]
+    res[1].title = "Overview (revised)"
+    res[3].title, res[3].raw_url = "New", "https://b"
+    stats = sync_course(session, adapter, "c1", user_id)
+    assert (stats.resources_updated, stats.resources_skipped) == (2, 2)
+    session.expire_all()
+    page = _resource(session, "r-page")
+    assert page.title == "Overview (revised)"
+    assert page.status == "extracted" and page.extracted_text == "A tree is..."
+    assert len(session.exec(select(Chunk)).all()) == 1  # not purged
+    nohash = _resource(session, "r-nohash")
+    assert (nohash.title, nohash.raw_url) == ("New", "https://b")
+
+
+def test_unchanged_assignment_not_counted(session, user_id):
+    adapter = FakeAdapter()
+    sync_course(session, adapter, "c1", user_id)
+    assert sync_course(session, adapter, "c1", user_id).assignments_updated == 0
+    adapter.assignments["c1"][0].title = "Assignment 1 (extended)"
+    assert sync_course(session, adapter, "c1", user_id).assignments_updated == 1
+
+
+def _to_fingerprint(session, user_id, fetch_content):
+    """Sync with a legacy content hash, then switch the file to a fingerprint."""
+    adapter = FakeAdapter()
+    sync_course(session, adapter, "c1", user_id)  # legacy full-content hash (b"v1")
+    _derive(session, _resource(session, "r-file"), user_id, "file")
+    f = adapter.resources[("c1", "t1")][0]
+    f.content_bytes, f.fingerprint = None, "https://x/content/1/f.pdf|100|1700000000"
+    adapter.fetch_content = fetch_content
+    return adapter, f
+
+
+def test_legacy_hash_verified_same_bytes_keeps_progress(session, user_id):
+    adapter, f = _to_fingerprint(session, user_id, lambda r: b"v1")
+    stats = sync_course(session, adapter, "c1", user_id)
+    assert stats.resources_updated == 0
+    assert len(session.exec(select(Chunk)).all()) == 1
+    assert _resource(session, "r-file").content_hash.startswith("fp:")
+    f.fingerprint = "https://x/content/2/f.pdf|100|1700000000"  # revision bump
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 1
+    session.expire_all()
+    assert _resource(session, "r-file").status == "pending"
+    assert session.exec(select(Chunk)).all() == []
+
+
+def test_legacy_hash_verified_changed_bytes_resets(session, user_id):
+    adapter, _ = _to_fingerprint(session, user_id, lambda r: b"v2 new slides")
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 1
+    session.expire_all()
+    res = _resource(session, "r-file")
+    assert res.status == "pending" and res.content_hash.startswith("fp:")
+    assert session.exec(select(Chunk)).all() == []
+
+
+def test_legacy_hash_unverifiable_keeps_legacy_and_retries(session, user_id):
+    def down(r):
+        raise RuntimeError("moodle down")
+
+    adapter, _ = _to_fingerprint(session, user_id, down)
+    legacy = _resource(session, "r-file").content_hash
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 0
+    assert _resource(session, "r-file").content_hash == legacy
+    assert len(session.exec(select(Chunk)).all()) == 1
+    adapter.fetch_content = lambda r: b"v1"  # next sync can verify
+    sync_course(session, adapter, "c1", user_id)
+    assert _resource(session, "r-file").content_hash.startswith("fp:")
+
+
+def test_sync_all_fetches_courses_once(session, user_id):
+    adapter = FakeAdapter()
+    adapter.courses.append(CourseData("c2", "CS 302"))
+    adapter.topics["c2"] = []
+    adapter.assignments["c2"] = []
+    assert set(sync_all(session, adapter, user_id)) == {"c1", "c2"}
+    assert adapter.course_fetches == 1
+
+
+class FakeMoodleClient:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def site_info(self):
+        return {"userid": 7}
+
+    def get_users_courses(self, userid):
+        return [{"id": 5, "fullname": "CS 301", "shortname": "CS301"}]
+
+    def get_course_contents(self, courseid):
+        self.calls.append("contents")
+        file = {"type": "file", "filename": "a.pdf", "filepath": "/",
+                "fileurl": "https://m/a.pdf", "filesize": 10, "timemodified": 1,
+                "mimetype": "application/pdf"}
+        return [
+            {"id": s, "name": f"S{s}", "modules": [
+                {"id": s * 10, "modname": "resource", "name": "A", "contents": [file]},
+                {"id": s * 10 + 1, "modname": "page", "name": "P"},
+                {"id": s * 10 + 2, "modname": "page", "name": "Q"},
+            ]}
+            for s in (1, 2)
+        ]
+
+    def get_assignments(self, courseid):
+        return {"courses": []}
+
+    def call(self, function, **params):
+        self.calls.append(function)
+        return {"pages": [{"coursemodule": 11, "content": "page 11"}]}
+
+    def download(self, fileurl):
+        raise AssertionError("sync must not download files")
+
+
+def test_moodle_adapter_fetches_contents_once_and_never_downloads(session, user_id):
+    from app.moodle import MoodleAdapter
+
+    client = FakeMoodleClient()
+    stats = sync_all(session, MoodleAdapter(client), user_id)["5"]
+    assert stats.resources_new == 6
+    assert client.calls == ["contents", "mod_page_get_pages_by_courses"]
+    f = _resource(session, "10")
+    assert f.content_hash.startswith("fp:") and f.mime_type == "application/pdf"
+    assert _resource(session, "11").extracted_text == "page 11"
