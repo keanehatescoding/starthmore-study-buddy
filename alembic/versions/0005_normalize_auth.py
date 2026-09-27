@@ -4,9 +4,17 @@ Revision ID: 0005
 Revises: 0004_derived_cascade
 
 Needs the same SECRET_KEY as the app: refresh tokens are sealed with it.
+The sealing format is frozen here (not imported from app.crypto) so this
+migration keeps writing what it wrote at the time, whatever the app does later.
 """
 
+import base64
+import hashlib
+import os
+from pathlib import Path
+
 import sqlalchemy as sa
+from cryptography.fernet import Fernet, InvalidToken
 
 from alembic import op
 
@@ -15,10 +23,41 @@ down_revision = "0004_derived_cascade"
 branch_labels = None
 depends_on = None
 
+_PREFIX = "v1:"
+_PURPOSE = "google-refresh-token"
+
+
+def _secret_key() -> str:
+    """SECRET_KEY resolved like app.config at the time: env var, then .env
+    in the working directory, then the dev default."""
+    if "SECRET_KEY" in os.environ:
+        return os.environ["SECRET_KEY"]
+    env_file = Path(".env")
+    if env_file.is_file():
+        for line in env_file.read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.strip() == "SECRET_KEY":
+                return value.strip().strip("\"'")
+    return "dev-insecure-change-me"
+
+
+def _fernet() -> Fernet:
+    digest = hashlib.sha256(f"{_PURPOSE}:{_secret_key()}".encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _seal(value: str) -> str:
+    return _PREFIX + _fernet().encrypt(value.encode()).decode()
+
+
+def _unseal(stored: str) -> str | None:
+    try:
+        return _fernet().decrypt(stored[len(_PREFIX):].encode()).decode()
+    except InvalidToken:
+        return None
+
 
 def upgrade() -> None:
-    from app.crypto import seal
-
     bind = op.get_bind()
     # Lowercase at most one row per address: if the lowercase form is taken,
     # or several mixed-case variants exist, the others stay as they are
@@ -49,19 +88,17 @@ def upgrade() -> None:
     for user_id, token in rows:
         bind.execute(
             sa.text("UPDATE users SET google_refresh_token = :t WHERE id = :id"),
-            {"t": seal("google-refresh-token", token), "id": user_id},
+            {"t": _seal(token), "id": user_id},
         )
 
 
 def downgrade() -> None:
-    from app.crypto import unseal
-
     bind = op.get_bind()
     rows = bind.execute(sa.text(
         "SELECT id, google_refresh_token FROM users WHERE google_refresh_token LIKE 'v1:%'"
     )).all()
     for user_id, stored in rows:
-        plain = unseal("google-refresh-token", stored)
+        plain = _unseal(stored)
         if plain is None:
             # Writing NULL would destroy the token for good; abort instead.
             raise RuntimeError(

@@ -68,3 +68,16 @@ def test_0005_downgrade_refuses_to_null_undecryptable_tokens(engine):
     with engine.connect() as c:
         stored = c.execute(text("SELECT google_refresh_token FROM users")).scalar_one()
     assert stored == "v1:not-decryptable"
+
+
+def test_0005_seals_with_secret_key_from_env(engine, monkeypatch):
+    from app.config import settings
+
+    m = _migration("0005_normalize_auth")
+    monkeypatch.setenv("SECRET_KEY", "migration-test-key")
+    monkeypatch.setattr(settings, "secret_key", "migration-test-key")
+    _users(engine, [("a@x.edu", "rt")])
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        token = c.execute(text("SELECT google_refresh_token FROM users")).scalar_one()
+    assert unseal("google-refresh-token", token) == "rt"  # the app can read it
