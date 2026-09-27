@@ -61,8 +61,10 @@ Backups (nightly pg_dump, 14-day retention):
   full suite on Postgres 16 for every push/PR.
 - `/health` checks Postgres and returns 503 when unreachable — safe to use
   for platform restart decisions.
-- Personal-tool mode: set `ALLOWED_EMAILS` to your address so random Google
-  accounts get 403 at the callback instead of an empty session.
+- Sign-in is limited by `ALLOWED_EMAILS` (default `@strathmore.edu`): a
+  comma-separated mix of exact addresses and `@domain` entries. Anyone else
+  gets 403 at the callback. Set it to your address for personal-tool mode,
+  or to an empty value to admit any Google account.
 - Cron observability: set `HEALTHCHECK_PING_URL` (e.g. a healthchecks.io
   check) — the worker pings it after every successful pass, so a silent
   6am failure pages you instead of showing up as missing quizzes.

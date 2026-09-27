@@ -43,6 +43,15 @@ def allowed_emails() -> set[str]:
     }
 
 
+def email_allowed(email: str) -> bool:
+    """Exact address or "@domain" entry match; an empty allowlist admits anyone."""
+    allowed = allowed_emails()
+    if not allowed:
+        return True
+    domain = "@" + email.rpartition("@")[2]
+    return email in allowed or domain in allowed
+
+
 def current_user(
     request: Request, session: Session = Depends(get_session)
 ) -> User:
@@ -151,8 +160,7 @@ def auth_callback(
         settings.google_client_id, settings.google_client_secret, code, redirect_uri
     )
     email = auth_mod.fetch_email(tokens["access_token"])
-    allowed = allowed_emails()
-    if allowed and email not in allowed:
+    if not email_allowed(email):
         raise HTTPException(403, "sign-in not allowed for this account")
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
     request.session["user_id"] = str(user.id)

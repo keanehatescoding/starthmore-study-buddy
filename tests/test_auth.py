@@ -252,3 +252,30 @@ def test_empty_allowlist_permits_anyone(monkeypatch):
         assert r.status_code == 303
     finally:
         app.dependency_overrides.clear()
+
+
+def test_domain_allowlist(monkeypatch):
+    from app.main import email_allowed
+
+    monkeypatch.setattr(settings, "allowed_emails", "@strathmore.edu, guest@x.com")
+    assert email_allowed("student@strathmore.edu")
+    assert email_allowed("guest@x.com")
+    assert not email_allowed("other@x.com")
+    assert not email_allowed("evil@notstrathmore.edu")
+    assert not email_allowed("x@strathmore.edu.evil.com")
+
+
+def test_default_allowlist_is_strathmore():
+    from app.config import Settings
+
+    assert Settings(_env_file=None).allowed_emails == "@strathmore.edu"
+
+
+def test_domain_allowlist_blocks_outsider_at_callback(monkeypatch):
+    monkeypatch.setattr(settings, "allowed_emails", "@strathmore.edu")
+    client = _callback_client("someone@gmail.com", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 403
+    finally:
+        app.dependency_overrides.clear()
