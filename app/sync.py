@@ -154,6 +154,19 @@ def _purge_derived(session: Session, resource_id) -> None:
     session.exec(delete(Chunk).where(Chunk.resource_id == resource_id))
 
 
+def _legacy_hash_matches(adapter, data: ResourceData, legacy: str) -> bool | None:
+    """Whether the file's current bytes still hash to a pre-fingerprint
+    content hash. None when that can't be checked right now."""
+    fetch = getattr(adapter, "fetch_content", None)
+    if fetch is None:
+        return None
+    try:
+        blob = fetch(data)
+    except Exception:
+        return None
+    return hashlib.sha256(blob).hexdigest() == legacy
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     # SQLite drops tzinfo on read; compare everything as aware UTC.
     if value is None or value.tzinfo is not None:
@@ -225,12 +238,17 @@ def sync_course(
             if (hash_changed and digest.startswith(FINGERPRINT_PREFIX)
                     and existing.content_hash
                     and not existing.content_hash.startswith(FINGERPRINT_PREFIX)):
-                # One-time rebaseline from a legacy full-content hash: adopt the
-                # fingerprint without resetting (would wipe all derived data).
-                existing.content_hash = digest
-                session.add(existing)
-                session.commit()
-                hash_changed = False
+                # One-time move from a legacy full-content hash: verify against
+                # the file's bytes. Same bytes -> adopt the fingerprint and keep
+                # derived data; different -> normal reset; unverifiable (e.g.
+                # download failed) -> keep the legacy hash and retry next sync.
+                matches = _legacy_hash_matches(adapter, r, existing.content_hash)
+                if matches is not False:
+                    if matches:
+                        existing.content_hash = digest
+                        session.add(existing)
+                        session.commit()
+                    hash_changed = False
 
             if hash_changed:
                 _purge_derived(session, existing.id)

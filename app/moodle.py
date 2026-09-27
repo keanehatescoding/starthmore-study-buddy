@@ -96,10 +96,14 @@ from app.sync import (  # noqa: E402
 
 def _file_fingerprint(c: dict) -> str:
     """Change marker from core_course_get_contents file metadata, so sync
-    never downloads files (extraction fetches bytes later via raw_url)."""
+    never downloads files (extraction fetches bytes later via raw_url).
+
+    The API exposes no content hash, but fileurl embeds the module revision
+    (.../mod_resource/content/<rev>/...), which Moodle bumps on every save, so
+    a replaced file changes the marker even at the same size and mtime.
+    """
     return "|".join(
-        str(c.get(k) or "")
-        for k in ("fileurl", "filesize", "timemodified", "contenthash")
+        str(c.get(k) or "") for k in ("fileurl", "filesize", "timemodified")
     )
 
 
@@ -259,6 +263,10 @@ class MoodleAdapter:
                         )
             # else: unknown modname — skip silently in v1 (visible via counts)
         return out
+
+    def fetch_content(self, data: ResourceData) -> bytes:
+        """File bytes; sync uses this only to verify legacy content hashes."""
+        return self.client.download(data.raw_url)[0]
 
     def fetch_assignments(self, course_source_id: str) -> list[AssignmentData]:
         from datetime import datetime, timezone

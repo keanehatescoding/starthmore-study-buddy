@@ -181,22 +181,51 @@ def test_unchanged_assignment_not_counted(session, user_id):
     assert sync_course(session, adapter, "c1", user_id).assignments_updated == 1
 
 
-def test_fingerprint_rebaselines_legacy_hash_then_tracks(session, user_id):
+def _to_fingerprint(session, user_id, fetch_content):
+    """Sync with a legacy content hash, then switch the file to a fingerprint."""
     adapter = FakeAdapter()
-    sync_course(session, adapter, "c1", user_id)  # legacy full-content hash
+    sync_course(session, adapter, "c1", user_id)  # legacy full-content hash (b"v1")
     _derive(session, _resource(session, "r-file"), user_id, "file")
     f = adapter.resources[("c1", "t1")][0]
-    f.content_bytes, f.fingerprint = None, "https://x/f.pdf|100|1700000000|"
+    f.content_bytes, f.fingerprint = None, "https://x/content/1/f.pdf|100|1700000000"
+    adapter.fetch_content = fetch_content
+    return adapter, f
+
+
+def test_legacy_hash_verified_same_bytes_keeps_progress(session, user_id):
+    adapter, f = _to_fingerprint(session, user_id, lambda r: b"v1")
     stats = sync_course(session, adapter, "c1", user_id)
     assert stats.resources_updated == 0
-    assert len(session.exec(select(Chunk)).all()) == 1  # progress kept
+    assert len(session.exec(select(Chunk)).all()) == 1
     assert _resource(session, "r-file").content_hash.startswith("fp:")
-    f.fingerprint = "https://x/f.pdf|120|1700009999|"
-    stats = sync_course(session, adapter, "c1", user_id)
-    assert stats.resources_updated == 1
+    f.fingerprint = "https://x/content/2/f.pdf|100|1700000000"  # revision bump
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 1
     session.expire_all()
     assert _resource(session, "r-file").status == "pending"
     assert session.exec(select(Chunk)).all() == []
+
+
+def test_legacy_hash_verified_changed_bytes_resets(session, user_id):
+    adapter, _ = _to_fingerprint(session, user_id, lambda r: b"v2 new slides")
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 1
+    session.expire_all()
+    res = _resource(session, "r-file")
+    assert res.status == "pending" and res.content_hash.startswith("fp:")
+    assert session.exec(select(Chunk)).all() == []
+
+
+def test_legacy_hash_unverifiable_keeps_legacy_and_retries(session, user_id):
+    def down(r):
+        raise RuntimeError("moodle down")
+
+    adapter, _ = _to_fingerprint(session, user_id, down)
+    legacy = _resource(session, "r-file").content_hash
+    assert sync_course(session, adapter, "c1", user_id).resources_updated == 0
+    assert _resource(session, "r-file").content_hash == legacy
+    assert len(session.exec(select(Chunk)).all()) == 1
+    adapter.fetch_content = lambda r: b"v1"  # next sync can verify
+    sync_course(session, adapter, "c1", user_id)
+    assert _resource(session, "r-file").content_hash.startswith("fp:")
 
 
 def test_sync_all_fetches_courses_once(session, user_id):
