@@ -85,6 +85,9 @@ def csrf_token(request: Request) -> str:
     return token
 
 
+templates.env.globals["session_csrf_token"] = csrf_token
+
+
 async def checked_form(request: Request):
     """Parsed POST form, after verifying its CSRF token."""
     form = await request.form()
@@ -149,15 +152,16 @@ def auth_callback(
     )
     email = auth_mod.fetch_email(tokens["access_token"])
     allowed = allowed_emails()
-    if allowed and email.lower() not in allowed:
+    if allowed and email not in allowed:
         raise HTTPException(403, "sign-in not allowed for this account")
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
     request.session["user_id"] = str(user.id)
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.get("/logout")
-def logout(request: Request):
+@app.post("/logout")
+async def logout(request: Request):
+    await checked_form(request)
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
 

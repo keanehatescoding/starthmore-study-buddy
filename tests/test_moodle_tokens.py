@@ -86,12 +86,15 @@ def test_build_adapter_uses_users_token(shared_token):
 
 
 def test_all_users_selects_only_connected(shared_token):
+    from app.crypto import seal
     from app.sync_cli import has_credentials
 
     assert has_credentials("moodle", User(email="a@x.edu", moodle_token=encrypt_token("A")))
     assert has_credentials("moodle", User(email="owner@x.edu"))
     assert not has_credentials("moodle", User(email="b@x.edu"))
-    assert has_credentials("classroom", User(email="b@x.edu", google_refresh_token="r"))
+    sealed = seal("google-refresh-token", "r")
+    assert has_credentials("classroom", User(email="b@x.edu", google_refresh_token=sealed))
+    assert not has_credentials("classroom", User(email="b@x.edu", google_refresh_token="r"))
 
 
 def test_pipeline_downloads_as_course_owner(testapp, shared_token):

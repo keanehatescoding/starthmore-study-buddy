@@ -316,8 +316,16 @@ code {
   white-space: nowrap;
 }
 
+.logout-form {
+  margin: 0;
+}
+
 .logout-link {
+  font: inherit;
   font-size: 0.82rem;
+  background: none;
+  border: none;
+  cursor: pointer;
   color: var(--text-faint);
   padding: 0.35rem 0.65rem;
   border-radius: var(--radius-sm);

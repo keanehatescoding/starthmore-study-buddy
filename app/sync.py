@@ -123,13 +123,23 @@ class SyncStats:
 def _upsert_course(
     session: Session, source: str, user_id, data: CourseData
 ) -> tuple[Course, bool]:
-    course = session.exec(
-        select(Course).where(
-            Course.user_id == user_id,
-            Course.source == source,
-            Course.source_id == data.source_id,
-        )
-    ).first()
+    same = select(Course).where(
+        Course.source == source, Course.source_id == data.source_id
+    )
+    # NULL never equals NULL in SQL, so unowned rows need IS NULL to match.
+    unowned = same.where(Course.user_id.is_(None))
+    if user_id is None:
+        course = session.exec(unowned).first()
+    else:
+        course = session.exec(same.where(Course.user_id == user_id)).first()
+        if course is None:
+            # Adopt a pre-auth row (synced before owners existed) instead of
+            # duplicating it; syncing proves this user is enrolled.
+            course = session.exec(unowned).first()
+            if course is not None:
+                course.user_id = user_id
+                session.add(course)
+                session.commit()
     if course is None:
         course = Course(user_id=user_id, source=source, source_id=data.source_id,
                         name=data.name, code=data.code)

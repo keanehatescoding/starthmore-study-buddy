@@ -116,6 +116,21 @@ def test_same_source_course_per_user(session, user_id):
     assert len(mine) == 1
 
 
+def test_unowned_sync_reuses_unowned_course(session):
+    sync_course(session, FakeAdapter(), "c1", None)
+    stats = sync_course(session, FakeAdapter(), "c1", None)
+    assert stats.courses_new == 0
+    assert len(session.exec(select(Course)).all()) == 1
+
+
+def test_user_sync_adopts_pre_auth_course(session, user_id):
+    sync_course(session, FakeAdapter(), "c1", None)
+    stats = sync_course(session, FakeAdapter(), "c1", user_id)
+    assert stats.courses_new == 0 and stats.resources_new == 0
+    course = session.exec(select(Course)).one()
+    assert course.user_id == user_id
+
+
 def test_link_type():
     assert link_type("https://www.youtube.com/watch?v=abc") == "video"
     assert link_type("https://youtu.be/abc") == "video"
