@@ -52,7 +52,8 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | Key | Purpose |
 | --- | --- |
 | `DATABASE_URL` | Postgres connection |
-| `MOODLE_BASE_URL`, `MOODLE_TOKEN` | Moodle API (Preferences → Security keys) |
+| `MOODLE_BASE_URL` | Moodle site; users connect their own account at `/settings/moodle` |
+| `MOODLE_TOKEN`, `MOODLE_TOKEN_OWNER` | Optional fallback token, used only for that owner's email (empty = anyone) |
 | `GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN` | Classroom OAuth (Web app, Testing mode) |
 | `LLM_BASE_URL`, `LLM_API_KEY` | OpenAI-compatible endpoint |
 | `LLM_CHUNK_MODEL`, `LLM_QUIZ_MODEL`, `LLM_GRADE_MODEL` | Per-stage models (cheap → quality) |

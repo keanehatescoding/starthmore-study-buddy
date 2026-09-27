@@ -16,7 +16,7 @@ from app.config import settings
 from app.db import engine
 from app.extract import ExtractError, SkipResource, extract_resource_text
 from app.llm import QuotaExhaustedError
-from app.models import Chunk, Course, QuizItem, Resource, Topic
+from app.models import Chunk, Course, QuizItem, Resource, Topic, User
 from app.quiz import chunk_needs_quiz, generate_for_chunk
 
 
@@ -42,12 +42,44 @@ def chunkable_resources(session: Session, course_id=None):
     return [r for r in resources if r.topic_id in topic_ids]
 
 
-def run_extraction(session: Session, downloader, course_id=None) -> dict:
+def moodle_downloader_for(session: Session):
+    """Per-resource Moodle downloader acting as the course owner.
+
+    Returns a function resource -> downloader, or None when the owner has no
+    usable token (their file resources then stay pending until they connect).
+    Legacy courses without an owner use the global MOODLE_TOKEN.
+    """
+    from app.moodle import MoodleClient
+    from app.moodle_tokens import token_for
+
+    cache: dict = {}
+
+    def for_resource(r: Resource):
+        topic = session.get(Topic, r.topic_id)
+        course = session.get(Course, topic.course_id) if topic else None
+        owner_id = course.user_id if course else None
+        if owner_id not in cache:
+            user = session.get(User, owner_id) if owner_id else None
+            token = token_for(user) if user else settings.moodle_token
+            cache[owner_id] = (
+                MoodleClient(settings.moodle_base_url, token).download if token else None
+            )
+        return cache[owner_id]
+
+    return for_resource
+
+
+def run_extraction(session: Session, downloader, course_id=None, downloader_for=None) -> dict:
     counts = {"extracted": 0, "skipped": 0, "failed": 0}
     resources = pending_resources(session, course_id)
     for i, r in enumerate(resources, 1):
+        dl = downloader_for(r) if downloader_for else downloader
+        if dl is None and r.type == "file" and downloader_for:
+            # owner hasn't connected Moodle: leave pending, retry once they do
+            counts["no_token"] = counts.get("no_token", 0) + 1
+            continue
         try:
-            r.extracted_text = extract_resource_text(r, downloader)
+            r.extracted_text = extract_resource_text(r, dl)
             r.status = "extracted"
             r.error = None
             counts["extracted"] += 1
@@ -158,12 +190,8 @@ def main() -> None:
                         help="seconds between LLM calls (free-tier rate limits)")
     args = parser.parse_args()
 
-    if args.source == "moodle":
-        from app.moodle import MoodleClient
-
-        client = MoodleClient(settings.moodle_base_url, settings.moodle_token)
-        downloader = client.download
-    else:
+    downloader = None
+    if args.source != "moodle":
         def downloader(_url):
             raise ExtractError("classroom drive download needs a drive scope (v1 gap)")
 
@@ -193,7 +221,8 @@ def main() -> None:
                 raise SystemExit(f"course {args.course} not synced — run sync_cli first")
             course_id = course.id
         if not args.chunk_only and not args.quiz_only:
-            print("extraction:", run_extraction(session, downloader, course_id))
+            downloader_for = moodle_downloader_for(session) if args.source == "moodle" else None
+            print("extraction:", run_extraction(session, downloader, course_id, downloader_for))
         if not args.extract_only and not args.quiz_only:
             print("chunking:", run_chunking(session, chunk_llm, course_id))
         if not args.extract_only and not args.chunk_only:
