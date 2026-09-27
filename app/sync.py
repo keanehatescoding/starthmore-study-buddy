@@ -131,11 +131,15 @@ def _upsert_course(
     if user_id is None:
         course = session.exec(unowned).first()
     else:
-        course = session.exec(same.where(Course.user_id == user_id)).first()
+        mine = same.where(Course.user_id == user_id)
+        course = session.exec(mine).first()
         if course is None:
             # Adopt a pre-auth row (synced before owners existed) instead of
             # duplicating it; syncing proves this user is enrolled.
             course = _adopt_unowned(session, unowned, user_id)
+        if course is None:
+            # A lost claim may have gone to another sync for this same user.
+            course = session.exec(mine).first()
     if course is None:
         course = Course(user_id=user_id, source=source, source_id=data.source_id,
                         name=data.name, code=data.code)
@@ -154,7 +158,7 @@ def _adopt_unowned(session: Session, unowned, user_id) -> Course | None:
     """Claim an unowned course row for user_id, or None if there is none.
 
     The UPDATE only matches while the row is still unowned, so when two
-    users race for it exactly one wins; the loser gets its own course."""
+    syncs race for it exactly one wins."""
     course = session.exec(unowned).first()
     if course is None:
         return None

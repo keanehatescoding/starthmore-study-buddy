@@ -150,6 +150,24 @@ def test_adoption_loses_race_without_overwriting(session, user_id):
     assert course.user_id == other.id
 
 
+def test_lost_claim_to_same_user_reuses_their_course(session, user_id, monkeypatch):
+    import app.sync as sync_mod
+
+    session.add(Course(source="moodle", source_id="c1", name="CS 301"))
+    session.commit()
+
+    def lose_to_self(session, unowned, uid):
+        # a concurrent sync for the same user claims the row first
+        session.exec(sync_mod.update(Course).values(user_id=uid))
+        session.commit()
+        return None
+
+    monkeypatch.setattr(sync_mod, "_adopt_unowned", lose_to_self)
+    stats = sync_course(session, FakeAdapter(), "c1", user_id)
+    assert stats.courses_new == 0
+    assert session.exec(select(Course)).one().user_id == user_id
+
+
 def test_link_type():
     assert link_type("https://www.youtube.com/watch?v=abc") == "video"
     assert link_type("https://youtu.be/abc") == "video"

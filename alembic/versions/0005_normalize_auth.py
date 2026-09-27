@@ -11,10 +11,10 @@ migration keeps writing what it wrote at the time, whatever the app does later.
 import base64
 import hashlib
 import os
-from pathlib import Path
 
 import sqlalchemy as sa
 from cryptography.fernet import Fernet, InvalidToken
+from dotenv import dotenv_values
 
 from alembic import op
 
@@ -27,17 +27,19 @@ _PREFIX = "v1:"
 _PURPOSE = "google-refresh-token"
 
 
+def _lookup(values, name: str):
+    """Case-insensitive, like pydantic-settings' default."""
+    return next((v for k, v in values.items() if k.lower() == name), None)
+
+
 def _secret_key() -> str:
     """SECRET_KEY resolved like app.config at the time: env var, then .env
-    in the working directory, then the dev default."""
-    if "SECRET_KEY" in os.environ:
-        return os.environ["SECRET_KEY"]
-    env_file = Path(".env")
-    if env_file.is_file():
-        for line in env_file.read_text().splitlines():
-            key, sep, value = line.strip().partition("=")
-            if sep and key.strip() == "SECRET_KEY":
-                return value.strip().strip("\"'")
+    in the working directory (parsed by python-dotenv, as pydantic-settings
+    does), then the dev default."""
+    for source in (os.environ, dotenv_values(".env")):
+        value = _lookup(source, "secret_key")
+        if value is not None:
+            return value
     return "dev-insecure-change-me"
 
 

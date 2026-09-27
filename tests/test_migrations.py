@@ -1,6 +1,7 @@
 """Data migrations that can't be checked by `alembic check` alone."""
 
 import importlib.util
+import os
 import uuid
 from pathlib import Path
 
@@ -81,3 +82,28 @@ def test_0005_seals_with_secret_key_from_env(engine, monkeypatch):
     with engine.connect() as c:
         token = c.execute(text("SELECT google_refresh_token FROM users")).scalar_one()
     assert unseal("google-refresh-token", token) == "rt"  # the app can read it
+
+
+@pytest.mark.parametrize("line", [
+    "export SECRET_KEY=dotenv-key",
+    "SECRET_KEY=dotenv-key # a comment",
+    "SECRET_KEY='dotenv-key'",
+    "secret_key=dotenv-key",
+])
+def test_0005_reads_dotenv_like_the_app(line, tmp_path, monkeypatch):
+    from app.config import Settings
+
+    m = _migration("0005_normalize_auth")
+    (tmp_path / ".env").write_text(line + "\n")
+    monkeypatch.chdir(tmp_path)
+    for k in [k for k in os.environ if k.lower() == "secret_key"]:
+        monkeypatch.delenv(k)
+    assert m._secret_key() == Settings().secret_key == "dotenv-key"
+
+
+def test_0005_env_var_beats_dotenv(tmp_path, monkeypatch):
+    m = _migration("0005_normalize_auth")
+    (tmp_path / ".env").write_text("SECRET_KEY=from-file\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SECRET_KEY", "from-env")
+    assert m._secret_key() == "from-env"
