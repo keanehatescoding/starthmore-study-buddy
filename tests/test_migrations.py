@@ -1,0 +1,70 @@
+"""Data migrations that can't be checked by `alembic check` alone."""
+
+import importlib.util
+import uuid
+from pathlib import Path
+
+import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, text
+from sqlmodel import SQLModel
+
+import app.models  # noqa: F401 -- populate metadata
+from app.crypto import unseal
+
+VERSIONS = Path(__file__).parent.parent / "alembic" / "versions"
+
+
+def _migration(name: str):
+    spec = importlib.util.spec_from_file_location(name, VERSIONS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _users(engine, rows):
+    with engine.begin() as c:
+        for i, (email, token) in enumerate(rows):
+            c.execute(
+                text("INSERT INTO users (id, email, google_refresh_token, created_at) "
+                     "VALUES (:i, :e, :t, :d)"),
+                {"i": uuid.uuid4().hex, "e": email, "t": token, "d": f"2026-01-0{i + 1}"},
+            )
+
+
+def _run(engine, fn):
+    with engine.begin() as c, Operations.context(MigrationContext.configure(c)):
+        fn()
+
+
+@pytest.fixture()
+def engine():
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
+def test_0005_lowercases_one_row_per_address(engine):
+    m = _migration("0005_normalize_auth")
+    # two mixed-case variants with no lowercase row used to collide
+    _users(engine, [("A@x.edu", None), ("a@X.edu", None), ("Dup@x.edu", None),
+                    ("dup@x.edu", None), ("Solo@X.edu", "rt")])
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        emails = sorted(r[0] for r in c.execute(text("SELECT email FROM users")))
+        token = c.execute(text(
+            "SELECT google_refresh_token FROM users WHERE email = 'solo@x.edu'"
+        )).scalar_one()
+    assert emails == ["Dup@x.edu", "a@X.edu", "a@x.edu", "dup@x.edu", "solo@x.edu"]
+    assert unseal("google-refresh-token", token) == "rt"
+
+
+def test_0005_downgrade_refuses_to_null_undecryptable_tokens(engine):
+    m = _migration("0005_normalize_auth")
+    _users(engine, [("a@x.edu", "v1:not-decryptable")])
+    with pytest.raises(RuntimeError, match="SECRET_KEY"):
+        _run(engine, m.downgrade)
+    with engine.connect() as c:
+        stored = c.execute(text("SELECT google_refresh_token FROM users")).scalar_one()
+    assert stored == "v1:not-decryptable"

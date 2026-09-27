@@ -131,6 +131,25 @@ def test_user_sync_adopts_pre_auth_course(session, user_id):
     assert course.user_id == user_id
 
 
+def test_adoption_loses_race_without_overwriting(session, user_id):
+    from sqlmodel import update
+
+    from app.sync import _adopt_unowned
+
+    other = User(email="other@x.edu")
+    session.add(other)
+    session.add(Course(source="moodle", source_id="c1", name="CS 301"))
+    session.commit()
+    course = session.exec(select(Course)).one()
+    stale = select(Course).where(Course.id == course.id)  # loaded while unowned
+    # another worker claims it between our SELECT and UPDATE
+    session.exec(update(Course).values(user_id=other.id))
+    session.commit()
+    assert _adopt_unowned(session, stale, user_id) is None
+    session.refresh(course)
+    assert course.user_id == other.id
+
+
 def test_link_type():
     assert link_type("https://www.youtube.com/watch?v=abc") == "video"
     assert link_type("https://youtu.be/abc") == "video"
