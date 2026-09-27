@@ -94,12 +94,11 @@ def run_due(session: Session, limit: int = 5) -> dict:
 @handler("sync")
 def run_sync_job(session: Session, payload: dict) -> dict:
     """payload: {source, course_id|None, user_email}."""
+    from app.auth import find_user
     from app.sync import sync_all, sync_course
     from app.sync_cli import build_adapter
 
-    user = session.exec(
-        select(User).where(User.email == payload["user_email"])
-    ).first()
+    user = find_user(session, payload["user_email"])
     if user is None:
         raise ValueError(f"no such user {payload['user_email']}")
     adapter = build_adapter(payload["source"], user)

@@ -35,7 +35,9 @@ def build_adapter(source: str, user: User):
     if source == "classroom":
         from app.classroom import ClassroomAdapter, ClassroomClient, build_service
 
-        refresh = user.google_refresh_token or settings.google_refresh_token
+        from app.auth import refresh_token_for
+
+        refresh = refresh_token_for(user) or settings.google_refresh_token
         if not refresh:
             raise NotConnectedError("no classroom refresh token — log in via Google first")
         service = build_service(
@@ -50,7 +52,9 @@ def has_credentials(source: str, user: User) -> bool:
         from app.moodle_tokens import token_for
 
         return token_for(user) is not None
-    return bool(user.google_refresh_token)
+    from app.auth import refresh_token_for
+
+    return refresh_token_for(user) is not None
 
 
 def main() -> None:
@@ -85,7 +89,9 @@ def main() -> None:
                     _sync_inline(session, args.source, u, args.course)
             return
 
-        user = session.exec(select(User).where(User.email == args.user)).first()
+        from app.auth import find_user
+
+        user = find_user(session, args.user)
         if user is None:
             raise SystemExit(f"no such user {args.user} — log in via the web UI first")
         if args.enqueue:

@@ -11,38 +11,25 @@ that is unset — the single-user setup this app started as).
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import urllib.parse
 import urllib.request
 
-from cryptography.fernet import Fernet, InvalidToken
-
 from app.config import settings
+from app.crypto import seal, unseal
 from app.moodle import MoodleClient, MoodleError
 
 MOBILE_SERVICE = "moodle_mobile_app"
-_PREFIX = "v1:"
-
-
-def _fernet() -> Fernet:
-    digest = hashlib.sha256(b"moodle-token:" + settings.secret_key.encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
+_PURPOSE = "moodle-token"
 
 
 def encrypt_token(token: str) -> str:
-    return _PREFIX + _fernet().encrypt(token.encode()).decode()
+    return seal(_PURPOSE, token)
 
 
 def decrypt_token(stored: str | None) -> str | None:
     """Plain token, or None if missing/undecryptable (e.g. SECRET_KEY rotated)."""
-    if not stored or not stored.startswith(_PREFIX):
-        return None
-    try:
-        return _fernet().decrypt(stored[len(_PREFIX):].encode()).decode()
-    except InvalidToken:
-        return None
+    return unseal(_PURPOSE, stored)
 
 
 def fetch_token(base_url: str, username: str, password: str, timeout: int = 30) -> str:

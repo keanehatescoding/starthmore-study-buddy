@@ -1,4 +1,9 @@
+import os
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+INSECURE_SECRET_KEY = "dev-insecure-change-me"
 
 
 class Settings(BaseSettings):
@@ -19,10 +24,21 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     email_from: str = ""
     email_to: str = ""
-    secret_key: str = "dev-insecure-change-me"
+    secret_key: str = INSECURE_SECRET_KEY
     session_secure_cookie: bool = False
-    allowed_emails: str = ""  # comma-separated; empty = any Google account may sign in
+    # comma-separated addresses and/or "@domain" entries; empty = any Google account
+    allowed_emails: str = "@strathmore.edu"
     healthcheck_ping_url: str = ""  # e.g. healthchecks.io ping on worker success
+
+    @model_validator(mode="after")
+    def _require_real_secret_in_prod(self):
+        # SECRET_KEY signs sessions and encrypts stored tokens; the default is public.
+        in_prod = self.session_secure_cookie or any(
+            os.environ.get(k) for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME")
+        )
+        if in_prod and self.secret_key in ("", INSECURE_SECRET_KEY):
+            raise ValueError("SECRET_KEY must be set to a random value in production")
+        return self
 
 
 settings = Settings()

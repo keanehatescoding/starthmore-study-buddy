@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from sqlmodel import Session, delete, select
+from sqlmodel import Session, delete, select, update
 
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic
 
@@ -123,13 +123,23 @@ class SyncStats:
 def _upsert_course(
     session: Session, source: str, user_id, data: CourseData
 ) -> tuple[Course, bool]:
-    course = session.exec(
-        select(Course).where(
-            Course.user_id == user_id,
-            Course.source == source,
-            Course.source_id == data.source_id,
-        )
-    ).first()
+    same = select(Course).where(
+        Course.source == source, Course.source_id == data.source_id
+    )
+    # NULL never equals NULL in SQL, so unowned rows need IS NULL to match.
+    unowned = same.where(Course.user_id.is_(None))
+    if user_id is None:
+        course = session.exec(unowned).first()
+    else:
+        mine = same.where(Course.user_id == user_id)
+        course = session.exec(mine).first()
+        if course is None:
+            # Adopt a pre-auth row (synced before owners existed) instead of
+            # duplicating it; syncing proves this user is enrolled.
+            course = _adopt_unowned(session, unowned, user_id)
+        if course is None:
+            # A lost claim may have gone to another sync for this same user.
+            course = session.exec(mine).first()
     if course is None:
         course = Course(user_id=user_id, source=source, source_id=data.source_id,
                         name=data.name, code=data.code)
@@ -142,6 +152,26 @@ def _upsert_course(
         session.add(course)
         session.commit()
     return course, False
+
+
+def _adopt_unowned(session: Session, unowned, user_id) -> Course | None:
+    """Claim an unowned course row for user_id, or None if there is none.
+
+    The UPDATE only matches while the row is still unowned, so when two
+    syncs race for it exactly one wins."""
+    course = session.exec(unowned).first()
+    if course is None:
+        return None
+    claimed = session.exec(
+        update(Course)
+        .where(Course.id == course.id, Course.user_id.is_(None))
+        .values(user_id=user_id)
+    )
+    session.commit()
+    if claimed.rowcount != 1:
+        return None
+    session.refresh(course)
+    return course
 
 
 def _purge_derived(session: Session, resource_id) -> None:

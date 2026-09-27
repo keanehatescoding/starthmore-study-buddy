@@ -116,6 +116,58 @@ def test_same_source_course_per_user(session, user_id):
     assert len(mine) == 1
 
 
+def test_unowned_sync_reuses_unowned_course(session):
+    sync_course(session, FakeAdapter(), "c1", None)
+    stats = sync_course(session, FakeAdapter(), "c1", None)
+    assert stats.courses_new == 0
+    assert len(session.exec(select(Course)).all()) == 1
+
+
+def test_user_sync_adopts_pre_auth_course(session, user_id):
+    sync_course(session, FakeAdapter(), "c1", None)
+    stats = sync_course(session, FakeAdapter(), "c1", user_id)
+    assert stats.courses_new == 0 and stats.resources_new == 0
+    course = session.exec(select(Course)).one()
+    assert course.user_id == user_id
+
+
+def test_adoption_loses_race_without_overwriting(session, user_id):
+    from sqlmodel import update
+
+    from app.sync import _adopt_unowned
+
+    other = User(email="other@x.edu")
+    session.add(other)
+    session.add(Course(source="moodle", source_id="c1", name="CS 301"))
+    session.commit()
+    course = session.exec(select(Course)).one()
+    stale = select(Course).where(Course.id == course.id)  # loaded while unowned
+    # another worker claims it between our SELECT and UPDATE
+    session.exec(update(Course).values(user_id=other.id))
+    session.commit()
+    assert _adopt_unowned(session, stale, user_id) is None
+    session.refresh(course)
+    assert course.user_id == other.id
+
+
+def test_lost_claim_to_same_user_reuses_their_course(session, user_id, monkeypatch):
+    import app.sync as sync_mod
+
+    session.add(Course(source="moodle", source_id="c1", name="CS 301"))
+    session.commit()
+
+    def lose_to_self(session, unowned, uid):
+        # a concurrent sync for the same user claims the row first
+        session.exec(sync_mod.update(Course).values(user_id=uid))
+        session.commit()
+        return None
+
+    monkeypatch.setattr(sync_mod, "_adopt_unowned", lose_to_self)
+    stats = sync_course(session, FakeAdapter(), "c1", user_id)
+    assert stats.courses_new == 0
+    assert session.exec(select(Course)).one().user_id == user_id
+
+
 def test_link_type():
     assert link_type("https://www.youtube.com/watch?v=abc") == "video"
     assert link_type("https://youtu.be/abc") == "video"

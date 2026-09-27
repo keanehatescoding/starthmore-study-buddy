@@ -1,8 +1,8 @@
 """Google sign-in. One consent grants login (openid/email) AND Classroom sync.
 
 Flow: /login -> Google (with state) -> /auth/callback -> exchange code for
-tokens -> fetch email -> upsert User (storing the refresh token for
-Classroom) -> claim unowned courses -> session cookie.
+tokens -> fetch verified email -> upsert User (storing the refresh token for
+Classroom, encrypted) -> claim legacy unowned courses -> session cookie.
 """
 
 from __future__ import annotations
@@ -12,9 +12,11 @@ import secrets
 import urllib.parse
 import urllib.request
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.classroom import SCOPES as CLASSROOM_SCOPES
+from app.config import settings
+from app.crypto import seal, unseal
 from app.models import Course, User
 
 LOGIN_SCOPES = ["openid", "email", "profile", *CLASSROOM_SCOPES]
@@ -22,6 +24,7 @@ LOGIN_SCOPES = ["openid", "email", "profile", *CLASSROOM_SCOPES]
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+_REFRESH_PURPOSE = "google-refresh-token"
 
 
 class AuthError(RuntimeError):
@@ -74,30 +77,64 @@ def fetch_email(access_token: str) -> str:
             info = json.loads(resp.read().decode())
     except Exception as e:
         raise AuthError(f"userinfo failed: {e}") from e
-    email = info.get("email")
+    email = normalize_email(info.get("email") or "")
     if not email:
         raise AuthError("google did not return an email")
+    if info.get("email_verified") is not True:
+        raise AuthError("google account email is not verified")
     return email
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def refresh_token_for(user: User | None) -> str | None:
+    """The user's decrypted Google refresh token, or None."""
+    return unseal(_REFRESH_PURPOSE, getattr(user, "google_refresh_token", None))
+
+
+def find_user(session: Session, email: str) -> User | None:
+    """Case-insensitive, so rows stored before normalization still match
+    (an exact, already-normalized row wins)."""
+    email = normalize_email(email)
+    return session.exec(select(User).where(User.email == email)).first() or session.exec(
+        select(User).where(func.lower(User.email) == email)
+    ).first()
 
 
 def sign_in(
     session: Session, email: str, refresh_token: str | None = None
 ) -> User:
     """Upsert user by email, store Classroom refresh token, claim courses."""
-    user = session.exec(select(User).where(User.email == email)).first()
+    email = normalize_email(email)
+    user = find_user(session, email)
+    is_new = user is None
     if user is None:
-        user = User(email=email, google_refresh_token=refresh_token)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-    elif refresh_token and user.google_refresh_token != refresh_token:
-        user.google_refresh_token = refresh_token
-        session.add(user)
-        session.commit()
-    # first login claims courses synced before auth existed
-    for course in session.exec(select(Course).where(Course.user_id.is_(None))).all():
-        course.user_id = user.id
-        session.add(course)
+        user = User(email=email)
+    elif user.email != email:
+        user.email = email
+    if refresh_token and refresh_token_for(user) != refresh_token:
+        user.google_refresh_token = seal(_REFRESH_PURPOSE, refresh_token)
+    session.add(user)
     session.commit()
     session.refresh(user)
+    if _may_claim_unowned(session, user, is_new):
+        for course in session.exec(select(Course).where(Course.user_id.is_(None))).all():
+            course.user_id = user.id
+            session.add(course)
+        session.commit()
+        session.refresh(user)
     return user
+
+
+def _may_claim_unowned(session: Session, user: User, is_new: bool) -> bool:
+    """Courses with no owner were synced with the shared MOODLE_TOKEN before
+    sign-in existed, so only that token's owner may claim them. Without a
+    configured owner, only the very first account to sign in does."""
+    owner = normalize_email(settings.moodle_token_owner)
+    if owner:
+        return user.email == owner
+    if not is_new:
+        return False
+    return session.exec(select(func.count()).select_from(User)).one() == 1

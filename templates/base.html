@@ -71,7 +71,10 @@
             </svg>
             {{ user.email if user else 'Account' }}
           </span>
-          <a href="/logout" class="logout-link" title="Sign out of your session">Sign out</a>
+          <form method="post" action="/logout" class="logout-form">
+            <input type="hidden" name="csrf_token" value="{{ session_csrf_token(request) }}">
+            <button type="submit" class="logout-link" title="Sign out of your session">Sign out</button>
+          </form>
         </div>
         {% elif active_page != 'login' %}
         <div class="nav-user">
