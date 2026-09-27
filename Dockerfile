@@ -10,7 +10,8 @@ COPY pyproject.toml alembic.ini ./
 COPY app/ app/
 COPY alembic/ alembic/
 COPY templates/ templates/
+COPY static/ static/
 
 RUN pip install --no-cache-dir --index-url $PIP_INDEX_URL .
 
-CMD alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --forwarded-allow-ips "*"
