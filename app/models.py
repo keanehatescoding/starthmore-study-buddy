@@ -91,7 +91,7 @@ class Chunk(SQLModel, table=True):
     __tablename__ = "chunks"
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    resource_id: uuid.UUID = Field(foreign_key="resources.id", index=True)
+    resource_id: uuid.UUID = Field(foreign_key="resources.id", index=True, ondelete="CASCADE")
     title: str
     content: str = Field(sa_column=Column(Text, nullable=False))
     order: int = Field(default=0)
@@ -104,7 +104,7 @@ class QuizItem(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("generation_key", name="uq_quiz_items_gen_key"),)
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    chunk_id: uuid.UUID = Field(foreign_key="chunks.id", index=True)
+    chunk_id: uuid.UUID = Field(foreign_key="chunks.id", index=True, ondelete="CASCADE")
     question: str = Field(sa_column=Column(Text, nullable=False))
     question_type: str  # "mcq" | "short_answer"
     options: Optional[Any] = Field(default=None, sa_column=Column(JSON))
@@ -121,7 +121,9 @@ class ReviewState(SQLModel, table=True):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="users.id", index=True)
-    quiz_item_id: uuid.UUID = Field(foreign_key="quiz_items.id", index=True)
+    quiz_item_id: uuid.UUID = Field(
+        foreign_key="quiz_items.id", index=True, ondelete="CASCADE"
+    )
     ease_factor: float = Field(default=2.5)
     interval_days: int = Field(default=0)
     next_review_date: datetime = Field(
