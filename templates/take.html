@@ -64,6 +64,9 @@
     </div>
 
     {% else %}
+    {% if error %}
+    <div class="notice notice-error" role="alert">{{ error }}</div>
+    {% endif %}
     <!-- Answer Submission Form -->
     <form method="post" action="/review/{{ item.id }}/answer">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -73,7 +76,7 @@
         {% set letters = ["A", "B", "C", "D", "E", "F"] %}
         {% for o in item.options %}
         <label class="option-label">
-          <input type="radio" name="answer" value="{{ loop.index0 }}" required>
+          <input type="radio" name="answer" value="{{ loop.index0 }}"{% if answer == loop.index0|string %} checked{% endif %} required>
           <span class="option-badge">{{ letters[loop.index0] if loop.index0 < 6 else loop.index }}</span>
           <span style="flex: 1;">{{ o }}</span>
         </label>
@@ -81,7 +84,7 @@
       </div>
       {% else %}
       <div style="margin-bottom: 1.5rem;">
-        <textarea name="answer" class="answer-textarea" rows="4" cols="60" required placeholder="Type your answer…"></textarea>
+        <textarea name="answer" class="answer-textarea" rows="4" cols="60" required placeholder="Type your answer…">{{ answer }}</textarea>
         <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.35rem; margin-bottom: 0;">
           The AI grader checks your conceptual understanding leniently on phrasing.
         </p>
