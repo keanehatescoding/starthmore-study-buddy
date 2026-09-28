@@ -15,7 +15,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import auth as auth_mod
 from app.config import settings
 from app.db import get_session
-from app.grade import due_items, submit_answer
+from app.grade import InvalidAnswer, due_count, due_items, submit_answer, user_owns_item
+from app.llm import LLMClient, LLMError
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic, User
 from app.security import RateLimitMiddleware, SecurityHeadersMiddleware
 from app.stats import compute_stats
@@ -69,16 +70,6 @@ def owned_course(session: Session, user: User, course_id: UUID) -> Course:
     ):
         raise HTTPException(404, "course not found")
     return course
-
-
-def owns_item(session: Session, user: User, item: QuizItem) -> bool:
-    chunk = session.get(Chunk, item.chunk_id)
-    resource = session.get(Resource, chunk.resource_id) if chunk else None
-    topic = session.get(Topic, resource.topic_id) if resource else None
-    course = session.get(Course, topic.course_id) if topic else None
-    return course is not None and (
-        course.user_id is None or course.user_id == user.id
-    )
 
 
 def _login_redirect(request: Request):
@@ -185,19 +176,22 @@ def course_list(
         .where((Course.user_id == user.id) | (Course.user_id.is_(None)))
         .order_by(Course.name)
     ).all()
-    counts: dict[str, dict] = {}
-    for c in courses:
-        n_topics = session.exec(
-            select(func.count()).select_from(Topic).where(Topic.course_id == c.id)
-        ).one()
-        n_resources = session.exec(
-            select(func.count())
-            .select_from(Resource)
-            .join(Topic, Resource.topic_id == Topic.id)
-            .where(Topic.course_id == c.id)
-        ).one()
-        counts[str(c.id)] = {"topics": n_topics, "resources": n_resources}
-    due_count = len(due_items(session, user.id))
+    ids = [c.id for c in courses]
+    n_topics = dict(session.exec(
+        select(Topic.course_id, func.count())
+        .where(Topic.course_id.in_(ids))
+        .group_by(Topic.course_id)
+    ).all())
+    n_resources = dict(session.exec(
+        select(Topic.course_id, func.count(Resource.id))
+        .join(Resource, Resource.topic_id == Topic.id)
+        .where(Topic.course_id.in_(ids))
+        .group_by(Topic.course_id)
+    ).all())
+    counts = {
+        str(c.id): {"topics": n_topics.get(c.id, 0), "resources": n_resources.get(c.id, 0)}
+        for c in courses
+    }
     return templates.TemplateResponse(
         request,
         "courses.html",
@@ -205,7 +199,7 @@ def course_list(
             "courses": courses,
             "counts": counts,
             "user": user,
-            "due_count": due_count,
+            "due_count": due_count(session, user.id),
             "active_page": "courses",
         },
     )
@@ -326,35 +320,42 @@ async def review_answer(
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
-    form = await request.form()
-    submitted = str(form.get("csrf_token", ""))
-    expected = str(request.session.get("csrf_token", ""))
-    if not expected or not hmac.compare_digest(submitted, expected):
-        raise HTTPException(403, "invalid csrf token")
+    form = await checked_form(request)
     answer = str(form.get("answer", ""))
     item = session.get(QuizItem, item_id)
-    if item is None or not owns_item(session, user, item):
+    if item is None or not user_owns_item(session, user.id, item_id):
         raise HTTPException(404, "quiz item not found")
-    llm = None
-    if item.question_type == "short_answer":
-        from app.llm import LLMClient
 
-        llm = LLMClient(
-            settings.llm_base_url, settings.llm_api_key, settings.llm_grade_model
-        )
-    result = submit_answer(session, user.id, item.id, answer, llm)
-    queue = due_items(session, user.id)
+    def grade():
+        llm = None
+        if item.question_type == "short_answer":
+            llm = LLMClient(
+                settings.llm_base_url, settings.llm_api_key, settings.llm_grade_model
+            )
+        return submit_answer(session, user.id, item.id, answer, llm)
+
+    result, error, status = None, None, 200
+    try:
+        result = await run_in_threadpool(grade)
+    except InvalidAnswer:
+        error, status = "Pick one of the listed options.", 400
+    except LLMError:
+        # Nothing was recorded; hand the answer back so it isn't lost.
+        error, status = "The grader is unavailable right now. Your answer is below — try again shortly.", 503
     return templates.TemplateResponse(
         request,
         "take.html",
         {
             "item": item,
-            "remaining": len(queue),
+            "remaining": max(0, due_count(session, user.id) - (1 if error else 0)),
             "result": result,
+            "error": error,
+            "answer": answer if error else "",
             "csrf_token": csrf_token(request),
             "user": user,
             "active_page": "review",
         },
+        status_code=status,
     )
 
 
@@ -369,7 +370,7 @@ def stats_page(
         "stats.html",
         {
             "stats": compute_stats(session, user.id),
-            "due": len(due_items(session, user.id)),
+            "due": due_count(session, user.id),
             "user": user,
             "active_page": "stats",
         },
@@ -396,7 +397,7 @@ def moodle_settings(
             "flash": request.session.pop("flash", None),
             "csrf_token": csrf_token(request),
             "user": user,
-            "due_count": len(due_items(session, user.id)),
+            "due_count": due_count(session, user.id),
             "active_page": "settings",
         },
     )

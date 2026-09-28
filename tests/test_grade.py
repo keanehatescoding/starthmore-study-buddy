@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.grade import due_items, submit_answer
+from app.grade import InvalidAnswer, due_count, due_items, submit_answer, user_owns_item
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 
 
@@ -97,3 +97,52 @@ def test_due_queue_new_first_then_overdue(setup):
     s.add(state)
     s.commit()
     assert [i.id for i in due_items(s, user.id)] == [mcq.id]
+
+
+@pytest.mark.parametrize("bad", ["", "x", "-1", "4", "1.0"])
+def test_mcq_rejects_out_of_range_or_garbage(setup, bad):
+    s, user, mcq, _ = setup
+    with pytest.raises(InvalidAnswer):
+        submit_answer(s, user.id, mcq.id, bad)
+    assert s.exec(select(ReviewState)).first() is None  # nothing recorded
+
+
+def test_mcq_tolerates_whitespace(setup):
+    s, user, mcq, _ = setup
+    assert submit_answer(s, user.id, mcq.id, " 1 ")["correct"] is True
+
+
+def test_due_scoped_to_own_courses(setup):
+    s, user, mcq, short = setup
+    other = User(email="o@x.edu")
+    s.add(other)
+    s.commit()
+    course = Course(user_id=other.id, source="moodle", source_id="c2", name="Theirs")
+    s.add(course)
+    s.commit()
+    topic = Topic(course_id=course.id, source_id="t2", title="T2")
+    s.add(topic)
+    s.commit()
+    res = Resource(topic_id=topic.id, source="moodle", source_id="r2", type="file", title="R2")
+    s.add(res)
+    s.commit()
+    chunk = Chunk(resource_id=res.id, title="Ch2", content="t", order=0)
+    s.add(chunk)
+    s.commit()
+    theirs = QuizItem(chunk_id=chunk.id, question="Q?", question_type="mcq",
+                      options=["a", "b"], correct_answer="0", generation_key="g3")
+    s.add(theirs)
+    s.commit()
+
+    assert [i.id for i in due_items(s, user.id)] == [mcq.id, short.id]
+    assert due_count(s, user.id) == 2
+    assert not user_owns_item(s, user.id, theirs.id)
+    assert user_owns_item(s, user.id, mcq.id)
+    # the other user sees their own item plus the unclaimed course's
+    assert due_count(s, other.id) == 3
+
+
+def test_due_count_ignores_limit(setup):
+    s, user, _, _ = setup
+    assert len(due_items(s, user.id, limit=1)) == 1
+    assert due_count(s, user.id) == 2

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
-from app.grade import _aware  # noqa: F401 (shared sqlite/postgres helper)
+from app.grade import _aware, scoped_items
 from app.models import QuizItem, ReviewState, User
 
 
@@ -26,7 +26,9 @@ def compute_stats(session: Session, user_id) -> dict:
     ).all()
     verdicts = [s.last_result for s in states if s.last_result]
     correct = sum(1 for v in verdicts if v == "correct")
-    items_total = len(session.exec(select(QuizItem)).all())
+    items_total = session.exec(
+        scoped_items(user_id).with_only_columns(func.count(QuizItem.id))
+    ).one()
 
     days = {
         _aware(s.answered_at).date()

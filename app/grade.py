@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlmodel import Session, select
+from sqlalchemy import and_, or_
+from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic
@@ -51,6 +52,26 @@ def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
     }
 
 
+class InvalidAnswer(ValueError):
+    """The submitted answer can't be graded against this item (e.g. bad MCQ index)."""
+
+
+def _mcq_index(value: str, n_options: int) -> int | None:
+    try:
+        idx = int(str(value).strip())
+    except ValueError:
+        return None
+    return idx if 0 <= idx < n_options else None
+
+
+def grade_mcq(item: QuizItem, answer: str) -> float:
+    n = len(item.options or [])
+    chosen = _mcq_index(answer, n)
+    if chosen is None:
+        raise InvalidAnswer(f"answer must be an option index 0-{n - 1}")
+    return 1.0 if chosen == _mcq_index(item.correct_answer, n) else 0.0
+
+
 def _verdict(partial: float) -> str:
     if partial >= 0.6:
         return "correct"
@@ -68,7 +89,7 @@ def submit_answer(
         raise ValueError(f"quiz item {quiz_item_id} not found")
 
     if item.question_type == "mcq":
-        partial = 1.0 if answer.strip() == item.correct_answer.strip() else 0.0
+        partial = grade_mcq(item, answer)
         feedback = item.explanation or ""
     else:
         if llm is None:
@@ -115,36 +136,47 @@ def submit_answer(
     }
 
 
-def due_items(session: Session, user_id, limit: int = 20) -> list[QuizItem]:
-    """Review queue: new items (no ReviewState) first, then most-overdue.
-
-    Scoped to the user's courses (owned or still-unclaimed pre-auth rows).
-    """
-    now = datetime.now(timezone.utc)
-    owned_ids = {
-        c.id
-        for c in session.exec(
-            select(Course).where(
-                (Course.user_id == user_id) | (Course.user_id.is_(None))
-            )
-        ).all()
-    }
-    states = {
-        s.quiz_item_id: s
-        for s in session.exec(select(ReviewState).where(ReviewState.user_id == user_id)).all()
-    }
-
-    def in_scope(item: QuizItem) -> bool:
-        chunk = session.get(Chunk, item.chunk_id)
-        resource = session.get(Resource, chunk.resource_id) if chunk else None
-        topic = session.get(Topic, resource.topic_id) if resource else None
-        course = session.get(Course, topic.course_id) if topic else None
-        return course is not None and course.id in owned_ids
-
-    items = [i for i in session.exec(select(QuizItem)).all() if in_scope(i)]
-    new = [i for i in items if i.id not in states]
-    overdue = sorted(
-        (i for i in items if i.id in states and _aware(states[i.id].next_review_date) <= now),
-        key=lambda i: _aware(states[i.id].next_review_date),
+def scoped_items(user_id):
+    """QuizItems in the user's courses (owned or still-unclaimed pre-auth rows)."""
+    return (
+        select(QuizItem)
+        .join(Chunk, Chunk.id == QuizItem.chunk_id)
+        .join(Resource, Resource.id == Chunk.resource_id)
+        .join(Topic, Topic.id == Resource.topic_id)
+        .join(Course, Course.id == Topic.course_id)
+        .where((Course.user_id == user_id) | (Course.user_id.is_(None)))
     )
-    return (new + overdue)[:limit]
+
+
+def user_owns_item(session: Session, user_id, item_id) -> bool:
+    return session.exec(
+        scoped_items(user_id).where(QuizItem.id == item_id).with_only_columns(QuizItem.id)
+    ).first() is not None
+
+
+def _due(user_id, now: datetime):
+    """Scoped items with no ReviewState for this user, or one that's come due."""
+    return scoped_items(user_id).outerjoin(
+        ReviewState,
+        and_(ReviewState.quiz_item_id == QuizItem.id, ReviewState.user_id == user_id),
+    ).where(or_(ReviewState.id.is_(None), ReviewState.next_review_date <= now))
+
+
+def due_items(session: Session, user_id, limit: int = 20) -> list[QuizItem]:
+    """Review queue: new items (no ReviewState) first, then most-overdue."""
+    now = datetime.now(timezone.utc)
+    return list(session.exec(
+        _due(user_id, now)
+        .order_by(
+            ReviewState.id.is_not(None), ReviewState.next_review_date,
+            Topic.order, Chunk.order, QuizItem.generation_key,
+        )
+        .limit(limit)
+    ).all())
+
+
+def due_count(session: Session, user_id) -> int:
+    now = datetime.now(timezone.utc)
+    return session.exec(
+        _due(user_id, now).with_only_columns(func.count(QuizItem.id))
+    ).one()
