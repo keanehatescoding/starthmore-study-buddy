@@ -8,38 +8,58 @@ Chunking needs LLM_* in .env; extraction runs without it.
 from __future__ import annotations
 
 import argparse
+import time
+from collections import Counter
+from dataclasses import dataclass, field
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
-from app.chunk import chunk_resource
+from app.chunk import chunk_resource, needs_llm
 from app.config import settings
 from app.db import engine
 from app.extract import ExtractError, SkipResource, extract_resource_text
 from app.llm import QuotaExhaustedError
-from app.models import Chunk, Course, QuizItem, Resource, Topic, User
+from app.models import Chunk, Course, Resource, Topic, User
+from app.moodle import MoodleError
 from app.quiz import chunk_needs_quiz, generate_for_chunk
 
 
-def pending_resources(session: Session, course_id=None):
-    q = select(Resource).where(Resource.status == "pending")
-    resources = session.exec(q).all()
-    if course_id is None:
-        return resources
-    topic_ids = {
-        t.id for t in session.exec(select(Topic).where(Topic.course_id == course_id)).all()
-    }
-    return [r for r in resources if r.topic_id in topic_ids]
+@dataclass
+class StageResult:
+    """Integer tallies per outcome; a quota stop is a separate flag."""
+
+    counts: Counter[str] = field(default_factory=Counter)
+    quota_exhausted: bool = False
+
+    def __str__(self) -> str:
+        out = ", ".join(f"{k}={v}" for k, v in self.counts.items())
+        return out + (" (quota_exhausted: stopped, re-run to resume)"
+                      if self.quota_exhausted else "")
 
 
-def chunkable_resources(session: Session, course_id=None):
-    q = select(Resource).where(Resource.extracted_text.is_not(None))
-    resources = session.exec(q).all()
+def _in_course(q, course_id):
+    """Restrict a Resource-joinable query to one course (None = all)."""
     if course_id is None:
-        return resources
-    topic_ids = {
-        t.id for t in session.exec(select(Topic).where(Topic.course_id == course_id)).all()
-    }
-    return [r for r in resources if r.topic_id in topic_ids]
+        return q
+    return q.join(Topic, Topic.id == Resource.topic_id).where(Topic.course_id == course_id)
+
+
+def pending_resource_ids(session: Session, course_id=None) -> list:
+    q = select(Resource.id).where(Resource.status == "pending").order_by(Resource.id)
+    return session.exec(_in_course(q, course_id)).all()
+
+
+def chunkable_resource_ids(session: Session, course_id=None) -> list:
+    # ids only: loading every extracted_text up front is what blew memory
+    q = (select(Resource.id).where(Resource.extracted_text.is_not(None))
+         .order_by(Resource.id))
+    return session.exec(_in_course(q, course_id)).all()
+
+
+def quiz_chunk_ids(session: Session, course_id=None) -> list:
+    q = (select(Chunk.id).join(Resource, Resource.id == Chunk.resource_id)
+         .order_by(Chunk.resource_id, Chunk.order))
+    return session.exec(_in_course(q, course_id)).all()
 
 
 def moodle_downloader_for(session: Session):
@@ -69,14 +89,17 @@ def moodle_downloader_for(session: Session):
     return for_resource
 
 
-def run_extraction(session: Session, downloader, course_id=None, downloader_for=None) -> dict:
-    counts = {"extracted": 0, "skipped": 0, "failed": 0}
-    resources = pending_resources(session, course_id)
-    for i, r in enumerate(resources, 1):
+def run_extraction(session: Session, downloader, course_id=None,
+                   downloader_for=None) -> StageResult:
+    result = StageResult(Counter(extracted=0, skipped=0, failed=0))
+    counts = result.counts
+    ids = pending_resource_ids(session, course_id)
+    for i, rid in enumerate(ids, 1):
+        r = session.get(Resource, rid)
         dl = downloader_for(r) if downloader_for else downloader
         if dl is None and r.type == "file" and downloader_for:
             # owner hasn't connected Moodle: leave pending, retry once they do
-            counts["no_token"] = counts.get("no_token", 0) + 1
+            counts["no_token"] += 1
             continue
         try:
             r.extracted_text = extract_resource_text(r, dl)
@@ -87,96 +110,101 @@ def run_extraction(session: Session, downloader, course_id=None, downloader_for=
             r.status = "skipped"
             r.error = None
             counts["skipped"] += 1
+        except MoodleError as e:
+            # network blip or rejected token: keep pending so the next run retries
+            r.error = str(e)[:500]
+            counts["download_errors"] += 1
         except ExtractError as e:
             r.status = "failed"
             r.error = str(e)[:500]
             counts["failed"] += 1
+        except Exception as e:  # parser crash on one bad file must not end the run
+            r.status = "failed"
+            r.error = f"{type(e).__name__}: {e}"[:500]
+            counts["failed"] += 1
         session.add(r)
         session.commit()
-        print(f"  extract {i}/{len(resources)} {r.status}: {r.title[:60]}", flush=True)
-    return counts
+        print(f"  extract {i}/{len(ids)} {r.status}: {r.title[:60]}", flush=True)
+    return result
 
 
-def run_chunking(session: Session, llm, course_id=None, pace: float = 4.0) -> dict:
-    counts = {"chunks": 0, "cached": 0, "resources": 0}
-    resources = chunkable_resources(session, course_id)
-    for i, r in enumerate(resources, 1):
-        n_existing = len(
-            session.exec(select(Chunk).where(Chunk.resource_id == r.id)).all()
-        )
+def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0) -> StageResult:
+    result = StageResult(Counter(chunks=0, cached=0, resources=0))
+    counts = result.counts
+    ids = chunkable_resource_ids(session, course_id)
+    for i, rid in enumerate(ids, 1):
+        r = session.get(Resource, rid)
+        has_chunks = session.exec(
+            select(func.count()).select_from(Chunk).where(Chunk.resource_id == r.id)
+        ).one()
+        if has_chunks and r.status == "extracted":
+            counts["cached"] += 1
+            continue
+        if llm is None and needs_llm(r):
+            counts["needs_llm"] += 1  # left untouched for a run with LLM_* set
+            continue
         try:
             n = chunk_resource(session, r, llm)
         except QuotaExhaustedError as e:
             print(f"  quota exhausted, stopping run (resumable): {str(e)[:120]}",
                   flush=True)
-            counts["quota_exhausted"] = True
+            result.quota_exhausted = True
             break
         except Exception as e:
-            counts["errors"] = counts.get("errors", 0) + 1
-            print(f"  error on resource {r.id}: {str(e)[:120]}", flush=True)
+            session.rollback()
+            counts["errors"] += 1
+            print(f"  error on resource {rid}: {str(e)[:120]}", flush=True)
             continue
         counts["chunks"] += n
-        print(f"  chunk {i}/{len(resources)} +{n}: {r.title[:60]}", flush=True)
-        if n == 0 and n_existing:
-            counts["cached"] += 1
-        elif n:
+        print(f"  chunk {i}/{len(ids)} +{n}: {r.title[:60]}", flush=True)
+        if n:
             counts["resources"] += 1
-            if pace:
-                import time
-
+            if pace and needs_llm(r):
                 time.sleep(pace)
-    return counts
+    return result
 
 
 def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
-             pace: float = 8.0) -> dict:
+             pace: float = 0.0) -> StageResult:
     from uuid import UUID
 
     from app.notify import course_of_chunk, enqueue_new_material
 
-    counts = {"items": 0, "chunks": 0, "skipped": 0}
-    per_course: dict[str, int] = {}
-    q = select(Chunk)
-    chunks = session.exec(q).all()
-    if course_id is not None:
-        topic_ids = {
-            t.id for t in session.exec(select(Topic).where(Topic.course_id == course_id)).all()
-        }
-        res_ids = {
-            r.id for r in session.exec(select(Resource)).all() if r.topic_id in topic_ids
-        }
-        chunks = [c for c in chunks if c.resource_id in res_ids]
-    for chunk in chunks:
-        if not chunk_needs_quiz(session, chunk.id, attempt):
+    result = StageResult(Counter(items=0, chunks=0, skipped=0))
+    counts = result.counts
+    per_course: Counter[str] = Counter()
+    ids = quiz_chunk_ids(session, course_id)
+    for chunk_id in ids:
+        if not chunk_needs_quiz(session, chunk_id, attempt):
             counts["skipped"] += 1
             continue
+        chunk = session.get(Chunk, chunk_id)
         try:
             items = generate_for_chunk(session, chunk, llm, attempt)
         except QuotaExhaustedError as e:
             print(f"  quota exhausted, stopping run (resumable): {str(e)[:120]}",
                   flush=True)
-            counts["quota_exhausted"] = True
+            result.quota_exhausted = True
             break
         except Exception as e:
-            counts["errors"] = counts.get("errors", 0) + 1
-            print(f"  error on chunk {chunk.id}: {str(e)[:120]}", flush=True)
+            session.rollback()
+            counts["errors"] += 1
+            print(f"  error on chunk {chunk_id}: {str(e)[:120]}", flush=True)
             continue
         counts["items"] += len(items)
         counts["chunks"] += 1
-        print(f"  +{len(items)} items ({counts['chunks']}/{len(chunks)} chunks)",
+        print(f"  +{len(items)} items ({counts['chunks']}/{len(ids)} chunks)",
               flush=True)
         if items:
             course = course_of_chunk(session, chunk)
             if course is not None:
-                per_course[str(course.id)] = per_course.get(str(course.id), 0) + len(items)
+                per_course[str(course.id)] += len(items)
         if pace:
-            import time
-
             time.sleep(pace)
     for cid, n in per_course.items():
         enqueue_new_material(session, UUID(cid), n)
-        counts["events"] = counts.get("events", 0) + 1
-    return counts
+        counts["events"] += 1
+    return result
 
 
 def main() -> None:
@@ -186,8 +214,9 @@ def main() -> None:
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--chunk-only", action="store_true")
     parser.add_argument("--quiz-only", action="store_true")
-    parser.add_argument("--pace", type=float, default=8.0,
-                        help="seconds between LLM calls (free-tier rate limits)")
+    parser.add_argument("--pace", type=float, default=settings.llm_pace,
+                        help="seconds between LLM calls (default LLM_PACE; "
+                             "raise it for free-tier rate limits)")
     args = parser.parse_args()
 
     downloader = None
@@ -224,7 +253,7 @@ def main() -> None:
             downloader_for = moodle_downloader_for(session) if args.source == "moodle" else None
             print("extraction:", run_extraction(session, downloader, course_id, downloader_for))
         if not args.extract_only and not args.quiz_only:
-            print("chunking:", run_chunking(session, chunk_llm, course_id))
+            print("chunking:", run_chunking(session, chunk_llm, course_id, pace=args.pace))
         if not args.extract_only and not args.chunk_only:
             print("quiz:", run_quiz(session, quiz_llm, course_id, pace=args.pace))
 

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     llm_chunk_model: str = "gemini-3.6-flash"
     llm_quiz_model: str = "gemini-3.6-flash"
     llm_grade_model: str = "gemini-3.6-flash"
+    llm_pace: float = 0.0  # seconds between pipeline LLM calls; ~5-45 on free tiers
     resend_api_key: str = ""
     email_from: str = ""
     email_to: str = ""

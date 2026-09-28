@@ -124,6 +124,6 @@ def test_run_quiz_aborts_on_quota():
                 type(self).calls += 1
                 raise QuotaExhaustedError("gone")
 
-        counts = run_quiz(s, DeadLLM(), pace=0)
-        assert counts.get("quota_exhausted") is True
-        assert counts["items"] == 0 and DeadLLM.calls == 1  # stopped, not ground through
+        result = run_quiz(s, DeadLLM(), pace=0)
+        assert result.quota_exhausted is True
+        assert result.counts["items"] == 0 and DeadLLM.calls == 1  # stopped, not ground through

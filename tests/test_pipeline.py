@@ -15,7 +15,8 @@ from app.extract import (
     extract_resource_text,
 )
 from app.models import Chunk, Course, Resource, Topic
-from app.pipeline import run_chunking, run_extraction
+from app.moodle import MoodleError
+from app.pipeline import quiz_chunk_ids, run_chunking, run_extraction
 
 
 class FakeLLM:
@@ -152,11 +153,72 @@ def test_run_extraction_counts(session):
     _resource(session, source_id="ok", type="page_text", text="page content here",
               extracted_text="page content here")
     _resource(session, source_id="skip", type="link", raw_url="https://example.com")
-    counts = run_extraction(session, downloader=None)
+    counts = run_extraction(session, downloader=None).counts
     assert counts == {"extracted": 1, "skipped": 1, "failed": 0}
+
+
+def test_run_extraction_survives_download_errors(session):
+    _resource(session, source_id="down", raw_url="https://m.example/down.txt")
+    _resource(session, source_id="bad", raw_url="https://m.example/bad.bin")
+    _resource(session, source_id="ok", raw_url="https://m.example/ok.txt")
+
+    def downloader(url):
+        if "down" in url:
+            raise MoodleError("download failed: timed out")
+        if "bad" in url:
+            raise ValueError("parser blew up")  # stands in for a library crash
+        return b"plain text notes", "text/plain"
+
+    counts = run_extraction(session, downloader).counts
+    assert counts == {"extracted": 1, "skipped": 0, "failed": 1, "download_errors": 1}
+    by_id = {r.source_id: r for r in session.exec(select(Resource)).all()}
+    assert by_id["down"].status == "pending"  # retried next run
+    assert "timed out" in by_id["down"].error
+    assert by_id["bad"].status == "failed" and "ValueError" in by_id["bad"].error
+    assert by_id["ok"].status == "extracted"
 
 
 def test_run_chunking_counts(session):
     _resource(session, source_id="a", status="extracted", extracted_text="short one")
-    counts = run_chunking(session, None)
+    counts = run_chunking(session, None).counts
     assert counts["chunks"] == 1 and counts["resources"] == 1
+    assert run_chunking(session, None).counts["cached"] == 1
+
+
+def test_chunk_without_llm_leaves_long_text_alone(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500)
+    assert chunk_resource(session, r, FakeLLM()) == 2
+    r.status = "pending"  # content changed; stale chunks await an LLM run
+    session.add(r)
+    session.commit()
+    assert chunk_resource(session, r, None) == 0
+    session.refresh(r)
+    assert r.status == "pending" and r.error is None
+    assert len(session.exec(select(Chunk)).all()) == 2  # not deleted
+
+
+def test_run_chunking_without_llm_skips_not_fails(session):
+    _resource(session, source_id="long", status="extracted", extracted_text="x" * 500)
+    result = run_chunking(session, None)
+    assert result.counts["needs_llm"] == 1 and result.counts["chunks"] == 0
+    r = session.exec(select(Resource)).one()
+    assert r.status == "extracted" and r.error is None
+
+
+def test_stage_ids_are_scoped_to_course(session):
+    mine = _resource(session, source_id="m", status="extracted", extracted_text="t")
+    other_course = Course(source="moodle", source_id="c2", name="Other")
+    session.add(other_course)
+    session.commit()
+    other_topic = Topic(course_id=other_course.id, source_id="t2", title="T2")
+    session.add(other_topic)
+    session.commit()
+    theirs = _resource(session, source_id="o", topic_id=other_topic.id,
+                       status="extracted", extracted_text="t")
+    for res in (mine, theirs):
+        session.add(Chunk(resource_id=res.id, title="c", content="t", order=0))
+    session.commit()
+    mine_chunk = session.exec(select(Chunk).where(Chunk.resource_id == mine.id)).one()
+    my_course_id = session.get(Topic, mine.topic_id).course_id
+    assert quiz_chunk_ids(session, my_course_id) == [mine_chunk.id]
+    assert len(quiz_chunk_ids(session)) == 2

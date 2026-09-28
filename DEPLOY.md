@@ -22,8 +22,9 @@
    ```
    python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.worker
    ```
-   Run chunking/quiz generation paced (`--pace 45`) afterwards — the free
-   Gemini tier rate-limits hard, so don't bundle them into the same cron slot.
+   Run chunking/quiz generation paced (`--pace 45`, or set `LLM_PACE`)
+   afterwards — the free Gemini tier rate-limits hard, so don't bundle
+   them into the same cron slot.
    All three steps are idempotent; re-running is always safe.
 
 ## Single VPS (podman)

@@ -93,8 +93,17 @@ def chunk_sections(sections: list[str], llm: LLMClient) -> list[dict]:
     return out
 
 
+def needs_llm(resource) -> bool:
+    return len(resource.extracted_text or "") >= MIN_LLM_CHARS
+
+
 def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> int:
-    """Chunk one extracted resource. Returns number of chunks created (0 if cached)."""
+    """Chunk one extracted resource. Returns number of chunks created.
+
+    Returns 0 without touching anything when cached, or when the text is long
+    enough to need an LLM and none was given (extract-only runs must not mark
+    resources failed or drop their existing chunks).
+    """
     from app.models import Resource  # noqa: F401 (type hint only)
 
     existing = session.exec(
@@ -102,14 +111,15 @@ def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> 
     ).all()
     if existing and resource.status == "extracted":
         return 0  # cached
+    if llm is None and needs_llm(resource):
+        return 0  # leave as-is for a run that has an LLM
     for c in existing:  # content changed -> regenerate, don't version
         session.delete(c)
     session.commit()
 
     text = resource.extracted_text or ""
-    items = [{"title": text[:80], "content": text}] if len(text) < MIN_LLM_CHARS else (
-        chunk_sections(presplit(text), llm) if llm else []
-    )
+    items = (chunk_sections(presplit(text), llm) if needs_llm(resource)
+             else [{"title": text[:80], "content": text}])
     for order, item in enumerate(items):
         start, end = locate(item["content"], text)
         session.add(
