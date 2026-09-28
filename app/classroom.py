@@ -10,8 +10,13 @@ without the google libs installed.
 
 Known v1 limitation: Drive-file materials need a Drive scope to download,
 which the plan's minimal scope set deliberately excludes. Those resources
-sync as metadata (hash of the Drive link) with status pending; extraction
+sync as metadata (hash of the Drive file id) with status pending; extraction
 will mark them failed/skipped with a clear error until the scope is added.
+Without that scope, edits inside the same Drive file can't be seen; swapping
+the attachment for another file (new id) or renaming it is picked up.
+
+Materials with no topic, or whose topic was deleted, sync under a synthetic
+"Other materials" topic (UNTAGGED_TOPIC_ID) instead of being dropped.
 """
 
 from __future__ import annotations
@@ -65,60 +70,37 @@ class ClassroomClient:
     def __init__(self, service):
         self.service = service
 
-    def _pages(self, request):
+    def _pages(self, collection, request):
+        # list_next carries the token itself; the first call sends none.
         while request is not None:
             resp = request.execute()
             yield resp
-            request = self.service.courses().list_next(request, resp)
+            request = collection.list_next(request, resp)
 
-    def list_courses(self) -> list[dict]:
+    def _list_all(self, collection, key: str, **params) -> list[dict]:
         out = []
-        req = self.service.courses().list(courseStates=["ACTIVE"], pageSize=100)
-        for page in self._pages(req):
-            out.extend(page.get("courses", []))
+        for page in self._pages(collection, collection.list(pageSize=100, **params)):
+            out.extend(page.get(key, []))
         return out
 
+    def list_courses(self) -> list[dict]:
+        return self._list_all(self.service.courses(), "courses", courseStates=["ACTIVE"])
+
     def list_topics(self, course_id: str) -> list[dict]:
-        out, token = [], None
-        while True:
-            resp = (
-                self.service.courses()
-                .topics()
-                .list(courseId=course_id, pageSize=100, pageToken=token)
-                .execute()
-            )
-            out.extend(resp.get("topic", []))
-            token = resp.get("nextPageToken")
-            if not token:
-                return out
+        # ListTopicResponse's array really is singular "topic" (as with
+        # "courseWorkMaterial" below), unlike "courses"/"courseWork".
+        return self._list_all(self.service.courses().topics(), "topic", courseId=course_id)
 
     def list_materials(self, course_id: str) -> list[dict]:
-        out, token = [], None
-        while True:
-            resp = (
-                self.service.courses()
-                .courseWorkMaterials()
-                .list(courseId=course_id, pageSize=100, pageToken=token)
-                .execute()
-            )
-            out.extend(resp.get("courseWorkMaterial", []))
-            token = resp.get("nextPageToken")
-            if not token:
-                return out
+        return self._list_all(
+            self.service.courses().courseWorkMaterials(), "courseWorkMaterial",
+            courseId=course_id,
+        )
 
     def list_coursework(self, course_id: str) -> list[dict]:
-        out, token = [], None
-        while True:
-            resp = (
-                self.service.courses()
-                .courseWork()
-                .list(courseId=course_id, pageSize=100, pageToken=token)
-                .execute()
-            )
-            out.extend(resp.get("courseWork", []))
-            token = resp.get("nextPageToken")
-            if not token:
-                return out
+        return self._list_all(
+            self.service.courses().courseWork(), "courseWork", courseId=course_id
+        )
 
 
 # -- adapter -------------------------------------------------------------------
@@ -137,6 +119,9 @@ class ClassroomAdapter:
 
     def __init__(self, client: ClassroomClient):
         self.client = client
+        # course id -> (known topic ids, materials); refreshed by fetch_topics
+        # so each course sync lists materials once, not once per topic.
+        self._materials: dict[str, tuple[set[str], list[dict]]] = {}
 
     def fetch_courses(self) -> list[CourseData]:
         return [
@@ -149,17 +134,26 @@ class ClassroomAdapter:
         ]
 
     def fetch_topics(self, course_source_id: str) -> list[TopicData]:
-        return [
+        topics = [
             TopicData(source_id=t["topicId"], title=t.get("name", ""), order=i)
             for i, t in enumerate(self.client.list_topics(course_source_id))
         ]
+        known = {t.source_id for t in topics}
+        materials = self.client.list_materials(course_source_id)
+        self._materials[course_source_id] = (known, materials)
+        if any(_topic_of(m, known) == UNTAGGED_TOPIC_ID for m in materials):
+            topics.append(TopicData(UNTAGGED_TOPIC_ID, UNTAGGED_TITLE, len(topics)))
+        return topics
 
     def fetch_resources(
         self, course_source_id: str, topic_source_id: str
     ) -> list[ResourceData]:
+        if course_source_id not in self._materials:
+            self.fetch_topics(course_source_id)
+        known, materials = self._materials[course_source_id]
         out: list[ResourceData] = []
-        for m in self.client.list_materials(course_source_id):
-            if m.get("topicId") != topic_source_id:
+        for m in materials:
+            if _topic_of(m, known) != topic_source_id:
                 continue
             for i, mat in enumerate(m.get("materials", [])):
                 sid = f"{m['id']}:{i}"
@@ -184,16 +178,13 @@ class ClassroomAdapter:
                         )
                     )
                 elif "driveFile" in mat:
-                    df = mat["driveFile"]
-                    link = (df.get("driveFile") or {}).get("alternateLink") or df.get(
-                        "alternateLink"
-                    )
+                    # SharedDriveFile{driveFile: DriveFile{id, title, alternateLink}}
+                    df = mat["driveFile"].get("driveFile") or {}
                     out.append(
                         ResourceData(
                             topic_source_id, sid, "file", df.get("title") or title,
-                            raw_url=link,
-                            mime_type=df.get("mimeType") or (df.get("driveFile") or {}).get("mimeType"),
-                            content_bytes=(f"drive:{link}".encode() if link else None),
+                            raw_url=df.get("alternateLink"),
+                            content_bytes=_drive_marker(df),
                         )
                     )
                 elif "form" in mat:
@@ -227,3 +218,19 @@ class ClassroomAdapter:
                 )
             )
         return out
+
+
+UNTAGGED_TOPIC_ID = "untagged"  # Classroom topic ids are numeric; can't collide
+UNTAGGED_TITLE = "Other materials"
+
+
+def _topic_of(material: dict, known: set[str]) -> str:
+    topic_id = material.get("topicId")
+    return topic_id if topic_id in known else UNTAGGED_TOPIC_ID
+
+
+def _drive_marker(drive_file: dict) -> bytes | None:
+    """Stable change marker: the Drive file id (link as fallback), never None
+    while the attachment is identifiable."""
+    ref = drive_file.get("id") or drive_file.get("alternateLink")
+    return f"drive:{ref}".encode() if ref else None
