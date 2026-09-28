@@ -195,6 +195,18 @@ def test_due_sync_claimed_before_earlier_notify(session, fake_handler, monkeypat
     assert order == ["notify"]
 
 
+def test_notify_waits_for_sync_running_elsewhere(session, fake_handler, monkeypatch):
+    order: list = []
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: order.append("notify"))
+    sync = enqueue(session, "fake", {"n": 1})
+    _set(session, sync, status="running", attempts=1)  # another worker's claim
+    enqueue(session, "send_notifications")
+    assert run_due(session) == {"completed": 0, "failed": 0, "retried": 0}
+    _set(session, sync, status="completed")
+    run_due(session)
+    assert order == ["notify"]
+
+
 def test_only_one_active_notify_job(session):
     enqueue(session, "send_notifications")
     with pytest.raises(IntegrityError):

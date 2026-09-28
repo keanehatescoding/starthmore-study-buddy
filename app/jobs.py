@@ -13,8 +13,8 @@ instead of blocking the CLI caller.
   RUNNING_TIMEOUT (its worker died) is reaped back to pending, or to failed
   once its attempts are used up. `attempts` doubles as the claim token, so a
   worker whose claim was reaped and re-taken can't record its result.
-- Due sync jobs are claimed before send_notifications, so a pass notifies
-  about what it just synced.
+- send_notifications is only claimed once no other job is running or due,
+  on any worker, so it never notifies about half-synced data.
 - Job types: "sync" (Moodle/Classroom course sync), "send_notifications".
 """
 
@@ -23,7 +23,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, update
+from sqlalchemy import and_, exists, or_, update
+from sqlalchemy.orm import aliased
 from sqlmodel import Session, select
 
 from app.models import Job, User
@@ -78,13 +79,24 @@ def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> int:
 
 def _claim_next(session: Session) -> Job | None:
     """Atomically move the oldest due pending job to running."""
+    now = _utcnow()
+    other = aliased(Job)
+    # A job is pending-and-due or running at every instant (the claim flips
+    # it in one commit), so this can't miss a sync another worker is taking.
+    busy = exists().where(
+        other.type != "send_notifications",
+        or_(
+            other.status == "running",
+            and_(other.status == "pending", other.available_at <= now),
+        ),
+    )
     job = session.exec(
         select(Job)
-        .where(Job.status == "pending", Job.available_at <= _utcnow())
-        .order_by(
-            case((Job.type == "send_notifications", 1), else_=0),
-            Job.created_at,
+        .where(
+            Job.status == "pending", Job.available_at <= now,
+            or_(Job.type != "send_notifications", ~busy),
         )
+        .order_by(Job.created_at)
         .limit(1)
         .with_for_update(skip_locked=True)
     ).first()
