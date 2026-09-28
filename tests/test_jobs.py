@@ -4,9 +4,10 @@ stale-running reaper, and the worker's single notify path."""
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import worker
+from app import jobs, worker
 from app.jobs import HANDLERS, RUNNING_TIMEOUT, enqueue, run_due
 from app.models import Job
 
@@ -181,3 +182,85 @@ def test_worker_skips_enqueue_when_notify_already_queued(worker_engine, monkeypa
     assert calls == [1]
     with Session(worker_engine) as s:
         assert len(s.exec(select(Job)).all()) == 1
+
+
+def test_due_sync_claimed_before_earlier_notify(session, fake_handler, monkeypatch):
+    order: list = []
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: order.append("notify"))
+    enqueue(session, "send_notifications")
+    enqueue(session, "fake", {"n": 1})
+    run_due(session, limit=1)
+    assert fake_handler == [{"n": 1}] and order == []
+    run_due(session)
+    assert order == ["notify"]
+
+
+def test_only_one_active_notify_job(session):
+    enqueue(session, "send_notifications")
+    with pytest.raises(IntegrityError):
+        enqueue(session, "send_notifications")
+    session.rollback()
+    row = session.exec(select(Job)).one()
+    _set(session, row, status="completed")
+    enqueue(session, "send_notifications")  # finished ones don't count
+
+
+@pytest.fixture()
+def file_engine(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}")
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
+def test_result_from_reclaimed_job_rejected(file_engine, monkeypatch):
+    def overtaken(s, payload):
+        # Another worker reaps this job's lapsed lease and claims it again.
+        with Session(file_engine) as other:
+            row = other.get(Job, job_id)
+            row.attempts += 1
+            other.add(row)
+            other.commit()
+        return {"stale": True}
+
+    monkeypatch.setitem(HANDLERS, "overtaken", overtaken)
+    with Session(file_engine) as s:
+        job_id = enqueue(s, "overtaken", {}).id
+        out = run_due(s)
+    assert out["lost"] == 1 and out["completed"] == 0
+    with Session(file_engine) as s:
+        row = s.get(Job, job_id)
+    assert row.status == "running" and row.attempts == 2
+    assert "result" not in row.payload
+
+
+def test_heartbeat_renews_lease_while_handler_runs(file_engine, monkeypatch):
+    import time
+
+    seen: list = []
+
+    def slow(s, payload):
+        for _ in range(2):
+            with Session(file_engine) as other:
+                seen.append(other.get(Job, job_id).updated_at)
+            time.sleep(0.2)
+        return {}
+
+    monkeypatch.setattr(jobs, "HEARTBEAT_EVERY", timedelta(seconds=0.05))
+    monkeypatch.setitem(HANDLERS, "slow", slow)
+    with Session(file_engine) as s:
+        job_id = enqueue(s, "slow", {}).id
+        assert run_due(s)["completed"] == 1
+    assert seen[1] > seen[0]
+
+
+def test_worker_replaces_orphaned_notify_job_same_pass(worker_engine, monkeypatch):
+    calls: list = []
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: calls.append(1))
+    old = datetime.now(timezone.utc) - RUNNING_TIMEOUT - timedelta(minutes=1)
+    with Session(worker_engine) as s:
+        job = enqueue(s, "send_notifications", max_attempts=1)
+        _set(s, job, status="running", attempts=1, updated_at=old)
+    out = worker.run_once()
+    assert calls == [1] and out["reaped"] == 1
+    with Session(worker_engine) as s:
+        assert sorted(j.status for j in s.exec(select(Job)).all()) == ["completed", "failed"]

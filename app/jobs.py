@@ -8,24 +8,32 @@ instead of blocking the CLI caller.
   take the same job.
 - Failed jobs retry with backoff until max_attempts, then stay failed with
   the error recorded. Nothing is silently dropped.
-- A job left "running" longer than RUNNING_TIMEOUT (its worker died) is
-  reaped back to pending, or to failed once its attempts are used up.
+- A claim is a lease: while a handler runs, a heartbeat thread renews the
+  job's updated_at every HEARTBEAT_EVERY. A job whose lease lapses for
+  RUNNING_TIMEOUT (its worker died) is reaped back to pending, or to failed
+  once its attempts are used up. `attempts` doubles as the claim token, so a
+  worker whose claim was reaped and re-taken can't record its result.
+- Due sync jobs are claimed before send_notifications, so a pass notifies
+  about what it just synced.
 - Job types: "sync" (Moodle/Classroom course sync), "send_notifications".
 """
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import case, update
 from sqlmodel import Session, select
 
 from app.models import Job, User
 
 HANDLERS: dict[str, callable] = {}
 
-# Longest a job may sit in "running" before it's presumed orphaned. Generous:
-# a full-course sync with slow Moodle/Drive downloads can take a while.
-RUNNING_TIMEOUT = timedelta(hours=1)
+# A running job's lease is renewed every HEARTBEAT_EVERY; one not renewed for
+# RUNNING_TIMEOUT is presumed orphaned. Handler runtime itself is unbounded.
+HEARTBEAT_EVERY = timedelta(minutes=1)
+RUNNING_TIMEOUT = timedelta(minutes=10)
 
 
 def handler(job_type: str):
@@ -73,7 +81,10 @@ def _claim_next(session: Session) -> Job | None:
     job = session.exec(
         select(Job)
         .where(Job.status == "pending", Job.available_at <= _utcnow())
-        .order_by(Job.created_at)
+        .order_by(
+            case((Job.type == "send_notifications", 1), else_=0),
+            Job.created_at,
+        )
         .limit(1)
         .with_for_update(skip_locked=True)
     ).first()
@@ -86,6 +97,53 @@ def _claim_next(session: Session) -> Job | None:
     return job
 
 
+def _held(job_id, claim: int):
+    """WHERE clause matching a job only while this claim still owns it."""
+    return (Job.id == job_id) & (Job.status == "running") & (Job.attempts == claim)
+
+
+class _Heartbeat:
+    """Renews a claimed job's lease from a side thread while its handler runs."""
+
+    def __init__(self, bind, job_id, claim: int):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(bind, job_id, claim), daemon=True
+        )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+
+    def _run(self, bind, job_id, claim: int) -> None:
+        while not self._stop.wait(HEARTBEAT_EVERY.total_seconds()):
+            try:
+                with Session(bind) as s:
+                    renewed = s.execute(
+                        update(Job).where(_held(job_id, claim))
+                        .values(updated_at=_utcnow())
+                    ).rowcount
+                    s.commit()
+            except Exception:  # noqa: BLE001 — a missed beat is retried next tick
+                continue
+            if not renewed:
+                return  # reaped; _finish will reject this claim's result
+
+
+def _finish(session: Session, job_id, claim: int, **values) -> bool:
+    """Record the outcome if this claim still owns the job."""
+    done = session.execute(
+        update(Job).where(_held(job_id, claim))
+        .values(**values, updated_at=_utcnow())
+    ).rowcount
+    session.commit()
+    return bool(done)
+
+
 def run_due(session: Session, limit: int = 5) -> dict:
     """Claim and execute up to `limit` due pending jobs. Returns a summary."""
     summary: dict = {"completed": 0, "failed": 0, "retried": 0}
@@ -96,30 +154,31 @@ def run_due(session: Session, limit: int = 5) -> dict:
         job = _claim_next(session)
         if job is None:
             break
+        job_id, claim, payload = job.id, job.attempts, dict(job.payload)
+        max_attempts = job.max_attempts
         fn = HANDLERS.get(job.type)
         try:
             if fn is None:
                 raise ValueError(f"no handler for job type {job.type!r}")
-            result = fn(session, job.payload)
-            job.status = "completed"
-            job.error = None
-            job.payload = {**job.payload, "result": result}
-            summary["completed"] += 1
+            with _Heartbeat(session.get_bind(), job_id, claim):
+                result = fn(session, payload)
+            outcome = "completed"
+            values = {"status": "completed", "error": None,
+                      "payload": {**payload, "result": result}}
         except Exception as e:  # noqa: BLE001 — recorded on the row, never dropped
             session.rollback()  # a DB error inside the handler poisons the txn
-            job.error = f"{type(e).__name__}: {e}"[:2000]
-            if job.attempts >= job.max_attempts:
-                job.status = "failed"
-                summary["failed"] += 1
+            values = {"error": f"{type(e).__name__}: {e}"[:2000]}
+            if claim >= max_attempts:
+                outcome = "failed"
+                values["status"] = "failed"
             else:
-                job.status = "pending"  # retry with backoff
-                job.available_at = _utcnow() + timedelta(
-                    seconds=60 * job.attempts
-                )
-                summary["retried"] += 1
-        job.updated_at = _utcnow()
-        session.add(job)
-        session.commit()
+                outcome = "retried"
+                values["status"] = "pending"  # retry with backoff
+                values["available_at"] = _utcnow() + timedelta(seconds=60 * claim)
+        if _finish(session, job_id, claim, **values):
+            summary[outcome] += 1
+        else:  # lease lapsed and the job was reaped; its new owner reports
+            summary["lost"] = summary.get("lost", 0) + 1
     return summary
 
 
