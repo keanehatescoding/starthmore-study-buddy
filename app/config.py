@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     llm_quiz_model: str = "gemini-3.6-flash"
     llm_grade_model: str = "gemini-3.6-flash"
     llm_pace: float = 0.0  # seconds between pipeline LLM calls; ~5-45 on free tiers
+    app_base_url: str = "http://localhost:8000"  # public origin for links in emails
     resend_api_key: str = ""
     email_from: str = ""
     email_to: str = ""

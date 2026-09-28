@@ -1,5 +1,7 @@
 """Phase 6 tests: batching, threshold, dedupe, delivery (fake sender)."""
 
+import io
+import urllib.error
 import uuid
 
 import pytest
@@ -19,8 +21,11 @@ def session():
 
 def _course_with_items(s: Session, n_chunks=2, code="CS 301"):
     user = User(email="s@x.edu")
-    course = Course(source="moodle", source_id="c1", name="Data Structures", code=code)
-    s.add_all([user, course])
+    s.add(user)
+    s.commit()
+    course = Course(user_id=user.id, source="moodle", source_id="c1",
+                    name="Data Structures", code=code)
+    s.add(course)
     s.commit()
     topic = Topic(course_id=course.id, source_id="t1", title="T")
     s.add(topic)
@@ -66,40 +71,46 @@ def test_review_due_threshold_and_dedupe(session):
     assert notify.check_review_due(session, user.id, threshold=3) is None  # deduped
 
 
+def _fake_batches(monkeypatch, fail=lambda emails: None):
+    """Record each send_batch call; `fail` may raise to simulate errors."""
+    calls = []
+
+    def fake(api_key, emails, sleep=None):
+        fail(emails)
+        calls.append(emails)
+
+    monkeypatch.setattr(notify, "send_batch", fake)
+    return calls
+
+
 def test_send_marks_sent_and_renders(session, monkeypatch):
-    sent = []
-    monkeypatch.setattr(
-        notify, "send_email",
-        lambda api, frm, to, subj, body: sent.append((subj, body)),
-    )
+    calls = _fake_batches(monkeypatch)
     user, course = _course_with_items(session, n_chunks=1)
     notify.enqueue_new_material(session, course.id, 2)
     out = notify.send_pending(session, "key", "from@x", "to@x")
     assert out == {"sent": 1, "failed": 0}
-    assert sent[0][0] == "New study material: CS 301"
-    assert "2 new quiz items" in sent[0][1]
+    [[email]] = calls
+    assert email["subject"] == "New study material: CS 301"
+    assert "2 new quiz items" in email["text"]
+    assert email["to"] == ["s@x.edu"] and email["from"] == "from@x"
     event = session.exec(select(NotificationEvent)).one()
     assert event.sent is True and event.sent_at is not None
 
 
 def test_send_failure_stays_queued(session, monkeypatch):
-    def boom(api, frm, to, subj, body):
-        raise notify.EmailError("no key")
+    def boom(emails):
+        raise notify.EmailError("resend returned 500")
 
-    monkeypatch.setattr(notify, "send_email", boom)
+    _fake_batches(monkeypatch, boom)
     user, course = _course_with_items(session, n_chunks=1)
     notify.enqueue_new_material(session, course.id, 2)
-    out = notify.send_pending(session, "", "from@x", "to@x")
+    out = notify.send_pending(session, "key", "from@x", "to@x")
     assert out == {"sent": 0, "failed": 1}
     assert session.exec(select(NotificationEvent)).one().sent is False
 
 
 def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
-    seen = []
-    monkeypatch.setattr(
-        notify, "send_email",
-        lambda api, frm, to, subj, body: seen.append(to),
-    )
+    calls = _fake_batches(monkeypatch)
     other = User(email="other@x.edu")
     session.add(other)
     session.commit()
@@ -113,26 +124,146 @@ def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
     assert event.user_id == other.id
     out = notify.send_pending(session, "key", "from@x", "fallback@x")
     assert out == {"sent": 1, "failed": 0}
-    assert seen == ["other@x.edu"]
+    assert [e["to"] for e in calls[0]] == [["other@x.edu"]]
 
 
 def test_send_without_recipient_stays_queued(session, monkeypatch):
-    monkeypatch.setattr(
-        notify, "send_email",
-        lambda *a: (_ for _ in ()).throw(AssertionError("must not send")),
-    )
+    calls = _fake_batches(monkeypatch)
     # stale reference: user row gone, no fallback -> cannot deliver
     orphan = NotificationEvent(user_id=uuid.UUID(int=0),
                                type="review_due", payload={"due_count": 9})
     session.add(orphan)
     session.commit()
     out = notify.send_pending(session, "key", "from@x", "")
-    assert out == {"sent": 0, "failed": 1}
+    assert out == {"sent": 0, "failed": 1} and calls == []
     assert session.exec(select(NotificationEvent)).one().sent is False
 
 
 def test_render_review_due():
     event = NotificationEvent(user_id="00000000-0000-0000-0000-000000000000",
                               type="review_due", payload={"due_count": 5})
-    subject, body = notify.render(event)
+    subject, body = notify.render(event, "https://sb.example.com/")
     assert subject == "5 reviews due" and "5 quiz items" in body
+    assert "https://sb.example.com/review" in body and "localhost" not in body
+
+
+def test_render_uses_app_base_url_setting(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "app_base_url", "https://prod.example.com")
+    event = NotificationEvent(user_id=uuid.UUID(int=0), type="new_material",
+                              payload={"course": "DS", "code": "CS", "new_items": 2})
+    _, body = notify.render(event)
+    assert body.endswith("Review them: https://prod.example.com/review")
+
+
+def test_unowned_course_enqueues_nothing_and_creates_no_user(session):
+    course = Course(source="moodle", source_id="orphan", name="Orphan", code="ORP")
+    session.add(course)
+    session.commit()
+    assert notify.enqueue_new_material(session, course.id, 4) is None
+    assert notify.enqueue_new_material(session, uuid.uuid4(), 4) is None  # missing
+    assert session.exec(select(User)).all() == []
+    assert session.exec(select(NotificationEvent)).all() == []
+
+
+def test_review_due_counts_all_due_items(session):
+    user, _ = _course_with_items(session, n_chunks=25)  # > due_items' default page
+    event = notify.check_review_due(session, user.id, threshold=3)
+    assert event.payload == {"due_count": 25}
+
+
+def _owned_events(session, n):
+    user = User(email="u@x.edu")
+    session.add(user)
+    session.commit()
+    for i in range(n):
+        session.add(NotificationEvent(user_id=user.id, type="review_due",
+                                      payload={"due_count": i}))
+    session.commit()
+
+
+def test_send_batches_requests(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    _owned_events(session, notify.BATCH_SIZE + 5)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": notify.BATCH_SIZE + 5, "failed": 0}
+    assert [len(c) for c in calls] == [notify.BATCH_SIZE, 5]
+    assert all(e.sent for e in session.exec(select(NotificationEvent)))
+
+
+def test_bad_email_in_batch_does_not_block_others(session, monkeypatch):
+    def reject_bad(emails):
+        if any(e["subject"] == "1 reviews due" for e in emails):
+            raise notify.EmailError("resend returned 422")
+
+    calls = _fake_batches(monkeypatch, reject_bad)
+    _owned_events(session, 3)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 2, "failed": 1}
+    assert [len(c) for c in calls] == [1, 1]  # the batch retried one by one
+    unsent = session.exec(
+        select(NotificationEvent).where(NotificationEvent.sent == False)  # noqa: E712
+    ).all()
+    assert [e.payload["due_count"] for e in unsent] == [1]
+
+
+def test_rate_limit_stops_run_and_leaves_rest_queued(session, monkeypatch):
+    def limited(emails):
+        raise notify.RateLimitedError("429")
+
+    _fake_batches(monkeypatch, limited)
+    _owned_events(session, notify.BATCH_SIZE + 1)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 0, "failed": notify.BATCH_SIZE + 1}
+    assert not any(e.sent for e in session.exec(select(NotificationEvent)))
+
+
+def test_no_api_key_sends_nothing(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    _owned_events(session, 2)
+    assert notify.send_pending(session, "", "from@x") == {"sent": 0, "failed": 2}
+    assert calls == []
+
+
+def _http_429(retry_after="1.5"):
+    return urllib.error.HTTPError(
+        notify.RESEND_BATCH_URL, 429, "Too Many Requests",
+        {"Retry-After": retry_after}, io.BytesIO(b""),
+    )
+
+
+class _OK:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_send_batch_backs_off_on_429_then_succeeds(monkeypatch):
+    replies = [_http_429(), _http_429("nope"), _OK()]
+
+    def urlopen(req, timeout):
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
+    slept = []
+    notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+    assert slept == [1.5, 2.0] and replies == []  # Retry-After, then 2**attempt
+
+
+def test_send_batch_gives_up_after_retries(monkeypatch):
+    def urlopen(req, timeout):
+        raise _http_429("0")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
+    slept = []
+    with pytest.raises(notify.RateLimitedError):
+        notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+    assert len(slept) == notify.MAX_RETRIES
