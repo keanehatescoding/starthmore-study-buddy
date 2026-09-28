@@ -18,6 +18,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -79,8 +80,13 @@ def _http_reason(err: urllib.error.HTTPError) -> str:
     return f"http_{err.code}"
 
 
-def send_batch(api_key: str, emails: list[dict], sleep=time.sleep) -> None:
-    """POST up to BATCH_SIZE emails in one request; retries 429 with backoff."""
+def send_batch(api_key: str, emails: list[dict], idempotency_key: str,
+               sleep=time.sleep) -> None:
+    """POST up to BATCH_SIZE emails in one request; retries 429 with backoff.
+
+    Resend dedupes on Idempotency-Key for 24h, so resending the same batch
+    with the same key after a lost response doesn't deliver twice.
+    """
     if not api_key:
         raise EmailError("RESEND_API_KEY is empty — set it in .env", "no_api_key")
     req = urllib.request.Request(
@@ -89,6 +95,7 @@ def send_batch(api_key: str, emails: list[dict], sleep=time.sleep) -> None:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "Idempotency-Key": idempotency_key,
             # Resend's edge filter 403s the default urllib agent
             "User-Agent": "study-buddy/0.1",
         },
@@ -194,6 +201,10 @@ def recipient_for(session: Session, event: NotificationEvent, fallback: str = ""
     return fallback
 
 
+# Resend rejected the batch before sending anything: safe to split and resend.
+BATCH_REJECTED = "http_422:validation_error"
+
+
 def send_pending(
     session: Session, api_key: str, from_addr: str, fallback_to: str = "",
     base_url: str | None = None, sleep=time.sleep,
@@ -203,6 +214,13 @@ def send_pending(
     One commit per delivered batch. Failures stay queued; a rate limit that
     outlasts the retries stops the run so the rest wait for the next pass.
     `errors` counts failures by EmailError.reason for the job result.
+
+    Duplicate safety: a multi-email batch gets a batch_key, committed before
+    the request and sent as its Idempotency-Key. A failure that might have
+    been delivered (network, 5xx, ...) leaves the batch as-is, so later passes
+    resend the same events under the same key. Only a confirmed validation
+    rejection splits it into single sends (key "event-<id>"). Resend keeps
+    keys for 24h; a batch still unconfirmed after that may be delivered twice.
     """
     sent = 0
     errors: Counter[str] = Counter()  # reason token -> failed deliveries
@@ -214,7 +232,8 @@ def send_pending(
     if not api_key:  # nothing can be delivered; don't fake-mark or split batches
         errors["no_api_key"] = len(events)
         return _result(sent, errors)
-    ready: list[tuple[NotificationEvent, dict]] = []
+    keyed: dict[str, list] = {}  # batch_key -> earlier batch, resent unchanged
+    fresh: list = []
     for event in events:
         to_addr = recipient_for(session, event, fallback_to)
         try:
@@ -224,9 +243,14 @@ def send_pending(
         except EmailError as e:
             errors[e.reason] += 1
             continue
-        ready.append((event, {"from": from_addr, "to": [to_addr],
-                              "subject": subject, "text": body}))
-    pending = [ready[i:i + BATCH_SIZE] for i in range(0, len(ready), BATCH_SIZE)]
+        item = (event, {"from": from_addr, "to": [to_addr],
+                        "subject": subject, "text": body})
+        if event.batch_key:
+            keyed.setdefault(event.batch_key, []).append(item)
+        else:
+            fresh.append(item)
+    pending = [*keyed.values(),
+               *(fresh[i:i + BATCH_SIZE] for i in range(0, len(fresh), BATCH_SIZE))]
     while pending:
         batch = pending.pop(0)
         try:
@@ -236,12 +260,16 @@ def send_pending(
             errors[e.reason] += len(batch) + sum(len(b) for b in pending)
             break
         except EmailError as e:
-            if len(batch) == 1:
-                errors[e.reason] += 1
-            else:
-                # batch validation is all-or-nothing: one bad address must not
-                # hold back the rest, so retry this batch one email at a time
+            if len(batch) > 1 and e.reason == BATCH_REJECTED:
+                # all-or-nothing validation: nothing went out, so one bad
+                # address must not hold back the rest; retry one at a time
+                for event, _ in batch:
+                    event.batch_key = None
+                    session.add(event)
+                session.commit()
                 pending[:0] = [[one] for one in batch]
+            else:
+                errors[e.reason] += len(batch)
     return _result(sent, errors)
 
 
@@ -250,7 +278,16 @@ def _result(sent: int, errors: Counter) -> dict:
 
 
 def _deliver(session: Session, api_key: str, batch, sleep) -> None:
-    send_batch(api_key, [email for _, email in batch], sleep=sleep)
+    key = batch[0][0].batch_key
+    if key is None and len(batch) == 1:
+        key = f"event-{batch[0][0].id}"  # stable across passes, nothing to store
+    elif key is None:
+        key = f"batch-{uuid.uuid4()}"
+        for event, _ in batch:
+            event.batch_key = key
+            session.add(event)
+        session.commit()  # before the request: a lost response must reuse it
+    send_batch(api_key, [email for _, email in batch], key, sleep=sleep)
     now = datetime.now(timezone.utc)
     for event, _ in batch:
         event.sent = True

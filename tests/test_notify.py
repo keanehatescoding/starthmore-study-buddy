@@ -71,13 +71,22 @@ def test_review_due_threshold_and_dedupe(session):
     assert notify.check_review_due(session, user.id, threshold=3) is None  # deduped
 
 
+class _Calls(list):
+    """Emails of each send_batch call; `.keys` holds the Idempotency-Keys."""
+
+    def __init__(self):
+        super().__init__()
+        self.keys = []
+
+
 def _fake_batches(monkeypatch, fail=lambda emails: None):
     """Record each send_batch call; `fail` may raise to simulate errors."""
-    calls = []
+    calls = _Calls()
 
-    def fake(api_key, emails, sleep=None):
+    def fake(api_key, emails, idempotency_key, sleep=None):
         fail(emails)
         calls.append(emails)
+        calls.keys.append(idempotency_key)
 
     monkeypatch.setattr(notify, "send_batch", fake)
     return calls
@@ -265,7 +274,7 @@ def test_send_batch_backs_off_on_429_then_succeeds(monkeypatch):
 
     monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
     slept = []
-    notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+    notify.send_batch("key", [{"to": ["a@x"]}], "k", sleep=slept.append)
     assert slept == [1.5, 2.0] and replies == []  # Retry-After, then 2**attempt
 
 
@@ -276,7 +285,7 @@ def test_send_batch_gives_up_after_retries(monkeypatch):
     monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
     slept = []
     with pytest.raises(notify.RateLimitedError):
-        notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+        notify.send_batch("key", [{"to": ["a@x"]}], "k", sleep=slept.append)
     assert len(slept) == notify.MAX_RETRIES
 
 
@@ -295,7 +304,7 @@ def test_send_batch_gives_up_when_retry_after_exceeds_cap(monkeypatch):
     _raise_on_urlopen(monkeypatch, _http_429(str(notify.MAX_RETRY_WAIT + 1)))
     slept = []
     with pytest.raises(notify.RateLimitedError) as exc:
-        notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+        notify.send_batch("key", [{"to": ["a@x"]}], "k", sleep=slept.append)
     assert slept == [] and exc.value.reason == "rate_limited"
 
 
@@ -304,7 +313,7 @@ def test_send_batch_reason_uses_resend_error_name_not_message(monkeypatch):
     _raise_on_urlopen(monkeypatch, urllib.error.HTTPError(
         notify.RESEND_BATCH_URL, 422, "Unprocessable", {}, io.BytesIO(body)))
     with pytest.raises(notify.EmailError) as exc:
-        notify.send_batch("key", [{"to": ["a@x.edu"]}])
+        notify.send_batch("key", [{"to": ["a@x.edu"]}], "k")
     assert exc.value.reason == "http_422:validation_error"
     assert "a@x.edu" not in str(exc.value)
 
@@ -314,5 +323,79 @@ def test_send_batch_reason_drops_unexpected_error_names(monkeypatch):
     _raise_on_urlopen(monkeypatch, urllib.error.HTTPError(
         notify.RESEND_BATCH_URL, 500, "Server Error", {}, io.BytesIO(body)))
     with pytest.raises(notify.EmailError) as exc:
-        notify.send_batch("key", [{"to": ["a@x"]}])
+        notify.send_batch("key", [{"to": ["a@x"]}], "k")
     assert exc.value.reason == "http_500"
+
+
+def test_single_send_uses_stable_event_key(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    _owned_events(session, 1)
+    notify.send_pending(session, "key", "from@x")
+    event = session.exec(select(NotificationEvent)).one()
+    assert calls.keys == [f"event-{event.id}"] and event.batch_key is None
+
+
+def test_ambiguous_batch_failure_resends_same_batch_same_key(session, monkeypatch):
+    def lost(emails):
+        raise notify.EmailError("send failed: timed out", "network:TimeoutError")
+
+    calls = _fake_batches(monkeypatch, lost)
+    _owned_events(session, 3)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 0, "failed": 3, "errors": {"network:TimeoutError": 3}}
+    assert len(calls.keys) == 0  # fake raised before recording
+    events = session.exec(select(NotificationEvent)).all()
+    [key] = {e.batch_key for e in events}
+    assert key and key.startswith("batch-")  # persisted, not split into singles
+
+    # a newer event arrives; the next pass resends the old batch unchanged
+    session.add(NotificationEvent(user_id=events[0].user_id, type="review_due",
+                                  payload={"due_count": 99}))
+    session.commit()
+    calls = _fake_batches(monkeypatch)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 4, "failed": 0, "errors": {}}
+    assert calls.keys == [key, f"event-{_newest(session).id}"]
+    assert [len(c) for c in calls] == [3, 1]
+
+
+def _newest(session):
+    return session.exec(
+        select(NotificationEvent).order_by(NotificationEvent.created_at.desc())
+    ).first()
+
+
+def test_server_error_does_not_split_batch(session, monkeypatch):
+    def boom(emails):
+        raise notify.EmailError("resend returned http_500", "http_500")
+
+    attempts = []
+    _fake_batches(monkeypatch, lambda emails: (attempts.append(len(emails)), boom(emails)))
+    _owned_events(session, 3)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out["errors"] == {"http_500": 3} and attempts == [3]  # no singles
+
+
+def test_validation_split_clears_batch_key(session, monkeypatch):
+    def reject_batches(emails):
+        if len(emails) > 1:
+            raise notify.EmailError("422", notify.BATCH_REJECTED)
+
+    calls = _fake_batches(monkeypatch, reject_batches)
+    _owned_events(session, 2)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 2
+    events = session.exec(select(NotificationEvent)).all()
+    assert all(e.batch_key is None for e in events)
+    assert sorted(calls.keys) == sorted(f"event-{e.id}" for e in events)
+
+
+def test_send_batch_sends_idempotency_key(monkeypatch):
+    seen = []
+
+    def urlopen(req, timeout):
+        seen.append(req.get_header("Idempotency-key"))
+        return _OK()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
+    notify.send_batch("key", [{"to": ["a@x"]}], "batch-abc")
+    assert seen == ["batch-abc"]
