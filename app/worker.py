@@ -1,7 +1,10 @@
-"""Background worker: send queued notifications + daily review-due check.
+"""Background worker: drain the job queue, including one notify pass.
 
 Usage: python -m app.worker [--loop SECONDS]
-One pass = check review-due for every user, then send all unsent events.
+One pass = reap orphaned jobs, enqueue a send_notifications job (unless one
+is already queued), then run due jobs until none are left. Due syncs are
+claimed before the notify job, so their new-material events go out in the
+same pass.
 Schedule with cron (daily) or run --loop for a persistent worker.
 """
 
@@ -11,13 +14,12 @@ import argparse
 import time
 import urllib.request
 
-from sqlmodel import Session, select
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session
 
 from app.config import settings
 from app.db import engine
-from app.jobs import run_due
-from app.models import User
-from app.notify import check_review_due, send_pending
+from app.jobs import enqueue, reap_stale, run_due
 
 
 def ping_healthcheck() -> None:
@@ -33,18 +35,25 @@ def ping_healthcheck() -> None:
 
 
 def run_once() -> dict:
-    summary: dict = {"review_due_events": 0}
+    totals: dict = {"completed": 0, "failed": 0, "retried": 0}
     with Session(engine) as session:
-        summary["jobs"] = run_due(session)  # queued sync/notify jobs first
-        for user in session.exec(select(User)).all():
-            if check_review_due(session, user.id) is not None:
-                summary["review_due_events"] += 1
-        summary["send"] = send_pending(
-            session, settings.resend_api_key, settings.email_from,
-            settings.email_to,  # fallback only; owned events go to User.email
-        )
+        # Reap first: a notify job orphaned by a crashed worker would
+        # otherwise block this pass's enqueue and then be failed unrun.
+        reaped = reap_stale(session)
+        if reaped:
+            totals["reaped"] = reaped
+        try:
+            enqueue(session, "send_notifications", max_attempts=1)
+        except IntegrityError:  # uq_jobs_active_notify: one is already queued
+            session.rollback()
+        while True:  # drain; failed jobs back off, so this terminates
+            batch = run_due(session)
+            for key, n in batch.items():
+                totals[key] = totals.get(key, 0) + n
+            if not any(batch.values()):
+                break
     ping_healthcheck()
-    return summary
+    return totals
 
 
 def main() -> None:

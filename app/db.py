@@ -1,9 +1,10 @@
-from sqlalchemy.ext.asyncio import create_async_engine  # noqa: F401 (placeholder)
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.config import settings
 
-engine = create_engine(settings.database_url, echo=False)
+# pool_pre_ping: a Postgres restart/idle-kill would otherwise hand out dead
+# connections and 500 every request until the app restarts.
+engine = create_engine(settings.database_url, echo=False, pool_pre_ping=True)
 
 
 def get_engine():

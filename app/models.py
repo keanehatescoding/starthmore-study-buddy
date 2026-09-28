@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Column, DateTime, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, Index, Text, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
 
@@ -153,13 +153,25 @@ class NotificationEvent(SQLModel, table=True):
     )
 
 
+ACTIVE_NOTIFY_WHERE = "type = 'send_notifications' AND status IN ('pending', 'running')"
+
+
 class Job(SQLModel, table=True):
     """Postgres-backed job queue (no Redis/Celery at this scale)."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        # At most one queued/running notify job, so racing workers can't both
+        # enqueue one and double-send (see app.worker).
+        Index(
+            "uq_jobs_active_notify", "type", unique=True,
+            postgresql_where=text(ACTIVE_NOTIFY_WHERE),
+            sqlite_where=text(ACTIVE_NOTIFY_WHERE),
+        ),
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    type: str = Field(index=True)  # e.g. "sync_moodle" | "sync_classroom" | "send_notifications"
+    type: str = Field(index=True)  # "sync" | "send_notifications" (see app.jobs.HANDLERS)
     payload: Any = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     status: str = Field(default="pending", index=True)  # pending|running|completed|failed
     attempts: int = Field(default=0)
