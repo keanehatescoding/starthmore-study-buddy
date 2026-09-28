@@ -159,7 +159,7 @@ class Job(SQLModel, table=True):
     __tablename__ = "jobs"
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    type: str = Field(index=True)  # e.g. "sync_moodle" | "sync_classroom" | "send_notifications"
+    type: str = Field(index=True)  # "sync" | "send_notifications" (see app.jobs.HANDLERS)
     payload: Any = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     status: str = Field(default="pending", index=True)  # pending|running|completed|failed
     attempts: int = Field(default=0)

@@ -4,8 +4,12 @@ instead of blocking the CLI caller.
 - `enqueue(session, type, payload)` -> Job (status pending).
 - `run_due(session, limit)` claims the oldest due pending jobs one at a time
   (pending -> running -> completed/failed) and executes them via HANDLERS.
+  Claims use SELECT ... FOR UPDATE SKIP LOCKED, so concurrent workers never
+  take the same job.
 - Failed jobs retry with backoff until max_attempts, then stay failed with
   the error recorded. Nothing is silently dropped.
+- A job left "running" longer than RUNNING_TIMEOUT (its worker died) is
+  reaped back to pending, or to failed once its attempts are used up.
 - Job types: "sync" (Moodle/Classroom course sync), "send_notifications".
 """
 
@@ -18,6 +22,10 @@ from sqlmodel import Session, select
 from app.models import Job, User
 
 HANDLERS: dict[str, callable] = {}
+
+# Longest a job may sit in "running" before it's presumed orphaned. Generous:
+# a full-course sync with slow Moodle/Drive downloads can take a while.
+RUNNING_TIMEOUT = timedelta(hours=1)
 
 
 def handler(job_type: str):
@@ -43,28 +51,51 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _as_aware(value: datetime) -> datetime:
-    # SQLite returns naive datetimes for timezone-aware columns; Postgres
-    # returns aware ones. Normalize so due-checks work on both.
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
+def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> int:
+    """Recover jobs whose worker died mid-run. Returns how many were reaped."""
+    cutoff = _utcnow() - timeout
+    stale = session.exec(
+        select(Job)
+        .where(Job.status == "running", Job.updated_at < cutoff)
+        .with_for_update(skip_locked=True)
+    ).all()
+    for job in stale:
+        job.error = f"timed out after {timeout} in running (worker died?)"
+        job.status = "failed" if job.attempts >= job.max_attempts else "pending"
+        job.available_at = job.updated_at = _utcnow()
+        session.add(job)
+    session.commit()
+    return len(stale)
+
+
+def _claim_next(session: Session) -> Job | None:
+    """Atomically move the oldest due pending job to running."""
+    job = session.exec(
+        select(Job)
+        .where(Job.status == "pending", Job.available_at <= _utcnow())
+        .order_by(Job.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    ).first()
+    if job is not None:
+        job.status = "running"
+        job.attempts += 1
+        job.updated_at = _utcnow()
+        session.add(job)
+    session.commit()  # releases the row lock; status now keeps others off it
+    return job
 
 
 def run_due(session: Session, limit: int = 5) -> dict:
     """Claim and execute up to `limit` due pending jobs. Returns a summary."""
     summary: dict = {"completed": 0, "failed": 0, "retried": 0}
-    now = _utcnow()
-    pending = session.exec(
-        select(Job).where(Job.status == "pending").order_by(Job.created_at)
-    ).all()
-    due = [j for j in pending if _as_aware(j.available_at) <= now][:limit]
-    for job in due:
-        job.status = "running"
-        job.attempts += 1
-        job.updated_at = _utcnow()
-        session.add(job)
-        session.commit()
+    reaped = reap_stale(session)
+    if reaped:
+        summary["reaped"] = reaped
+    for _ in range(limit):
+        job = _claim_next(session)
+        if job is None:
+            break
         fn = HANDLERS.get(job.type)
         try:
             if fn is None:
@@ -75,6 +106,7 @@ def run_due(session: Session, limit: int = 5) -> dict:
             job.payload = {**job.payload, "result": result}
             summary["completed"] += 1
         except Exception as e:  # noqa: BLE001 — recorded on the row, never dropped
+            session.rollback()  # a DB error inside the handler poisons the txn
             job.error = f"{type(e).__name__}: {e}"[:2000]
             if job.attempts >= job.max_attempts:
                 job.status = "failed"

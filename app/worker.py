@@ -1,7 +1,9 @@
-"""Background worker: send queued notifications + daily review-due check.
+"""Background worker: drain the job queue, including one notify pass.
 
 Usage: python -m app.worker [--loop SECONDS]
-One pass = check review-due for every user, then send all unsent events.
+One pass = enqueue a send_notifications job (unless one is already queued),
+then run due jobs until none are left. Queued syncs run before the notify
+job, so their new-material events go out in the same pass.
 Schedule with cron (daily) or run --loop for a persistent worker.
 """
 
@@ -15,9 +17,8 @@ from sqlmodel import Session, select
 
 from app.config import settings
 from app.db import engine
-from app.jobs import run_due
-from app.models import User
-from app.notify import check_review_due, send_pending
+from app.jobs import enqueue, run_due
+from app.models import Job
 
 
 def ping_healthcheck() -> None:
@@ -33,18 +34,24 @@ def ping_healthcheck() -> None:
 
 
 def run_once() -> dict:
-    summary: dict = {"review_due_events": 0}
+    totals: dict = {"completed": 0, "failed": 0, "retried": 0}
     with Session(engine) as session:
-        summary["jobs"] = run_due(session)  # queued sync/notify jobs first
-        for user in session.exec(select(User)).all():
-            if check_review_due(session, user.id) is not None:
-                summary["review_due_events"] += 1
-        summary["send"] = send_pending(
-            session, settings.resend_api_key, settings.email_from,
-            settings.email_to,  # fallback only; owned events go to User.email
-        )
+        queued = session.exec(
+            select(Job).where(
+                Job.type == "send_notifications",
+                Job.status.in_(("pending", "running")),
+            )
+        ).first()
+        if queued is None:
+            enqueue(session, "send_notifications", max_attempts=1)
+        while True:  # drain; failed jobs back off, so this terminates
+            batch = run_due(session)
+            for key, n in batch.items():
+                totals[key] = totals.get(key, 0) + n
+            if not any(batch.values()):
+                break
     ping_healthcheck()
-    return summary
+    return totals
 
 
 def main() -> None:
