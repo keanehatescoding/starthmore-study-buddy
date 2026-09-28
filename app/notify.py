@@ -14,10 +14,13 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from sqlmodel import Session, select
 
@@ -28,27 +31,58 @@ REVIEW_DUE_THRESHOLD = 3
 RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 BATCH_SIZE = 100  # Resend's per-request batch limit
 MAX_RETRIES = 4
+MAX_RETRY_WAIT = 60.0  # longer waits give up; the next worker pass retries
 
 
 class EmailError(RuntimeError):
-    pass
+    """`reason` is a short fixed-vocabulary token, safe to persist in job results
+    (no provider message text, which can echo addresses)."""
+
+    def __init__(self, message: str, reason: str = "error"):
+        super().__init__(message)
+        self.reason = reason
 
 
 class RateLimitedError(EmailError):
-    """Resend kept answering 429 after all retries; stop and leave events queued."""
+    """Resend kept answering 429; stop and leave events queued."""
+
+    def __init__(self, message: str):
+        super().__init__(message, "rate_limited")
 
 
 def _retry_after(err: urllib.error.HTTPError, attempt: int) -> float:
+    """Seconds to wait: Retry-After as delta-seconds or HTTP-date, else 2**attempt."""
+    value = (err.headers.get("Retry-After") or "").strip() if err.headers else ""
     try:
-        return max(0.0, float(err.headers.get("Retry-After", "")))
-    except (TypeError, ValueError):
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
         return float(2 ** attempt)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _http_reason(err: urllib.error.HTTPError) -> str:
+    """`http_<code>[:<resend error name>]`, e.g. http_422:validation_error."""
+    name = None
+    try:
+        body = json.loads(err.read(2048) or b"{}")
+        name = body.get("name") if isinstance(body, dict) else None
+    except (OSError, ValueError):  # unreadable or non-JSON body: status only
+        pass
+    if isinstance(name, str) and re.fullmatch(r"[a-z_]{1,40}", name):
+        return f"http_{err.code}:{name}"
+    return f"http_{err.code}"
 
 
 def send_batch(api_key: str, emails: list[dict], sleep=time.sleep) -> None:
     """POST up to BATCH_SIZE emails in one request; retries 429 with backoff."""
     if not api_key:
-        raise EmailError("RESEND_API_KEY is empty — set it in .env")
+        raise EmailError("RESEND_API_KEY is empty — set it in .env", "no_api_key")
     req = urllib.request.Request(
         RESEND_BATCH_URL,
         data=json.dumps(emails).encode(),
@@ -64,18 +98,21 @@ def send_batch(api_key: str, emails: list[dict], sleep=time.sleep) -> None:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status not in (200, 201, 202):
-                    raise EmailError(f"resend returned {resp.status}")
+                    raise EmailError(f"resend returned {resp.status}",
+                                     f"http_{resp.status}")
                 return
         except urllib.error.HTTPError as e:
             if e.code != 429:
-                raise EmailError(f"resend returned {e.code}") from e
-            if attempt == MAX_RETRIES:
-                raise RateLimitedError("resend rate limit, retries exhausted") from e
-            sleep(_retry_after(e, attempt))
+                reason = _http_reason(e)
+                raise EmailError(f"resend returned {reason}", reason) from e
+            wait = _retry_after(e, attempt)
+            if attempt == MAX_RETRIES or wait > MAX_RETRY_WAIT:
+                raise RateLimitedError(f"resend rate limit (retry after {wait:.0f}s)") from e
+            sleep(wait)
         except EmailError:
             raise
         except Exception as e:
-            raise EmailError(f"send failed: {e}") from e
+            raise EmailError(f"send failed: {e}", f"network:{type(e).__name__}") from e
 
 
 def enqueue_new_material(session: Session, course_id, new_items: int) -> NotificationEvent | None:
@@ -145,7 +182,7 @@ def render(event: NotificationEvent, base_url: str | None = None) -> tuple[str, 
             f"You have {n} quiz items due for review.\n"
             f"Catch up: {review_url}",
         )
-    raise EmailError(f"unknown event type {event.type!r}")
+    raise EmailError(f"unknown event type {event.type!r}", "unknown_event_type")
 
 
 def recipient_for(session: Session, event: NotificationEvent, fallback: str = "") -> str:
@@ -165,24 +202,27 @@ def send_pending(
 
     One commit per delivered batch. Failures stay queued; a rate limit that
     outlasts the retries stops the run so the rest wait for the next pass.
+    `errors` counts failures by EmailError.reason for the job result.
     """
-    counts = {"sent": 0, "failed": 0}
+    sent = 0
+    errors: Counter[str] = Counter()  # reason token -> failed deliveries
     events = session.exec(
         select(NotificationEvent)
         .where(NotificationEvent.sent == False)  # noqa: E712
         .order_by(NotificationEvent.created_at)
     ).all()
     if not api_key:  # nothing can be delivered; don't fake-mark or split batches
-        return {"sent": 0, "failed": len(events)}
+        errors["no_api_key"] = len(events)
+        return _result(sent, errors)
     ready: list[tuple[NotificationEvent, dict]] = []
     for event in events:
         to_addr = recipient_for(session, event, fallback_to)
         try:
             if not to_addr:
-                raise EmailError("no recipient")
+                raise EmailError("no recipient", "no_recipient")
             subject, body = render(event, base_url)
-        except EmailError:
-            counts["failed"] += 1
+        except EmailError as e:
+            errors[e.reason] += 1
             continue
         ready.append((event, {"from": from_addr, "to": [to_addr],
                               "subject": subject, "text": body}))
@@ -191,18 +231,22 @@ def send_pending(
         batch = pending.pop(0)
         try:
             _deliver(session, api_key, batch, sleep)
-            counts["sent"] += len(batch)
-        except RateLimitedError:
-            counts["failed"] += len(batch) + sum(len(b) for b in pending)
+            sent += len(batch)
+        except RateLimitedError as e:
+            errors[e.reason] += len(batch) + sum(len(b) for b in pending)
             break
-        except EmailError:
+        except EmailError as e:
             if len(batch) == 1:
-                counts["failed"] += 1
+                errors[e.reason] += 1
             else:
                 # batch validation is all-or-nothing: one bad address must not
                 # hold back the rest, so retry this batch one email at a time
                 pending[:0] = [[one] for one in batch]
-    return counts
+    return _result(sent, errors)
+
+
+def _result(sent: int, errors: Counter) -> dict:
+    return {"sent": sent, "failed": sum(errors.values()), "errors": dict(errors)}
 
 
 def _deliver(session: Session, api_key: str, batch, sleep) -> None:

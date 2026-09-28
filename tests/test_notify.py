@@ -88,7 +88,7 @@ def test_send_marks_sent_and_renders(session, monkeypatch):
     user, course = _course_with_items(session, n_chunks=1)
     notify.enqueue_new_material(session, course.id, 2)
     out = notify.send_pending(session, "key", "from@x", "to@x")
-    assert out == {"sent": 1, "failed": 0}
+    assert out == {"sent": 1, "failed": 0, "errors": {}}
     [[email]] = calls
     assert email["subject"] == "New study material: CS 301"
     assert "2 new quiz items" in email["text"]
@@ -99,13 +99,13 @@ def test_send_marks_sent_and_renders(session, monkeypatch):
 
 def test_send_failure_stays_queued(session, monkeypatch):
     def boom(emails):
-        raise notify.EmailError("resend returned 500")
+        raise notify.EmailError("resend returned 500", "http_500")
 
     _fake_batches(monkeypatch, boom)
     user, course = _course_with_items(session, n_chunks=1)
     notify.enqueue_new_material(session, course.id, 2)
     out = notify.send_pending(session, "key", "from@x", "to@x")
-    assert out == {"sent": 0, "failed": 1}
+    assert out == {"sent": 0, "failed": 1, "errors": {"http_500": 1}}
     assert session.exec(select(NotificationEvent)).one().sent is False
 
 
@@ -123,7 +123,7 @@ def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
     event = notify.enqueue_new_material(session, owned.id, 3)
     assert event.user_id == other.id
     out = notify.send_pending(session, "key", "from@x", "fallback@x")
-    assert out == {"sent": 1, "failed": 0}
+    assert out == {"sent": 1, "failed": 0, "errors": {}}
     assert [e["to"] for e in calls[0]] == [["other@x.edu"]]
 
 
@@ -135,7 +135,8 @@ def test_send_without_recipient_stays_queued(session, monkeypatch):
     session.add(orphan)
     session.commit()
     out = notify.send_pending(session, "key", "from@x", "")
-    assert out == {"sent": 0, "failed": 1} and calls == []
+    assert out == {"sent": 0, "failed": 1, "errors": {"no_recipient": 1}}
+    assert calls == []
     assert session.exec(select(NotificationEvent)).one().sent is False
 
 
@@ -187,7 +188,7 @@ def test_send_batches_requests(session, monkeypatch):
     calls = _fake_batches(monkeypatch)
     _owned_events(session, notify.BATCH_SIZE + 5)
     out = notify.send_pending(session, "key", "from@x")
-    assert out == {"sent": notify.BATCH_SIZE + 5, "failed": 0}
+    assert out == {"sent": notify.BATCH_SIZE + 5, "failed": 0, "errors": {}}
     assert [len(c) for c in calls] == [notify.BATCH_SIZE, 5]
     assert all(e.sent for e in session.exec(select(NotificationEvent)))
 
@@ -195,12 +196,13 @@ def test_send_batches_requests(session, monkeypatch):
 def test_bad_email_in_batch_does_not_block_others(session, monkeypatch):
     def reject_bad(emails):
         if any(e["subject"] == "1 reviews due" for e in emails):
-            raise notify.EmailError("resend returned 422")
+            raise notify.EmailError("resend returned 422", "http_422:validation_error")
 
     calls = _fake_batches(monkeypatch, reject_bad)
     _owned_events(session, 3)
     out = notify.send_pending(session, "key", "from@x")
-    assert out == {"sent": 2, "failed": 1}
+    assert out == {"sent": 2, "failed": 1,
+                   "errors": {"http_422:validation_error": 1}}
     assert [len(c) for c in calls] == [1, 1]  # the batch retried one by one
     unsent = session.exec(
         select(NotificationEvent).where(NotificationEvent.sent == False)  # noqa: E712
@@ -215,14 +217,16 @@ def test_rate_limit_stops_run_and_leaves_rest_queued(session, monkeypatch):
     _fake_batches(monkeypatch, limited)
     _owned_events(session, notify.BATCH_SIZE + 1)
     out = notify.send_pending(session, "key", "from@x")
-    assert out == {"sent": 0, "failed": notify.BATCH_SIZE + 1}
+    assert out == {"sent": 0, "failed": notify.BATCH_SIZE + 1,
+                   "errors": {"rate_limited": notify.BATCH_SIZE + 1}}
     assert not any(e.sent for e in session.exec(select(NotificationEvent)))
 
 
 def test_no_api_key_sends_nothing(session, monkeypatch):
     calls = _fake_batches(monkeypatch)
     _owned_events(session, 2)
-    assert notify.send_pending(session, "", "from@x") == {"sent": 0, "failed": 2}
+    assert notify.send_pending(session, "", "from@x") == {
+        "sent": 0, "failed": 2, "errors": {"no_api_key": 2}}
     assert calls == []
 
 
@@ -231,6 +235,13 @@ def _http_429(retry_after="1.5"):
         notify.RESEND_BATCH_URL, 429, "Too Many Requests",
         {"Retry-After": retry_after}, io.BytesIO(b""),
     )
+
+
+def _raise_on_urlopen(monkeypatch, err):
+    def urlopen(req, timeout):
+        raise err
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
 
 
 class _OK:
@@ -267,3 +278,41 @@ def test_send_batch_gives_up_after_retries(monkeypatch):
     with pytest.raises(notify.RateLimitedError):
         notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
     assert len(slept) == notify.MAX_RETRIES
+
+
+def test_retry_after_parses_http_date():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    when = datetime.now(timezone.utc) + timedelta(seconds=30)
+    wait = notify._retry_after(_http_429(format_datetime(when, usegmt=True)), 0)
+    assert 25 <= wait <= 30
+    past = format_datetime(when - timedelta(hours=1), usegmt=True)
+    assert notify._retry_after(_http_429(past), 0) == 0.0
+
+
+def test_send_batch_gives_up_when_retry_after_exceeds_cap(monkeypatch):
+    _raise_on_urlopen(monkeypatch, _http_429(str(notify.MAX_RETRY_WAIT + 1)))
+    slept = []
+    with pytest.raises(notify.RateLimitedError) as exc:
+        notify.send_batch("key", [{"to": ["a@x"]}], sleep=slept.append)
+    assert slept == [] and exc.value.reason == "rate_limited"
+
+
+def test_send_batch_reason_uses_resend_error_name_not_message(monkeypatch):
+    body = b'{"statusCode":422,"name":"validation_error","message":"bad a@x.edu"}'
+    _raise_on_urlopen(monkeypatch, urllib.error.HTTPError(
+        notify.RESEND_BATCH_URL, 422, "Unprocessable", {}, io.BytesIO(body)))
+    with pytest.raises(notify.EmailError) as exc:
+        notify.send_batch("key", [{"to": ["a@x.edu"]}])
+    assert exc.value.reason == "http_422:validation_error"
+    assert "a@x.edu" not in str(exc.value)
+
+
+def test_send_batch_reason_drops_unexpected_error_names(monkeypatch):
+    body = b'{"name":"Bad <script> a@x.edu"}'
+    _raise_on_urlopen(monkeypatch, urllib.error.HTTPError(
+        notify.RESEND_BATCH_URL, 500, "Server Error", {}, io.BytesIO(body)))
+    with pytest.raises(notify.EmailError) as exc:
+        notify.send_batch("key", [{"to": ["a@x"]}])
+    assert exc.value.reason == "http_500"
