@@ -33,7 +33,7 @@
     </svg>
     <input type="text" id="course-search" class="search-input" placeholder="Search courses by code or title…" autocomplete="off">
   </div>
-  <div style="font-size: 0.875rem; color: var(--text-muted); font-weight: 500;">
+  <div class="course-count">
     {{ courses|length }} Course{% if courses|length != 1 %}s{% endif %} available
   </div>
 </div>
@@ -71,7 +71,7 @@
       </div>
 
       <div class="course-card-footer">
-        <a href="/courses/{{ c.id }}" class="btn btn-sm btn-outline" style="width: 100%;">
+        <a href="/courses/{{ c.id }}" class="btn btn-sm btn-outline btn-block">
           Open Course
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 12h14"/>
@@ -82,7 +82,7 @@
     </div>
   </div>
   {% else %}
-  <div class="empty-state" style="grid-column: 1 / -1;">
+  <div class="empty-state grid-span-all">
     <div class="empty-icon">📚</div>
     <h3 class="empty-title">No courses synced yet</h3>
     <p class="empty-text">
@@ -94,7 +94,7 @@
 </div>
 
 <!-- Search Empty State (Client-Side) -->
-<div id="search-empty-state" class="empty-state" style="display: none;">
+<div id="search-empty-state" class="empty-state is-hidden">
   <div class="empty-icon">🔍</div>
   <h3 class="empty-title">No matching courses</h3>
   <p class="empty-text">Try adjusting your search terms to find what you're looking for.</p>

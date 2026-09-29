@@ -18,10 +18,9 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda s: None)
 
 
-def _resp(payload: dict):
-    body = json.dumps(
-        {"choices": [{"message": {"content": json.dumps(payload)}}]}
-    ).encode()
+def _resp(payload):
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
     class FakeResp:
         def __enter__(self):
@@ -36,9 +35,9 @@ def _resp(payload: dict):
     return FakeResp()
 
 
-def _http_error(code: int):
+def _http_error(code: int, retry_after: str = "0"):
     return urllib.error.HTTPError(
-        "https://x", code, "err", {"Retry-After": "0"}, io.BytesIO()
+        "https://x", code, "err", {"Retry-After": retry_after}, io.BytesIO()
     )
 
 
@@ -83,10 +82,100 @@ def test_two_429s_then_success_recovers(monkeypatch):
 
 
 def test_non_retryable_raises_immediately(monkeypatch):
-    client, calls = _client(monkeypatch, [_http_error(400)])
+    client, calls = _client(monkeypatch, [_http_error(401)])
     with pytest.raises(LLMError, match="chat completion failed:"):
         client.complete_json("s", "u")
     assert len(calls) == 1
+
+
+def _sent(req) -> dict:
+    return json.loads(req.data)
+
+
+def test_400_on_json_mode_retries_without_it(monkeypatch):
+    client, calls = _client(
+        monkeypatch, [_http_error(400), '```json\n{"ok": true}\n```', {"again": 1}]
+    )
+    assert client.complete_json("s", "u") == {"ok": True}
+    assert "response_format" in _sent(calls[0])
+    assert "response_format" not in _sent(calls[1])
+    client.complete_json("s", "u")  # remembered for the client's later calls
+    assert len(calls) == 3 and "response_format" not in _sent(calls[2])
+
+
+def test_400_without_json_mode_is_not_retried(monkeypatch):
+    client, calls = _client(monkeypatch, [_http_error(400), _http_error(400)])
+    with pytest.raises(LLMError, match="chat completion failed:"):
+        client.complete_json("s", "u")
+    assert len(calls) == 2
+
+
+def test_prose_wrapped_json_is_parsed(monkeypatch):
+    client, _ = _client(monkeypatch, ['Sure! Here it is: {"a": [1, 2]} Hope that helps.'])
+    assert client.complete_json("s", "u") == {"a": [1, 2]}
+
+
+def test_prose_with_its_own_braces_still_finds_the_answer(monkeypatch):
+    client, _ = _client(
+        monkeypatch, ['For example: {}. Answer: {"chunks": [{"content": "x"}]} (see {note})']
+    )
+    assert client.complete_json("s", "u") == {"chunks": [{"content": "x"}]}
+
+
+def test_reply_without_json_object_is_a_bad_response(monkeypatch):
+    client, _ = _client(monkeypatch, ["[1, 2]"])
+    with pytest.raises(LLMError, match="bad LLM response"):
+        client.complete_json("s", "u")
+
+
+def _record_sleeps(monkeypatch):
+    slept = []
+    monkeypatch.setattr("time.sleep", slept.append)
+    return slept
+
+
+def test_429_sleeps_once_for_retry_after(monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    client, _ = _client(monkeypatch, [_http_error(429, "7"), {"ok": True}])
+    client.complete_json("s", "u")
+    assert slept == [7]  # the server's hint alone, no fixed backoff on top
+
+
+def test_429_retry_after_http_date(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    slept = _record_sleeps(monkeypatch)
+    when = datetime.now(timezone.utc) + timedelta(seconds=40)
+    client, _ = _client(
+        monkeypatch, [_http_error(429, format_datetime(when, usegmt=True)), {"ok": True}]
+    )
+    client.complete_json("s", "u")
+    assert len(slept) == 1 and 38 <= slept[0] <= 41
+
+
+def test_retry_after_is_clamped():
+    from app.llm import _retry_after
+
+    past = "Wed, 21 Oct 2015 07:28:00 GMT"
+    assert _retry_after(_http_error(429, past)) == 0
+    assert _retry_after(_http_error(429, "9999")) == llm_mod.MAX_RETRY_AFTER
+    assert _retry_after(_http_error(429, "-5")) is None
+
+
+def test_429_without_hint_uses_backoff(monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    client, _ = _client(monkeypatch, [_http_error(429, "soon"), {"ok": True}])
+    client.complete_json("s", "u")
+    assert slept == [llm_mod.BACKOFF[0]]
+
+
+def test_no_sleep_after_the_last_attempt(monkeypatch):
+    slept = _record_sleeps(monkeypatch)
+    client, calls = _client(monkeypatch, [_http_error(503)] * 5)
+    with pytest.raises(LLMError, match="after retries"):
+        client.complete_json("s", "u")
+    assert len(calls) == 5 and slept == llm_mod.BACKOFF[:4]
 
 
 def _bare_chunks(session, n=2):

@@ -87,7 +87,7 @@
     </div>
     <p class="stat-caption">
       {% if due > 0 %}
-        <a href="/review/take" style="font-weight: 600;">Start review session →</a>
+        <a class="text-strong" href="/review/take">Start review session →</a>
       {% else %}
         Queue caught up for today
       {% endif %}
@@ -156,10 +156,10 @@
 </div>
 
 <!-- Spaced Repetition Science Guide -->
-<div class="card" style="margin-top: 1.5rem;">
+<div class="card sm2-guide">
   <div class="card-header">
-    <h2 class="card-title" style="display: flex; align-items: center; gap: 0.5rem;">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary);">
+    <h2 class="card-title card-title-icon">
+      <svg class="icon-primary" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/>
         <line x1="12" y1="16" x2="12" y2="12"/>
         <line x1="12" y1="8" x2="12.01" y2="8"/>
@@ -167,10 +167,10 @@
       How the SM-2 Spaced Repetition Algorithm Works
     </h2>
   </div>
-  <p style="color: var(--text-muted); line-height: 1.6; margin-bottom: 0.75rem;">
+  <p class="sm2-guide-text">
     Strathmore Study Buddy uses the proven <strong>SuperMemo-2 (SM-2)</strong> spaced repetition algorithm to fight the forgetting curve. Each quiz question tracks an individualized <em>ease factor</em>, <em>interval</em>, and <em>repetition count</em>:
   </p>
-  <ul style="color: var(--text-muted); line-height: 1.6; margin-bottom: 0.5rem; padding-left: 1.25rem;">
+  <ul class="sm2-guide-list">
     <li><strong>First Recall:</strong> New items are scheduled for review within 1 day.</li>
     <li><strong>Expanding Intervals:</strong> Consecutive correct recalls multiply the interval (e.g. 1 day → 6 days → 15 days), requiring less study time as memories become permanent.</li>
     <li><strong>Adaptive Difficulty:</strong> Wrong answers reset the repetition counter while lowering ease, giving you extra practice where you need it most.</li>

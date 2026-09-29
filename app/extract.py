@@ -76,6 +76,34 @@ def extract_docx(blob: bytes) -> str:
     return text
 
 
+TRANSCRIPT_LANGUAGES = ("en", "en-US", "en-GB")
+
+
+def _fetch_transcript(api, video_id: str):
+    """English transcript if there is one; otherwise whatever the video has,
+    translated to English when YouTube can, else in its own language.
+    Lists the video's captions once and picks from that list.
+    Written against youtube-transcript-api 1.2.x (pinned in pyproject)."""
+    from youtube_transcript_api import NoTranscriptFound, YouTubeTranscriptApiException
+
+    transcripts = api.list(video_id)
+    try:  # uploader-written before auto-generated, per language
+        return transcripts.find_transcript(TRANSCRIPT_LANGUAGES).fetch()
+    except NoTranscriptFound:
+        pass
+    available = list(transcripts)
+    if not available:
+        raise SkipResource(f"no transcripts listed for {video_id}")
+    # Uploader-written captions beat auto-generated ones.
+    transcript = min(available, key=lambda t: t.is_generated)
+    if transcript.is_translatable:
+        try:
+            return transcript.translate("en").fetch()
+        except YouTubeTranscriptApiException:
+            pass  # translation is best-effort; fall back to the original
+    return transcript.fetch()
+
+
 def extract_transcript(url: str) -> str:
     """YouTube transcript. Raises SkipResource when unavailable (v1 policy)."""
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -89,8 +117,7 @@ def extract_transcript(url: str) -> str:
             video_id = parse_qs(urlparse(url).query).get("v", [None])[0]
         if not video_id:
             raise SkipResource(f"cannot parse video id from {url}")
-        api = YouTubeTranscriptApi()
-        transcript = api.fetch(video_id)
+        transcript = _fetch_transcript(YouTubeTranscriptApi(), video_id)
         text = " ".join(s.text.strip() for s in transcript if s.text.strip())
         if not text.strip():
             raise SkipResource(f"empty transcript for {url}")

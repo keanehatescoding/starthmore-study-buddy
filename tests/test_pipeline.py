@@ -13,6 +13,7 @@ from app.extract import (
     extract_docx,
     extract_pptx,
     extract_resource_text,
+    extract_transcript,
 )
 from app.models import Chunk, Course, Resource, Topic
 from app.moodle import MoodleError
@@ -112,6 +113,100 @@ def test_link_skipped(session):
     r = _resource(session, type="link", raw_url="https://example.com")
     with pytest.raises(SkipResource):
         extract_resource_text(r)
+
+
+class _Snippet:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Transcript:
+    def __init__(self, lang, generated=False, translatable=True):
+        self.language_code, self.is_generated = lang, generated
+        self.is_translatable = translatable
+
+    def translate(self, lang):
+        return _Transcript(f"{self.language_code}->{lang}", self.is_generated)
+
+    def fetch(self):
+        return [_Snippet(f"text in {self.language_code}")]
+
+
+class _UnfetchableTranslation(_Transcript):
+    def translate(self, lang):
+        import youtube_transcript_api as yta
+
+        class Broken(_Transcript):
+            def fetch(self):
+                raise yta.YouTubeTranscriptApiException("translation request failed")
+
+        return Broken(lang)
+
+
+def _fake_youtube(monkeypatch, available):
+    """Fake API over `available` transcripts; returns the list() call log."""
+    import youtube_transcript_api as yta
+
+    listed = []
+
+    class FakeList:
+        def __iter__(self):
+            return iter(available)
+
+        def find_transcript(self, languages):
+            for lang in languages:  # manual before generated, like the real one
+                for generated in (False, True):
+                    for t in available:
+                        if t.language_code == lang and t.is_generated == generated:
+                            return t
+            raise yta.NoTranscriptFound("abc", languages, None)
+
+    class FakeApi:
+        def list(self, video_id):
+            listed.append(video_id)
+            return FakeList()
+
+        def fetch(self, *a, **k):
+            raise AssertionError("fetch() lists again; use the one list")
+
+    monkeypatch.setattr(yta, "YouTubeTranscriptApi", FakeApi)
+    return listed
+
+
+def test_transcript_prefers_english(monkeypatch):
+    listed = _fake_youtube(monkeypatch, [_Transcript("fr"), _Transcript("en", generated=True),
+                                         _Transcript("en-GB")])
+    assert extract_transcript("https://youtu.be/abc") == "text in en"
+    assert listed == ["abc"]
+
+
+def test_transcript_language_order_beats_manual_vs_generated(monkeypatch):
+    _fake_youtube(monkeypatch, [_Transcript("en", generated=True),
+                                _Transcript("en-US")])
+    # "en" is tried first, generated "en" beats manual "en-US" (language order wins)
+    assert extract_transcript("https://youtu.be/abc") == "text in en"
+
+
+def test_transcript_falls_back_to_translated_manual_captions(monkeypatch):
+    listed = _fake_youtube(monkeypatch, [_Transcript("sw", generated=True), _Transcript("fr")])
+    assert extract_transcript("https://www.youtube.com/watch?v=abc") == "text in fr->en"
+    assert listed == ["abc"]  # one caption-list request, not two
+
+
+def test_transcript_untranslatable_uses_original_language(monkeypatch):
+    _fake_youtube(monkeypatch, [_Transcript("sw", translatable=False)])
+    assert extract_transcript("https://youtu.be/abc") == "text in sw"
+
+
+def test_transcript_failed_translation_fetch_falls_back_to_original(monkeypatch):
+    _fake_youtube(monkeypatch, [_UnfetchableTranslation("fr")])
+    assert extract_transcript("https://youtu.be/abc") == "text in fr"
+
+
+def test_transcript_none_available_skips(monkeypatch):
+    _fake_youtube(monkeypatch, [])
+    with pytest.raises(SkipResource):
+        extract_transcript("https://youtu.be/abc")
 
 
 def test_presplit_and_locate():

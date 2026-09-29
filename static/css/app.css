@@ -1493,3 +1493,305 @@ pre.text {
   background: var(--surface-active);
   color: var(--text-muted);
 }
+
+/* ---- Page-level layout (moved out of template style attributes so the
+   CSP needs no 'unsafe-inline') ---- */
+
+.page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.badge-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.section-block {
+  margin-top: 2rem;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.section-header-baseline {
+  align-items: baseline;
+}
+
+.section-title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.section-note {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.hint-text {
+  font-size: 0.85rem;
+  color: var(--text-faint);
+}
+
+.badge-type {
+  font-weight: 700;
+}
+
+.icon-primary {
+  color: var(--primary);
+}
+
+.text-strong {
+  font-weight: 600;
+}
+
+.is-hidden {
+  display: none;
+}
+
+.course-count {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.grid-span-all {
+  grid-column: 1 / -1;
+}
+
+.course-summary {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  margin-bottom: 0;
+}
+
+.assignments-title {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--accent);
+}
+
+.topics-section {
+  margin-top: 1.75rem;
+}
+
+.topics-heading {
+  font-size: 1.25rem;
+  margin-bottom: 1rem;
+  color: var(--text-main);
+}
+
+.badge-count {
+  font-size: 0.72rem;
+}
+
+.resource-empty {
+  padding: 0.5rem 0;
+  color: var(--text-faint);
+}
+
+.resource-header {
+  margin-bottom: 1.75rem;
+}
+
+.resource-title-heading {
+  margin-bottom: 0.75rem;
+}
+
+.resource-source {
+  margin-bottom: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.resource-error {
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: var(--danger);
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-md);
+  margin-top: 0.75rem;
+}
+
+.reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.badge-size {
+  font-size: 0.75rem;
+}
+
+.reader-empty {
+  padding: 2rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.flush {
+  margin: 0;
+}
+
+.badge-meta {
+  font-weight: 500;
+  font-size: 0.72rem;
+}
+
+.flush-bottom {
+  margin-bottom: 0;
+}
+
+.quiz-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.75rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.quiz-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.tip-text {
+  font-size: 0.8rem;
+  color: var(--text-faint);
+}
+
+.option-text {
+  flex: 1;
+}
+
+.answer-field {
+  margin-bottom: 1.5rem;
+}
+
+.answer-help {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-top: 0.35rem;
+  margin-bottom: 0;
+}
+
+.review-hero-title {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+}
+
+.review-hero-text {
+  color: var(--text-muted);
+  max-width: 520px;
+  margin: 0 auto 1.75rem auto;
+  font-size: 1rem;
+}
+
+.review-hero-text-loose {
+  line-height: 1.6;
+}
+
+.btn-hero {
+  padding: 0.9rem 2.25rem;
+  font-size: 1.1rem;
+}
+
+.queue-title {
+  font-size: 1.2rem;
+  margin: 0;
+}
+
+.queue-item-main {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.queue-item-question {
+  color: var(--text-main);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.no-shrink {
+  flex-shrink: 0;
+}
+
+.review-hero-icon-done {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.review-hero-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.sm2-guide {
+  margin-top: 1.5rem;
+}
+
+.card-title-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.sm2-guide-text {
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-bottom: 0.75rem;
+}
+
+.sm2-guide-list {
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-bottom: 0.5rem;
+  padding-left: 1.25rem;
+}
+
+.login-edition {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.75rem;
+}
+
+.login-check {
+  color: var(--success);
+  font-weight: bold;
+}
+
+.flush-bottom-sm {
+  margin-bottom: 0.5rem;
+}

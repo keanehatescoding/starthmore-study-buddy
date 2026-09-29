@@ -56,9 +56,24 @@ Backups (nightly pg_dump, 14-day retention):
 
 ## Notes
 
-- Rate limiting is per-process memory (120 POSTs/min/IP default). Behind
-  multiple uvicorn workers put a shared limiter or a proxy limit in front,
-  and set the client IP from `X-Forwarded-For` (currently `request.client`).
+- Rate limiting is per-process memory (120 POSTs/min default), keyed by
+  signed-in user and by client IP for anonymous requests, with at most
+  10,000 clients tracked (least recently seen evicted). Behind multiple
+  uvicorn workers put a shared limiter or a proxy limit in front.
+- Client IPs come from `X-Forwarded-For`, trusted from the peers listed in
+  `FORWARDED_ALLOW_IPS` (Dockerfile/Procfile default `*`: any peer). Uvicorn
+  takes the leftmost address that isn't a trusted proxy — with `*` that is
+  the leftmost entry, which a client can forge unless the proxy **replaces**
+  any incoming `X-Forwarded-For` rather than appending to it. So: only let
+  the proxy reach uvicorn (never publish the port directly), make the proxy
+  overwrite the header (nginx: `proxy_set_header X-Forwarded-For
+  $remote_addr;`, not `$proxy_add_x_forwarded_for`), and where the proxy's
+  address is known set `FORWARDED_ALLOW_IPS` to it (IPs or CIDRs,
+  comma-separated). A forged address only affects the anonymous POST budget
+  and logs — signed-in users are rate-limited by account.
+- CSP: scripts and `<style>` elements need the per-response nonce
+  (`{{ request.state.csp_nonce }}` in templates); no `unsafe-inline`.
+  `style="…"` attributes are blocked — add a class to `static/css/app.css`.
 - CI (`.github/workflows/ci.yml`) runs migrations + `alembic check` + the
   full suite on Postgres 16 for every push/PR.
 - `/health` checks Postgres and returns 503 when unreachable — safe to use

@@ -105,7 +105,7 @@ def _flash(request: Request, kind: str, text: str) -> None:
 @app.exception_handler(401)
 async def unauthorized(request: Request, exc: HTTPException):
     if request.url.path.startswith("/api"):
-        return HTMLResponse("login required", status_code=401)
+        return JSONResponse({"detail": "login required"}, status_code=401)
     return _login_redirect(request)
 
 
