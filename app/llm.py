@@ -51,20 +51,30 @@ def _retry_after(err: urllib.error.HTTPError) -> int | None:
 
 def parse_json_content(content: str) -> dict:
     """The model's reply as a JSON object. Without JSON mode, models wrap it
-    in ```json fences or a sentence of prose, so fall back to the outermost
-    {...} span."""
-    candidates = [content]
-    start, end = content.find("{"), content.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(content[start : end + 1])
-    for text in candidates:
-        for strict in (True, False):  # strict=False: raw control chars in strings
+    in ```json fences or prose (which may hold braces of its own), so fall
+    back to the largest complete {...} object found anywhere in the text."""
+    for strict in (True, False):  # strict=False: raw control chars in strings
+        try:
+            parsed = json.loads(content, strict=strict)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    best, best_len = None, 0
+    for strict in (True, False):
+        decoder = json.JSONDecoder(strict=strict)
+        pos = content.find("{")
+        while pos != -1:
             try:
-                parsed = json.loads(text, strict=strict)
+                parsed, end = decoder.raw_decode(content, pos)
             except json.JSONDecodeError:
+                pos = content.find("{", pos + 1)
                 continue
-            if isinstance(parsed, dict):
-                return parsed
+            if isinstance(parsed, dict) and end - pos > best_len:
+                best, best_len = parsed, end - pos
+            pos = content.find("{", end)  # skip past this object
+        if best is not None:
+            return best
     raise ValueError("no JSON object in reply")
 
 

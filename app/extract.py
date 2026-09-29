@@ -82,14 +82,16 @@ TRANSCRIPT_LANGUAGES = ("en", "en-US", "en-GB")
 def _fetch_transcript(api, video_id: str):
     """English transcript if there is one; otherwise whatever the video has,
     translated to English when YouTube can, else in its own language.
+    Lists the video's captions once and picks from that list.
     Written against youtube-transcript-api 1.2.x (pinned in pyproject)."""
     from youtube_transcript_api import NoTranscriptFound, YouTubeTranscriptApiException
 
-    try:
-        return api.fetch(video_id, languages=TRANSCRIPT_LANGUAGES)
+    transcripts = api.list(video_id)
+    try:  # uploader-written before auto-generated, per language
+        return transcripts.find_transcript(TRANSCRIPT_LANGUAGES).fetch()
     except NoTranscriptFound:
         pass
-    available = list(api.list(video_id))
+    available = list(transcripts)
     if not available:
         raise SkipResource(f"no transcripts listed for {video_id}")
     # Uploader-written captions beat auto-generated ones.

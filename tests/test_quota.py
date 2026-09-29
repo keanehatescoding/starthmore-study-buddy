@@ -115,6 +115,13 @@ def test_prose_wrapped_json_is_parsed(monkeypatch):
     assert client.complete_json("s", "u") == {"a": [1, 2]}
 
 
+def test_prose_with_its_own_braces_still_finds_the_answer(monkeypatch):
+    client, _ = _client(
+        monkeypatch, ['For example: {}. Answer: {"chunks": [{"content": "x"}]} (see {note})']
+    )
+    assert client.complete_json("s", "u") == {"chunks": [{"content": "x"}]}
+
+
 def test_reply_without_json_object_is_a_bad_response(monkeypatch):
     client, _ = _client(monkeypatch, ["[1, 2]"])
     with pytest.raises(LLMError, match="bad LLM response"):

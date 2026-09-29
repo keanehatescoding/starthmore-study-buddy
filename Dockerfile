@@ -14,4 +14,4 @@ COPY static/ static/
 
 RUN pip install --no-cache-dir --index-url $PIP_INDEX_URL .
 
-CMD alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --forwarded-allow-ips "*"
+CMD alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}"
