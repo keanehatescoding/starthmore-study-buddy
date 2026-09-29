@@ -134,6 +134,28 @@ def test_429_sleeps_once_for_retry_after(monkeypatch):
     assert slept == [7]  # the server's hint alone, no fixed backoff on top
 
 
+def test_429_retry_after_http_date(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    slept = _record_sleeps(monkeypatch)
+    when = datetime.now(timezone.utc) + timedelta(seconds=40)
+    client, _ = _client(
+        monkeypatch, [_http_error(429, format_datetime(when, usegmt=True)), {"ok": True}]
+    )
+    client.complete_json("s", "u")
+    assert len(slept) == 1 and 38 <= slept[0] <= 41
+
+
+def test_retry_after_is_clamped():
+    from app.llm import _retry_after
+
+    past = "Wed, 21 Oct 2015 07:28:00 GMT"
+    assert _retry_after(_http_error(429, past)) == 0
+    assert _retry_after(_http_error(429, "9999")) == llm_mod.MAX_RETRY_AFTER
+    assert _retry_after(_http_error(429, "-5")) is None
+
+
 def test_429_without_hint_uses_backoff(monkeypatch):
     slept = _record_sleeps(monkeypatch)
     client, _ = _client(monkeypatch, [_http_error(429, "soon"), {"ok": True}])

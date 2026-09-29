@@ -132,6 +132,17 @@ class _Transcript:
         return [_Snippet(f"text in {self.language_code}")]
 
 
+class _UnfetchableTranslation(_Transcript):
+    def translate(self, lang):
+        import youtube_transcript_api as yta
+
+        class Broken(_Transcript):
+            def fetch(self):
+                raise yta.YouTubeTranscriptApiException("translation request failed")
+
+        return Broken(lang)
+
+
 def _fake_youtube(monkeypatch, available, english=None):
     import youtube_transcript_api as yta
 
@@ -161,6 +172,11 @@ def test_transcript_falls_back_to_translated_manual_captions(monkeypatch):
 def test_transcript_untranslatable_uses_original_language(monkeypatch):
     _fake_youtube(monkeypatch, [_Transcript("sw", translatable=False)])
     assert extract_transcript("https://youtu.be/abc") == "text in sw"
+
+
+def test_transcript_failed_translation_fetch_falls_back_to_original(monkeypatch):
+    _fake_youtube(monkeypatch, [_UnfetchableTranslation("fr")])
+    assert extract_transcript("https://youtu.be/abc") == "text in fr"
 
 
 def test_transcript_none_available_skips(monkeypatch):

@@ -6,10 +6,13 @@ OpenAI-compatible endpoint — only base_url/api_key/model differ (.env).
 
 from __future__ import annotations
 
+import email.utils
 import json
+import math
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 
 class LLMError(RuntimeError):
@@ -27,10 +30,22 @@ MAX_RETRY_AFTER = 120
 
 
 def _retry_after(err: urllib.error.HTTPError) -> int | None:
-    try:
-        seconds = int(err.headers.get("Retry-After", ""))
-    except (AttributeError, TypeError, ValueError):
+    """Seconds the server asked us to wait: Retry-After is either
+    delay-seconds or an HTTP-date (RFC 9110 §10.2.3)."""
+    value = (getattr(err, "headers", None) or {}).get("Retry-After")
+    if not value:
         return None
+    value = value.strip()
+    if value.isdigit():
+        seconds = int(value)
+    else:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:  # obsolete date forms without a zone are GMT
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = math.ceil((when - datetime.now(timezone.utc)).total_seconds())
     return min(max(seconds, 0), MAX_RETRY_AFTER)
 
 

@@ -96,7 +96,7 @@ def _fetch_transcript(api, video_id: str):
     transcript = min(available, key=lambda t: t.is_generated)
     if transcript.is_translatable:
         try:
-            transcript = transcript.translate("en")
+            return transcript.translate("en").fetch()
         except YouTubeTranscriptApiException:
             pass  # translation is best-effort; fall back to the original
     return transcript.fetch()
