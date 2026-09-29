@@ -157,3 +157,23 @@ def test_sync_keeps_untopicd_materials(session):
     assert (topic.source_id, topic.title) == (UNTAGGED_TOPIC_ID, UNTAGGED_TITLE)
     titles = sorted(r.title for r in session.exec(select(Resource)))
     assert titles == ["M", "notes.pdf"]
+
+
+def test_material_moved_to_other_materials_is_moved_not_duplicated(session):
+    user = User(email="s@x.edu")
+    session.add(user)
+    session.commit()
+    service = _Service(topics=[{"topicId": "T1", "name": "Week 1"}],
+                       materials=[_material("m1", topic_id="T1")])
+    sync_course(session, ClassroomAdapter(ClassroomClient(service)), "c1", user.id)
+    before = session.exec(select(Resource)).one()
+
+    # teacher removes the topic from the material: it now sits under "Other materials"
+    service = _Service(topics=[{"topicId": "T1", "name": "Week 1"}],
+                       materials=[_material("m1")])
+    stats = sync_course(session, ClassroomAdapter(ClassroomClient(service)), "c1", user.id)
+
+    assert (stats.resources_new, stats.resources_updated) == (0, 1)
+    after = session.exec(select(Resource)).one()
+    assert after.id == before.id
+    assert session.get(Topic, after.topic_id).source_id == UNTAGGED_TOPIC_ID

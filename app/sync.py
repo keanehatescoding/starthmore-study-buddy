@@ -5,6 +5,7 @@ this module upserts them. Implements the plan's 6-step sync per course:
   hash changed  -> reset for re-extract/re-chunk and drop derived chunks,
                    quiz items and review states (Phase 2/3 regenerates)
   meta changed  -> update title/url/type/mime in place, no reset
+  topic changed -> move the row to the new topic, no reset
   unchanged     -> skip (hash check avoids re-running expensive LLM steps)
 Assignments are upserted separately and never become Resources.
 """
@@ -113,6 +114,7 @@ class SyncStats:
     resources_new: int = 0
     resources_updated: int = 0
     resources_skipped: int = 0
+    resources_removed: int = 0
     assignments_new: int = 0
     assignments_updated: int = 0
 
@@ -239,14 +241,28 @@ def sync_course(
             session.commit()
         topic_id_by_source[t.source_id] = topic.id
 
+    # Resources are matched per course, not per topic: a material the source
+    # moved to another topic is moved here too (keeping its derived data)
+    # instead of being inserted again beside the old row.
+    by_source_id: dict[str, list[Resource]] = {}
+    for row in session.exec(
+        select(Resource).join(Topic).where(Topic.course_id == course.id)
+    ):
+        by_source_id.setdefault(row.source_id, []).append(row)
+    kept: set[Any] = set()
+
     for topic_source_id, topic_id in topic_id_by_source.items():
         for r in adapter.fetch_resources(course_source_id, topic_source_id):
             digest = content_hash(r)
-            existing = session.exec(
-                select(Resource).where(
-                    Resource.topic_id == topic_id, Resource.source_id == r.source_id
-                )
-            ).first()
+            rows = by_source_id.get(r.source_id, [])
+            existing = next((x for x in rows if x.topic_id == topic_id), None) or next(
+                (x for x in rows if x.id not in kept), None
+            )
+            moved = existing is not None and existing.topic_id != topic_id
+            if moved:
+                existing.topic_id = topic_id
+            if existing is not None:
+                kept.add(existing.id)
             if existing is None:
                 session.add(
                     Resource(
@@ -291,7 +307,7 @@ def sync_course(
                 session.add(existing)
                 session.commit()
                 stats.resources_updated += 1
-            elif meta_changed:
+            elif meta_changed or moved:
                 for k, v in meta.items():
                     setattr(existing, k, v)
                 session.add(existing)
@@ -299,6 +315,18 @@ def sync_course(
                 stats.resources_updated += 1
             else:
                 stats.resources_skipped += 1
+
+    # Copies of a resource the source still lists, left under other topics by
+    # syncs before resources could move: retire them so each shows up once.
+    for source_id, rows in by_source_id.items():
+        if not any(x.id in kept for x in rows):
+            continue  # not listed this sync; leave it alone
+        for stale in rows:
+            if stale.id not in kept:
+                _purge_derived(session, stale.id)
+                session.delete(stale)
+                stats.resources_removed += 1
+    session.commit()
 
     for a in adapter.fetch_assignments(course_source_id):
         topic_id = topic_id_by_source.get(a.topic_source_id) if a.topic_source_id else None
