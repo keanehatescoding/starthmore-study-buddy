@@ -151,6 +151,9 @@ class NotificationEvent(SQLModel, table=True):
     sent_at: Optional[datetime] = Field(
         default=None, sa_column=Column(DateTime(timezone=True))
     )
+    # Resend Idempotency-Key of the multi-email batch this event was last sent
+    # in; kept so an ambiguous failure is retried as the same batch, same key.
+    batch_key: Optional[str] = Field(default=None, index=True)
 
 
 ACTIVE_NOTIFY_WHERE = "type = 'send_notifications' AND status IN ('pending', 'running')"

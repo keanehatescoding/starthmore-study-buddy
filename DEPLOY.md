@@ -5,7 +5,8 @@
 1. `railway init`, add the repo. Add a Postgres plugin (sets `DATABASE_URL`).
 2. Set env vars (see `.env.example`): `MOODLE_TOKEN`, `MOODLE_BASE_URL`,
    `GOOGLE_CLIENT_ID/SECRET` (after classroom consent), `LLM_*`, `RESEND_API_KEY`,
-   `EMAIL_FROM`, `EMAIL_TO`. Note: `DATABASE_URL` must use the `psycopg`
+   `EMAIL_FROM`, `EMAIL_TO`, `APP_BASE_URL` (the public web URL, used in
+   email links). Note: `DATABASE_URL` must use the `psycopg`
    driver as-is; no code change needed.
 3. Services from `Procfile`: `web` (FastAPI) and `worker` (hourly notification pass).
 4. Each user connects their own Moodle account at **Moodle** in the nav

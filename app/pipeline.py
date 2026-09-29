@@ -202,8 +202,8 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
         if pace:
             time.sleep(pace)
     for cid, n in per_course.items():
-        enqueue_new_material(session, UUID(cid), n)
-        counts["events"] += 1
+        if enqueue_new_material(session, UUID(cid), n) is not None:
+            counts["events"] += 1
     return result
 
 

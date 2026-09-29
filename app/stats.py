@@ -7,17 +7,7 @@ from datetime import datetime, timezone
 from sqlmodel import Session, func, select
 
 from app.grade import _aware, scoped_items
-from app.models import QuizItem, ReviewState, User
-
-
-def get_or_create_user(session: Session, email: str = "student@strathmore.edu") -> User:
-    user = session.exec(select(User).where(User.email == email)).first()
-    if user is None:
-        user = User(email=email)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-    return user
+from app.models import QuizItem, ReviewState
 
 
 def compute_stats(session: Session, user_id) -> dict:
