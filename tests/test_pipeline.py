@@ -13,6 +13,7 @@ from app.extract import (
     extract_docx,
     extract_pptx,
     extract_resource_text,
+    extract_transcript,
 )
 from app.models import Chunk, Course, Resource, Topic
 from app.moodle import MoodleError
@@ -112,6 +113,60 @@ def test_link_skipped(session):
     r = _resource(session, type="link", raw_url="https://example.com")
     with pytest.raises(SkipResource):
         extract_resource_text(r)
+
+
+class _Snippet:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Transcript:
+    def __init__(self, lang, generated=False, translatable=True):
+        self.language_code, self.is_generated = lang, generated
+        self.is_translatable = translatable
+
+    def translate(self, lang):
+        return _Transcript(f"{self.language_code}->{lang}", self.is_generated)
+
+    def fetch(self):
+        return [_Snippet(f"text in {self.language_code}")]
+
+
+def _fake_youtube(monkeypatch, available, english=None):
+    import youtube_transcript_api as yta
+
+    class FakeApi:
+        def fetch(self, video_id, languages=("en",)):
+            assert "en" in languages
+            if english is None:
+                raise yta.NoTranscriptFound(video_id, languages, None)
+            return [_Snippet(english), _Snippet("  ")]
+
+        def list(self, video_id):
+            return iter(available)
+
+    monkeypatch.setattr(yta, "YouTubeTranscriptApi", FakeApi)
+
+
+def test_transcript_prefers_english(monkeypatch):
+    _fake_youtube(monkeypatch, [], english="hello")
+    assert extract_transcript("https://youtu.be/abc") == "hello"
+
+
+def test_transcript_falls_back_to_translated_manual_captions(monkeypatch):
+    _fake_youtube(monkeypatch, [_Transcript("sw", generated=True), _Transcript("fr")])
+    assert extract_transcript("https://www.youtube.com/watch?v=abc") == "text in fr->en"
+
+
+def test_transcript_untranslatable_uses_original_language(monkeypatch):
+    _fake_youtube(monkeypatch, [_Transcript("sw", translatable=False)])
+    assert extract_transcript("https://youtu.be/abc") == "text in sw"
+
+
+def test_transcript_none_available_skips(monkeypatch):
+    _fake_youtube(monkeypatch, [])
+    with pytest.raises(SkipResource):
+        extract_transcript("https://youtu.be/abc")
 
 
 def test_presplit_and_locate():

@@ -56,9 +56,16 @@ Backups (nightly pg_dump, 14-day retention):
 
 ## Notes
 
-- Rate limiting is per-process memory (120 POSTs/min/IP default). Behind
-  multiple uvicorn workers put a shared limiter or a proxy limit in front,
-  and set the client IP from `X-Forwarded-For` (currently `request.client`).
+- Rate limiting is per-process memory (120 POSTs/min default), keyed by
+  signed-in user and by client IP for anonymous requests, with at most
+  10,000 clients tracked (least recently seen evicted). Behind multiple
+  uvicorn workers put a shared limiter or a proxy limit in front. The
+  Dockerfile runs uvicorn with `--forwarded-allow-ips "*"`, so the client IP
+  comes from `X-Forwarded-For` — only expose the container behind a proxy
+  that sets it.
+- CSP: scripts and `<style>` elements need the per-response nonce
+  (`{{ request.state.csp_nonce }}` in templates); no `unsafe-inline`.
+  `style="…"` attributes are still allowed via `style-src-attr`.
 - CI (`.github/workflows/ci.yml`) runs migrations + `alembic check` + the
   full suite on Postgres 16 for every push/PR.
 - `/health` checks Postgres and returns 503 when unreachable — safe to use
