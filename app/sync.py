@@ -5,6 +5,7 @@ this module upserts them. Implements the plan's 6-step sync per course:
   hash changed  -> reset for re-extract/re-chunk and drop derived chunks,
                    quiz items and review states (Phase 2/3 regenerates)
   meta changed  -> update title/url/type/mime in place, no reset
+  topic changed -> move the row to the new topic, no reset
   unchanged     -> skip (hash check avoids re-running expensive LLM steps)
 Assignments are upserted separately and never become Resources.
 """
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from sqlmodel import Session, delete, select, update
+from sqlmodel import Session, delete, func, select, update
 
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic
 
@@ -113,6 +114,7 @@ class SyncStats:
     resources_new: int = 0
     resources_updated: int = 0
     resources_skipped: int = 0
+    resources_removed: int = 0
     assignments_new: int = 0
     assignments_updated: int = 0
 
@@ -184,6 +186,33 @@ def _purge_derived(session: Session, resource_id) -> None:
     session.exec(delete(Chunk).where(Chunk.resource_id == resource_id))
 
 
+def _progress(session: Session, resource_id) -> tuple[int, int]:
+    """(review states, chunks) built from a resource: what retiring it loses."""
+    chunk_ids = select(Chunk.id).where(Chunk.resource_id == resource_id)
+    item_ids = select(QuizItem.id).where(QuizItem.chunk_id.in_(chunk_ids))
+    reviews = session.exec(
+        select(func.count()).select_from(ReviewState)
+        .where(ReviewState.quiz_item_id.in_(item_ids))
+    ).one()
+    chunks = session.exec(
+        select(func.count()).select_from(Chunk).where(Chunk.resource_id == resource_id)
+    ).one()
+    return reviews, chunks
+
+
+def _pick_copy(session: Session, rows: list[Resource], topic_id) -> Resource | None:
+    """The copy to keep among a resource's rows: the most review progress,
+    then the most derived chunks, then the one already in topic_id."""
+    if len(rows) <= 1:
+        return rows[0] if rows else None
+    return max(rows, key=lambda x: (*_progress(session, x.id), x.topic_id == topic_id))
+
+
+def _retire(session: Session, resource: Resource) -> None:
+    _purge_derived(session, resource.id)
+    session.delete(resource)
+
+
 def _legacy_hash_matches(adapter, data: ResourceData, legacy: str) -> bool | None:
     """Whether the file's current bytes still hash to a pre-fingerprint
     content hash. None when that can't be checked right now."""
@@ -239,14 +268,35 @@ def sync_course(
             session.commit()
         topic_id_by_source[t.source_id] = topic.id
 
+    # Resources are matched per course, not per topic: a material the source
+    # moved to another topic is moved here too (keeping its derived data)
+    # instead of being inserted again beside the old row.
+    by_source_id: dict[str, list[Resource]] = {}
+    for row in session.exec(
+        select(Resource).join(Topic).where(Topic.course_id == course.id)
+    ):
+        by_source_id.setdefault(row.source_id, []).append(row)
+    kept: set[Any] = set()
+
     for topic_source_id, topic_id in topic_id_by_source.items():
         for r in adapter.fetch_resources(course_source_id, topic_source_id):
             digest = content_hash(r)
-            existing = session.exec(
-                select(Resource).where(
-                    Resource.topic_id == topic_id, Resource.source_id == r.source_id
-                )
-            ).first()
+            rows = by_source_id.get(r.source_id, [])
+            existing = _pick_copy(session, [x for x in rows if x.id not in kept], topic_id)
+            moved = existing is not None and existing.topic_id != topic_id
+            if moved:
+                # A leftover copy may already sit in the destination topic with
+                # less progress; retire it first so the move doesn't collide
+                # with the (topic_id, source_id) unique constraint.
+                for blocking in [x for x in rows
+                                 if x.topic_id == topic_id and x.id not in kept]:
+                    _retire(session, blocking)
+                    rows.remove(blocking)
+                    stats.resources_removed += 1
+                session.commit()
+                existing.topic_id = topic_id
+            if existing is not None:
+                kept.add(existing.id)
             if existing is None:
                 session.add(
                     Resource(
@@ -291,7 +341,7 @@ def sync_course(
                 session.add(existing)
                 session.commit()
                 stats.resources_updated += 1
-            elif meta_changed:
+            elif meta_changed or moved:
                 for k, v in meta.items():
                     setattr(existing, k, v)
                 session.add(existing)
@@ -299,6 +349,17 @@ def sync_course(
                 stats.resources_updated += 1
             else:
                 stats.resources_skipped += 1
+
+    # Copies of a resource the source still lists, left under other topics by
+    # syncs before resources could move: retire them so each shows up once.
+    for source_id, rows in by_source_id.items():
+        if not any(x.id in kept for x in rows):
+            continue  # not listed this sync; leave it alone
+        for stale in rows:
+            if stale.id not in kept:
+                _retire(session, stale)
+                stats.resources_removed += 1
+    session.commit()
 
     for a in adapter.fetch_assignments(course_source_id):
         topic_id = topic_id_by_source.get(a.topic_source_id) if a.topic_source_id else None
