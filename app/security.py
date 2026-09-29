@@ -21,14 +21,13 @@ MAX_TRACKED_CLIENTS = 10_000  # LRU bound on the hit table
 
 
 def csp_header(nonce: str) -> str:
-    # Scripts and <style> elements need the per-response nonce. Style
-    # *attributes* can't carry a nonce, so style-src-attr allows them: they
-    # can restyle an element but can't run code or load anything.
+    # Scripts and <style> elements need the per-response nonce, and style=""
+    # attributes are blocked: templates style through classes in app.css.
+    # (JS setting element.style is CSSOM, which CSP doesn't restrict.)
     return (
         "default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}'; "
         f"style-src 'self' 'nonce-{nonce}'; "
-        "style-src-attr 'unsafe-inline'; "
         "object-src 'none'; base-uri 'self'; form-action 'self'; "
         "frame-ancestors 'none'"
     )

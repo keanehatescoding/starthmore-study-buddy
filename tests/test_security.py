@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+from pathlib import Path
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -36,6 +37,7 @@ def test_csp_uses_a_fresh_nonce_instead_of_unsafe_inline(testapp):
     nonce = re.search(r"'nonce-([^']+)'", csp["script-src"]).group(1)
     assert "unsafe-inline" not in csp["script-src"]
     assert "unsafe-inline" not in csp["style-src"]
+    assert "style-src-attr" not in csp
     assert f"'nonce-{nonce}'" in csp["style-src"]
     assert f'nonce="{nonce}"' in r.text  # the page's script carries it
     assert nonce not in client.get("/login").headers["Content-Security-Policy"]
@@ -101,3 +103,15 @@ def test_api_401_is_json():
     assert json.loads(r.body) == {"detail": "login required"}
     page = asyncio.run(unauthorized(_request({}, path="/courses"), HTTPException(401)))
     assert page.status_code == 303 and page.headers["location"] == "/login"
+
+
+def test_templates_have_no_inline_style_attributes():
+    # The CSP blocks style="" attributes; they'd silently not apply.
+    templates = Path(__file__).parent.parent / "templates"
+    offenders = [
+        f"{path.name}:{n}"
+        for path in sorted(templates.glob("*.html"))
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if re.search(r"\sstyle=", line)
+    ]
+    assert offenders == []

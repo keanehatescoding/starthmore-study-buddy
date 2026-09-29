@@ -65,7 +65,7 @@ Backups (nightly pg_dump, 14-day retention):
   that sets it.
 - CSP: scripts and `<style>` elements need the per-response nonce
   (`{{ request.state.csp_nonce }}` in templates); no `unsafe-inline`.
-  `style="…"` attributes are still allowed via `style-src-attr`.
+  `style="…"` attributes are blocked — add a class to `static/css/app.css`.
 - CI (`.github/workflows/ci.yml`) runs migrations + `alembic check` + the
   full suite on Postgres 16 for every push/PR.
 - `/health` checks Postgres and returns 503 when unreachable — safe to use

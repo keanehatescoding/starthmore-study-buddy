@@ -12,21 +12,21 @@
 {% block body %}
 <!-- Course Overview Header -->
 <div class="course-header-banner">
-  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+  <div class="page-toolbar">
     <a href="/" class="btn btn-sm btn-outline">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="m15 18-6-6 6-6"/>
       </svg>
       All Courses
     </a>
-    <div style="display: flex; align-items: center; gap: 0.4rem;">
+    <div class="badge-row">
       <span class="badge {{ course.source }}">{{ course.source|capitalize }}</span>
       {% if course.code %}<span class="badge course-code">{{ course.code }}</span>{% endif %}
     </div>
   </div>
 
-  <h1 style="margin-bottom: 0.5rem;">{{ course.name }}</h1>
-  <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 0;">
+  <h1 class="flush-bottom-sm">{{ course.name }}</h1>
+  <p class="course-summary">
     {{ topics|length }} topic modules · Synchronized materials and spaced repetition decks
   </p>
 </div>
@@ -34,7 +34,7 @@
 <!-- Upcoming Assignments (if present) -->
 {% if assignments %}
 <div class="assignments-box">
-  <h3 style="margin-top: 0; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; color: var(--accent);">
+  <h3 class="assignments-title">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <rect width="18" height="18" x="3" y="4" rx="2" ry="2"/>
       <line x1="16" x2="16" y1="2" y2="6"/>
@@ -46,7 +46,7 @@
   <ul class="clean">
     {% for a in assignments %}
     <li class="assignment-item">
-      <span style="font-weight: 600;">{{ a.title }}</span>
+      <span class="text-strong">{{ a.title }}</span>
       {% if a.due_date %}
         <span class="due-pill">due {{ a.due_date.strftime('%Y-%m-%d %H:%M UTC') }}</span>
       {% endif %}
@@ -57,19 +57,19 @@
 {% endif %}
 
 <!-- Topics and Learning Materials -->
-<div style="margin-top: 1.75rem;">
-  <h2 style="font-size: 1.25rem; margin-bottom: 1rem; color: var(--text-main);">Course Modules & Topics</h2>
+<div class="topics-section">
+  <h2 class="topics-heading">Course Modules & Topics</h2>
 
   {% for t in topics %}
   <div class="topic-card">
     <div class="topic-header">
       <h3 class="topic-title">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary);">
+        <svg class="icon-primary" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/>
         </svg>
         {{ t.title }}
       </h3>
-      <span class="badge" style="font-size: 0.72rem;">
+      <span class="badge badge-count">
         {{ resources_by_topic[t.id|string]|length }} resource{% if resources_by_topic[t.id|string]|length != 1 %}s{% endif %}
       </span>
     </div>
@@ -92,7 +92,7 @@
         </div>
       </li>
       {% else %}
-      <li style="padding: 0.5rem 0; color: var(--text-faint);"><small>No resources.</small></li>
+      <li class="resource-empty"><small>No resources.</small></li>
       {% endfor %}
     </ul>
   </div>
