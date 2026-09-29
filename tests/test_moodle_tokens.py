@@ -120,13 +120,27 @@ def test_pipeline_downloads_as_course_owner(testapp, shared_token):
             s.commit()
             resources[owner.email] = r.id
 
+        # an unowned pre-auth course never gets the shared token
+        orphan = Course(source="moodle", source_id="orphan", name="C")
+        s.add(orphan)
+        s.commit()
+        orphan_topic = Topic(course_id=orphan.id, source_id="t", title="T")
+        s.add(orphan_topic)
+        s.commit()
+        orphan_r = Resource(topic_id=orphan_topic.id, source="moodle", source_id="r",
+                            type="file", title="notes", status="pending",
+                            raw_url="https://m.example/f.txt")
+        s.add(orphan_r)
+        s.commit()
+
         downloader_for = moodle_downloader_for(s)
+        assert downloader_for(orphan_r) is None
         alice_dl = downloader_for(s.get(Resource, resources["alice@x.edu"]))
         assert alice_dl.__self__.token == "ALICE"
         assert downloader_for(s.get(Resource, resources["bob@x.edu"])) is None
 
         counts = run_extraction(s, None, downloader_for=lambda r: None).counts
-        assert counts["no_token"] == 2
+        assert counts["no_token"] == 3  # alice, bob, orphan
         assert all(s.get(Resource, rid).status == "pending" for rid in resources.values())
 
 

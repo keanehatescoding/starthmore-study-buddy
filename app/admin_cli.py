@@ -1,8 +1,8 @@
 """Admin chores: python -m app.admin_cli claim-unowned EMAIL
 
 Courses synced before sign-in existed have no owner and are hidden from
-everyone. They are claimed automatically when MOODLE_TOKEN_OWNER signs in
-(or by the first account when no owner is set); this assigns them by hand.
+everyone. They are claimed automatically when MOODLE_TOKEN_OWNER signs in;
+this assigns them by hand.
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ def main() -> None:
         user = find_user(session, args.email)
         if user is None:
             raise SystemExit(f"no such user {args.email} — log in via the web UI first")
-        print(f"assigned {claim_unowned(session, user)} unowned course(s) to {user.email}")
+        claimed, skipped = claim_unowned(session, user)
+        print(f"assigned {claimed} unowned course(s) to {user.email}")
+        if skipped:
+            print(f"skipped {skipped} they already have their own copy of")
 
 
 if __name__ == "__main__":

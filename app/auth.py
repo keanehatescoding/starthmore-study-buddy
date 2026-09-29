@@ -132,29 +132,36 @@ def sign_in(
     session.add(user)
     session.commit()
     session.refresh(user)
-    if _may_claim_unowned(session, user, is_new):
+    if _may_claim_unowned(user):
         claim_unowned(session, user)
         session.refresh(user)
     return user
 
 
-def claim_unowned(session: Session, user: User) -> int:
-    """Give every unowned (pre-auth) course to `user`; returns how many."""
-    courses = session.exec(select(Course).where(Course.user_id.is_(None))).all()
-    for course in courses:
+def claim_unowned(session: Session, user: User) -> tuple[int, int]:
+    """Give unowned (pre-auth) courses to `user`. Returns (claimed, skipped):
+    a course the user already has their own copy of (same source and id) is
+    skipped, since (user_id, source, source_id) is unique."""
+    have = set(session.exec(
+        select(Course.source, Course.source_id).where(Course.user_id == user.id)
+    ).all())
+    claimed = skipped = 0
+    for course in session.exec(select(Course).where(Course.user_id.is_(None))).all():
+        if (course.source, course.source_id) in have:
+            skipped += 1
+            continue
+        have.add((course.source, course.source_id))
         course.user_id = user.id
         session.add(course)
+        claimed += 1
     session.commit()
-    return len(courses)
+    return claimed, skipped
 
 
-def _may_claim_unowned(session: Session, user: User, is_new: bool) -> bool:
+def _may_claim_unowned(user: User) -> bool:
     """Courses with no owner were synced with the shared MOODLE_TOKEN before
-    sign-in existed, so only that token's owner may claim them. Without a
-    configured owner, only the very first account to sign in does."""
-    owner = normalize_email(settings.moodle_token_owner)
-    if owner:
-        return user.email == owner
-    if not is_new:
-        return False
-    return session.exec(select(func.count()).select_from(User)).one() == 1
+    sign-in existed, so only that token's owner may claim them automatically.
+    With no owner configured nobody does; use `app.admin_cli claim-unowned`."""
+    from app.moodle_tokens import is_owner
+
+    return is_owner(user, settings.moodle_token_owner)

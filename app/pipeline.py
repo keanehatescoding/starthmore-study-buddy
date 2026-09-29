@@ -73,7 +73,8 @@ def moodle_downloader_for(session: Session):
 
     Returns a function resource -> downloader, or None when the owner has no
     usable token (their file resources then stay pending until they connect).
-    Legacy courses without an owner use the global MOODLE_TOKEN.
+    Unowned pre-auth courses get none: the shared MOODLE_TOKEN belongs to
+    MOODLE_TOKEN_OWNER alone, who claims them on sign-in.
     """
     from app.moodle import MoodleClient
     from app.moodle_tokens import token_for
@@ -86,7 +87,7 @@ def moodle_downloader_for(session: Session):
         owner_id = course.user_id if course else None
         if owner_id not in cache:
             user = session.get(User, owner_id) if owner_id else None
-            token = token_for(user) if user else settings.moodle_token
+            token = token_for(user) if user else None
             cache[owner_id] = (
                 MoodleClient(settings.moodle_base_url, token).download if token else None
             )
@@ -255,7 +256,8 @@ def main() -> None:
             # every user enrolled in the course has their own copy of it
             course_ids = session.exec(
                 select(Course.id).where(
-                    Course.source == args.source, Course.source_id == args.course
+                    Course.source == args.source, Course.source_id == args.course,
+                    Course.user_id.is_not(None),
                 ).order_by(Course.id)
             ).all()
             if not course_ids:
