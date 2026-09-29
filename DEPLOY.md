@@ -15,8 +15,11 @@
    from `SECRET_KEY` — rotating `SECRET_KEY` means everyone reconnects, and
    the worker and cron services need the same `SECRET_KEY` as web
    (`scripts/railway-sync-cron-env.sh <service>` references it).
-   The global `MOODLE_TOKEN` is only used for `MOODLE_TOKEN_OWNER` (set it to
-   that token's owner, or every user without their own token syncs as them).
+   The global `MOODLE_TOKEN` is only used for `MOODLE_TOKEN_OWNER` (with no
+   owner it is unused), and likewise `GOOGLE_REFRESH_TOKEN` for
+   `GOOGLE_REFRESH_TOKEN_OWNER`. Courses synced before sign-in existed stay
+   hidden until the owner signs in, or `python -m app.admin_cli claim-unowned
+   EMAIL` assigns them.
 5. Sync on a schedule with a Railway cron service, daily. Syncs go through
    the job queue — one job per connected user, then the worker drains them
    and sends notifications:

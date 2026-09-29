@@ -65,9 +65,7 @@ def current_user(
 
 def owned_course(session: Session, user: User, course_id: UUID) -> Course:
     course = session.get(Course, course_id)
-    if course is None or (
-        course.user_id is not None and course.user_id != user.id
-    ):
+    if course is None or course.user_id != user.id:
         raise HTTPException(404, "course not found")
     return course
 
@@ -173,7 +171,7 @@ def course_list(
 ):
     courses = session.exec(
         select(Course)
-        .where((Course.user_id == user.id) | (Course.user_id.is_(None)))
+        .where(Course.user_id == user.id)
         .order_by(Course.name)
     ).all()
     ids = [c.id for c in courses]
@@ -250,9 +248,7 @@ def resource_detail(
     resource = session.get(Resource, resource_id)
     topic = session.get(Topic, resource.topic_id) if resource else None
     course = session.get(Course, topic.course_id) if topic else None
-    if resource is None or course is None or (
-        course.user_id is not None and course.user_id != user.id
-    ):
+    if resource is None or course is None or course.user_id != user.id:
         raise HTTPException(404, "resource not found")
     chunks = session.exec(
         select(Chunk).where(Chunk.resource_id == resource.id).order_by(Chunk.order)

@@ -5,8 +5,7 @@ it is stored Fernet-encrypted (key derived from SECRET_KEY) and never logged.
 Passwords are only ever held in memory for the single login/token.php call.
 
 Resolution (`token_for`): the user's own connected token; otherwise the
-global MOODLE_TOKEN, but only for MOODLE_TOKEN_OWNER (or for everyone when
-that is unset — the single-user setup this app started as).
+global MOODLE_TOKEN, but only for MOODLE_TOKEN_OWNER.
 """
 
 from __future__ import annotations
@@ -66,9 +65,12 @@ def token_for(user) -> str | None:
     own = decrypt_token(getattr(user, "moodle_token", None))
     if own:
         return own
-    if not settings.moodle_token:
-        return None
-    owner = settings.moodle_token_owner.strip().lower()
-    if owner and (user is None or user.email.lower() != owner):
+    if not settings.moodle_token or not is_owner(user, settings.moodle_token_owner):
         return None
     return settings.moodle_token
+
+
+def is_owner(user, owner_email: str) -> bool:
+    """Whether `user` is the configured owner of a shared token (empty = nobody)."""
+    owner = owner_email.strip().lower()
+    return bool(owner) and user is not None and user.email.lower() == owner

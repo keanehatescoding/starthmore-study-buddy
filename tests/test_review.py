@@ -3,6 +3,8 @@
 import re
 from datetime import datetime, timedelta, timezone
 
+from sqlmodel import select
+
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 
 
@@ -10,7 +12,9 @@ def _seed(Session):
     with Session() as s:
         user = User(email="s@x.edu")
         s.add(user)
-        course = Course(source="moodle", source_id="c1", name="C")
+        # owned by the signed-in fixture user (test@x.edu); unowned courses are hidden
+        owner = s.exec(select(User).where(User.email == "test@x.edu")).one()
+        course = Course(user_id=owner.id, source="moodle", source_id="c1", name="C")
         s.add(course)
         s.commit()
         topic = Topic(course_id=course.id, source_id="t1", title="T")

@@ -25,7 +25,7 @@ def setup():
     with Session(engine) as s:
         user = User(email="s@x.edu")
         s.add(user)
-        course = Course(source="moodle", source_id="c1", name="C")
+        course = Course(user_id=user.id, source="moodle", source_id="c1", name="C")
         s.add(course)
         s.commit()
         topic = Topic(course_id=course.id, source_id="t1", title="T")
@@ -138,8 +138,19 @@ def test_due_scoped_to_own_courses(setup):
     assert due_count(s, user.id) == 2
     assert not user_owns_item(s, user.id, theirs.id)
     assert user_owns_item(s, user.id, mcq.id)
-    # the other user sees their own item plus the unclaimed course's
-    assert due_count(s, other.id) == 3
+    # the other user sees only their own item
+    assert due_count(s, other.id) == 1
+
+
+def test_unowned_course_items_hidden_from_everyone(setup):
+    s, user, mcq, _ = setup
+    course = s.get(Course, s.get(Topic, s.get(Resource, s.get(Chunk, mcq.chunk_id)
+                                                          .resource_id).topic_id).course_id)
+    course.user_id = None
+    s.add(course)
+    s.commit()
+    assert due_count(s, user.id) == 0
+    assert not user_owns_item(s, user.id, mcq.id)
 
 
 def test_due_count_ignores_limit(setup):

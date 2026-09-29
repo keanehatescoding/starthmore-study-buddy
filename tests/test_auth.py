@@ -96,6 +96,20 @@ def test_only_token_owner_claims_unowned_courses(monkeypatch):
         assert s.exec(select(Course)).one().user_id == owner.id
 
 
+def test_claim_unowned_assigns_only_orphans():
+    with _memory_session() as s:
+        other = auth_mod.sign_in(s, "other@x.edu")
+        s.add(Course(source="moodle", source_id="o1", name="Orphan 1"))
+        s.add(Course(source="moodle", source_id="o2", name="Orphan 2"))
+        s.add(Course(source="moodle", source_id="m", name="Mine", user_id=other.id))
+        s.commit()
+        target = auth_mod.sign_in(s, "target@x.edu")
+        assert auth_mod.claim_unowned(s, target) == 2
+        owners = {c.source_id: c.user_id for c in s.exec(select(Course)).all()}
+        assert owners == {"o1": target.id, "o2": target.id, "m": other.id}
+        assert auth_mod.claim_unowned(s, target) == 0
+
+
 def test_email_is_case_insensitive():
     with _memory_session() as s:
         a = auth_mod.sign_in(s, " Test@X.edu ")

@@ -3,7 +3,8 @@
 
 Moodle uses the user's own connected token (Settings → Moodle), falling back
 to MOODLE_TOKEN only for MOODLE_TOKEN_OWNER (see app.moodle_tokens). Classroom reuses the Google refresh token
-stored on the user row at login (falls back to GOOGLE_REFRESH_TOKEN in .env).
+stored on the user row at login, falling back to GOOGLE_REFRESH_TOKEN only
+for GOOGLE_REFRESH_TOKEN_OWNER.
 """
 
 from __future__ import annotations
@@ -35,9 +36,9 @@ def build_adapter(source: str, user: User):
     if source == "classroom":
         from app.classroom import ClassroomAdapter, ClassroomClient, build_service
 
-        from app.auth import refresh_token_for
+        from app.auth import classroom_token_for
 
-        refresh = refresh_token_for(user) or settings.google_refresh_token
+        refresh = classroom_token_for(user)
         if not refresh:
             raise NotConnectedError("no classroom refresh token — log in via Google first")
         service = build_service(
@@ -52,9 +53,9 @@ def has_credentials(source: str, user: User) -> bool:
         from app.moodle_tokens import token_for
 
         return token_for(user) is not None
-    from app.auth import refresh_token_for
+    from app.auth import classroom_token_for
 
-    return refresh_token_for(user) is not None
+    return classroom_token_for(user) is not None
 
 
 def main() -> None:

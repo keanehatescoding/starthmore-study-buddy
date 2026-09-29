@@ -137,14 +137,15 @@ def submit_answer(
 
 
 def scoped_items(user_id):
-    """QuizItems in the user's courses (owned or still-unclaimed pre-auth rows)."""
+    """QuizItems in the user's courses. Unclaimed pre-auth rows belong to
+    nobody until their owner signs in or syncs (see auth.sign_in, sync)."""
     return (
         select(QuizItem)
         .join(Chunk, Chunk.id == QuizItem.chunk_id)
         .join(Resource, Resource.id == Chunk.resource_id)
         .join(Topic, Topic.id == Resource.topic_id)
         .join(Course, Course.id == Topic.course_id)
-        .where((Course.user_id == user_id) | (Course.user_id.is_(None)))
+        .where(Course.user_id == user_id)
     )
 
 

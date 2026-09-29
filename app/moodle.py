@@ -19,6 +19,11 @@ class MoodleError(RuntimeError):
     pass
 
 
+class ForeignURLError(MoodleError):
+    """A download URL outside this Moodle's pluginfile endpoints. Never
+    fetched: the token would be sent along with it."""
+
+
 class MoodleClient:
     def __init__(self, base_url: str, token: str, timeout: int = 30):
         if not token:
@@ -65,8 +70,22 @@ class MoodleClient:
         params = {f"courseids[{i}]": c for i, c in enumerate(courseids)}
         return self.call("mod_assign_get_assignments", **params)
 
+    def serves(self, fileurl: str) -> bool:
+        """Whether fileurl is one of this site's pluginfile.php endpoints."""
+        base = urllib.parse.urlsplit(self.base_url)
+        url = urllib.parse.urlsplit(fileurl)
+        prefix = base.path.rstrip("/")
+        return (
+            url.scheme in (base.scheme, "https")
+            and url.netloc.lower() == base.netloc.lower()
+            and url.path.startswith((f"{prefix}/webservice/pluginfile.php/",
+                                     f"{prefix}/pluginfile.php/"))
+        )
+
     def download(self, fileurl: str) -> tuple[bytes, str | None]:
         """Download a fileurl. Returns (bytes, mime_type)."""
+        if not self.serves(fileurl):
+            raise ForeignURLError(f"refusing to send the Moodle token to {fileurl}")
         sep = "&" if "?" in fileurl else "?"
         url = f"{fileurl}{sep}token={urllib.parse.quote(self.token)}"
         req = urllib.request.Request(url)
