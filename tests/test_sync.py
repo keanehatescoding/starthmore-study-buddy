@@ -375,7 +375,7 @@ def test_duplicate_left_by_earlier_move_is_retired(session, user_id):
     assert stats.resources_removed == 1
     session.expire_all()
     kept = _resource(session, "r-page")
-    assert kept.topic_id == t2.id  # the copy already in the right topic wins
+    assert kept.topic_id == t2.id  # the copy with progress wins
     assert [c.title for c in session.exec(select(Chunk)).all()] == ["copy"]
 
 
@@ -386,3 +386,26 @@ def test_resource_missing_from_source_is_left_alone(session, user_id):
     stats = sync_course(session, adapter, "c1", user_id)
     assert stats.resources_removed == 0
     assert len(session.exec(select(Resource)).all()) == 3
+
+
+def test_old_copy_with_progress_wins_over_empty_destination_copy(session, user_id):
+    adapter = FakeAdapter()
+    adapter.topics["c1"].append(TopicData("t2", "Graphs", 1))
+    adapter.resources[("c1", "t2")] = []
+    sync_course(session, adapter, "c1", user_id)
+    old = _resource(session, "r-page")
+    _derive(session, old, user_id, "old")
+    t2 = session.exec(select(Topic).where(Topic.source_id == "t2")).one()
+    session.add(Resource(topic_id=t2.id, source="moodle", source_id="r-page",
+                         type="page_text", title="Overview", extracted_text="A tree is...",
+                         content_hash=old.content_hash, status="extracted"))
+    session.commit()
+    adapter.resources[("c1", "t2")] = [adapter.resources[("c1", "t1")].pop(1)]
+
+    stats = sync_course(session, adapter, "c1", user_id)
+    assert stats.resources_removed == 1
+    session.expire_all()
+    kept = _resource(session, "r-page")
+    assert kept.id == old.id and kept.topic_id == t2.id  # moved into the destination
+    assert [c.title for c in session.exec(select(Chunk)).all()] == ["old"]
+    assert len(session.exec(select(ReviewState)).all()) == 1
