@@ -105,6 +105,20 @@ def test_only_token_owner_claims_unowned_courses(monkeypatch):
         assert s.exec(select(Course)).one().user_id == owner.id
 
 
+def test_token_owner_sign_in_claims_only_moodle_courses(monkeypatch):
+    # the owner's claim comes from the shared Moodle token, so an unowned
+    # Classroom course stays unowned; the CLI can still assign it
+    monkeypatch.setattr(settings, "moodle_token_owner", "owner@x.edu")
+    with _memory_session() as s:
+        s.add(Course(source="moodle", source_id="m1", name="Moodle orphan"))
+        s.add(Course(source="classroom", source_id="g1", name="Classroom orphan"))
+        s.commit()
+        owner = auth_mod.sign_in(s, "owner@x.edu")
+        owners = {c.source: c.user_id for c in s.exec(select(Course)).all()}
+        assert owners == {"moodle": owner.id, "classroom": None}
+        assert auth_mod.claim_unowned(s, owner) == (1, 0)
+
+
 def test_claim_unowned_assigns_only_orphans():
     with _memory_session() as s:
         other = auth_mod.sign_in(s, "other@x.edu")

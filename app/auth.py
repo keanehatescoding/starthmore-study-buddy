@@ -133,20 +133,26 @@ def sign_in(
     session.commit()
     session.refresh(user)
     if _may_claim_unowned(user):
-        claim_unowned(session, user)
+        claim_unowned(session, user, source="moodle")
         session.refresh(user)
     return user
 
 
-def claim_unowned(session: Session, user: User) -> tuple[int, int]:
-    """Give unowned (pre-auth) courses to `user`. Returns (claimed, skipped):
-    a course the user already has their own copy of (same source and id) is
-    skipped, since (user_id, source, source_id) is unique."""
+def claim_unowned(
+    session: Session, user: User, source: str | None = None
+) -> tuple[int, int]:
+    """Give unowned (pre-auth) courses to `user`, optionally only from
+    `source`. Returns (claimed, skipped): a course the user already has their
+    own copy of (same source and id) is skipped, since (user_id, source,
+    source_id) is unique."""
     have = set(session.exec(
         select(Course.source, Course.source_id).where(Course.user_id == user.id)
     ).all())
+    q = select(Course).where(Course.user_id.is_(None))
+    if source is not None:
+        q = q.where(Course.source == source)
     claimed = skipped = 0
-    for course in session.exec(select(Course).where(Course.user_id.is_(None))).all():
+    for course in session.exec(q).all():
         if (course.source, course.source_id) in have:
             skipped += 1
             continue
