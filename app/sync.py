@@ -19,24 +19,16 @@ from typing import Any, Protocol
 
 from sqlmodel import Session, delete, func, select, update
 
+from app.extract import MAX_DOWNLOAD_BYTES, too_large_message, youtube_video_id
 from app.models import (
     Assignment, Chunk, Course, QuizAttempt, QuizItem, Resource, ReviewState, Topic,
 )
 
-YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
-
-
-def is_youtube(url: str) -> bool:
-    try:
-        from urllib.parse import urlparse
-
-        return urlparse(url).hostname in YOUTUBE_HOSTS
-    except Exception:
-        return False
-
 
 def link_type(url: str) -> str:
-    return "video" if is_youtube(url) else "link"
+    """"video" only for a URL we can pull a transcript for; a channel or
+    playlist on YouTube is a plain link."""
+    return "video" if youtube_video_id(url) else "link"
 
 
 # -- normalized payloads -------------------------------------------------------
@@ -69,6 +61,7 @@ class ResourceData:
     # Change marker from source metadata (e.g. url|size|mtime) used instead of
     # content, so sync never has to download files. Takes precedence when set.
     fingerprint: str | None = None
+    size: int | None = None  # bytes, when the source reports it (files)
 
 
 @dataclass
@@ -119,9 +112,13 @@ class SyncStats:
     resources_removed: int = 0
     assignments_new: int = 0
     assignments_updated: int = 0
+    error: str | None = None  # set by sync_all when this course failed
 
-    def as_dict(self) -> dict[str, int]:
-        return {f: getattr(self, f) for f in self.__dataclass_fields__}
+    def as_dict(self) -> dict[str, Any]:
+        out = {f: getattr(self, f) for f in self.__dataclass_fields__}
+        if out["error"] is None:
+            del out["error"]
+        return out
 
 
 def _upsert_course(
@@ -229,6 +226,14 @@ def _legacy_hash_matches(adapter, data: ResourceData, legacy: str) -> bool | Non
     return hashlib.sha256(blob).hexdigest() == legacy
 
 
+def _fresh_state(r: ResourceData) -> dict[str, Any]:
+    """Status/error for new or changed content. A file the source says is
+    over the download cap is skipped here, so extraction never fetches it."""
+    if r.size is not None and r.size > MAX_DOWNLOAD_BYTES:
+        return {"status": "skipped", "error": too_large_message()}
+    return {"status": "extracted" if r.text else "pending", "error": None}
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     # SQLite drops tzinfo on read; compare everything as aware UTC.
     if value is None or value.tzinfo is not None:
@@ -306,8 +311,7 @@ def sync_course(
                         topic_id=topic_id, source=source, source_id=r.source_id,
                         type=r.type, title=r.title, raw_url=r.raw_url,
                         extracted_text=r.text, content_hash=digest,
-                        status="extracted" if r.text else "pending",
-                        mime_type=r.mime_type,
+                        mime_type=r.mime_type, **_fresh_state(r),
                     )
                 )
                 session.commit()
@@ -340,8 +344,8 @@ def sync_course(
                     setattr(existing, k, v)
                 existing.content_hash = digest
                 existing.extracted_text = r.text
-                existing.status = "extracted" if r.text else "pending"
-                existing.error = None
+                for k, v in _fresh_state(r).items():
+                    setattr(existing, k, v)
                 existing.attempts = 0  # new content: no backoff carried over
                 existing.retry_after = None
                 session.add(existing)
@@ -350,6 +354,14 @@ def sync_course(
             elif meta_changed or moved:
                 for k, v in meta.items():
                     setattr(existing, k, v)
+                session.add(existing)
+                session.commit()
+                stats.resources_updated += 1
+            elif (r.text is not None and existing.extracted_text is not None
+                  and existing.extracted_text != r.text):
+                # Same source content, better text from it (e.g. page HTML now
+                # converted to text): refresh the text, keep derived data.
+                existing.extracted_text = r.text
                 session.add(existing)
                 session.commit()
                 stats.resources_updated += 1
@@ -399,5 +411,17 @@ def sync_course(
 
 
 def sync_all(session: Session, adapter: SourceAdapter, user_id) -> dict[str, SyncStats]:
-    return {c.source_id: sync_course(session, adapter, c.source_id, user_id, c)
-            for c in adapter.fetch_courses()}
+    """Sync every course. One course failing (source error, revoked access,
+    bad data) is recorded in its SyncStats.error; the rest still sync."""
+    results: dict[str, SyncStats] = {}
+    for c in adapter.fetch_courses():
+        try:
+            results[c.source_id] = sync_course(session, adapter, c.source_id, user_id, c)
+        except Exception as e:
+            session.rollback()
+            results[c.source_id] = SyncStats(error=f"{type(e).__name__}: {e}"[:500])
+    return results
+
+
+def failed_courses(results: dict[str, SyncStats]) -> list[str]:
+    return [cid for cid, stats in results.items() if stats.error]

@@ -465,3 +465,141 @@ def test_page_first_seen_during_outage_is_filled_in_later(session, user_id):
     page = _resource(session, "11")
     assert (page.extracted_text, page.status) == ("page 11", "extracted")
     assert page.content_hash is not None
+
+
+# -- issue #28: isolation, size caps, page HTML, YouTube forms ------------------
+
+
+class _BrokenCourse(FakeAdapter):
+    """c1 fails mid-sync (e.g. MoodleError / HttpError); c2 is fine."""
+
+    def __init__(self):
+        super().__init__()
+        self.courses.append(CourseData("c2", "CS 302"))
+        self.topics["c2"] = [TopicData("t2", "Graphs", 0)]
+        self.resources[("c2", "t2")] = [
+            ResourceData("t2", "g", "page_text", "Graphs", text="A graph is...")]
+        self.assignments["c2"] = []
+
+    def fetch_topics(self, cid):
+        if cid == "c1":
+            from app.moodle import MoodleError
+
+            raise MoodleError("core_course_get_contents: accessexception")
+        return super().fetch_topics(cid)
+
+
+def test_one_failing_course_does_not_abort_the_rest(session, user_id):
+    results = sync_all(session, _BrokenCourse(), user_id)
+    assert results["c1"].error == (
+        "MoodleError: core_course_get_contents: accessexception")
+    assert results["c1"].as_dict()["error"] == results["c1"].error
+    assert results["c2"].error is None and "error" not in results["c2"].as_dict()
+    assert results["c2"].resources_new == 1
+    assert _resource(session, "g").extracted_text == "A graph is..."
+
+
+def _sync_job(session, monkeypatch, adapter):
+    import app.sync_cli as sync_cli
+    from app.jobs import run_sync_job
+
+    monkeypatch.setattr(sync_cli, "build_adapter", lambda source, user: adapter)
+    return run_sync_job(session, {"source": "moodle", "course_id": None,
+                                  "user_email": "s@x.edu"})
+
+
+def test_sync_job_completes_with_per_course_errors(session, user_id, monkeypatch):
+    result = _sync_job(session, monkeypatch, _BrokenCourse())
+    assert "accessexception" in result["c1"]["error"]
+    assert result["c2"]["resources_new"] == 1
+
+
+def test_sync_job_fails_when_every_course_fails(session, user_id, monkeypatch):
+    adapter = _BrokenCourse()
+    adapter.courses = adapter.courses[:1]
+    with pytest.raises(RuntimeError, match="every course failed"):
+        _sync_job(session, monkeypatch, adapter)
+
+
+def test_all_users_sync_continues_past_a_failing_user(session, monkeypatch, capsys):
+    import app.sync_cli as sync_cli
+
+    for email in ("a@x.edu", "b@x.edu", "c@x.edu"):
+        session.add(User(email=email))
+    session.commit()
+    engine = session.get_bind()
+    synced = []
+
+    def fake_inline(s, source, user, course):
+        if user.email == "b@x.edu":
+            raise RuntimeError("invalid_grant")
+        synced.append(user.email)
+
+    monkeypatch.setattr(sync_cli, "engine", engine)
+    monkeypatch.setattr(sync_cli, "has_credentials", lambda source, u: True)
+    monkeypatch.setattr(sync_cli, "_sync_inline", fake_inline)
+    monkeypatch.setattr("sys.argv", ["sync_cli", "--source", "moodle", "--all-users"])
+    with pytest.raises(SystemExit, match="1 of 3 users"):
+        sync_cli.main()
+    assert synced == ["a@x.edu", "c@x.edu"]
+    assert "b@x.edu: sync failed: RuntimeError: invalid_grant" in capsys.readouterr().err
+
+
+def test_oversized_file_is_skipped_without_download(session, user_id):
+    from app.extract import MAX_DOWNLOAD_BYTES
+
+    adapter = FakeAdapter()
+    big = ResourceData("t1", "big", "file", "lecture.mp4", raw_url="https://x/big",
+                       fingerprint="big|1", size=MAX_DOWNLOAD_BYTES + 1)
+    adapter.resources[("c1", "t1")].append(big)
+    sync_course(session, adapter, "c1", user_id)
+    row = _resource(session, "big")
+    assert row.status == "skipped" and "over 50 MB" in row.error
+    # re-uploaded smaller: queued for extraction again
+    big.fingerprint, big.size = "big|2", 1000
+    sync_course(session, adapter, "c1", user_id)
+    row = _resource(session, "big")
+    assert (row.status, row.error) == ("pending", None)
+
+
+def test_moodle_page_html_is_stored_as_text(session, user_id):
+    from app.moodle import MoodleAdapter
+
+    client = FakeMoodleClient()
+    client.call = lambda f, **p: {"pages": [
+        {"coursemodule": 11, "content": "<p>Trees &amp; <b>graphs</b></p>"}]}
+    sync_all(session, MoodleAdapter(client), user_id)
+    assert _resource(session, "11").extracted_text == "Trees & graphs"
+
+
+def test_page_stored_as_raw_html_gets_text_and_keeps_progress(session, user_id):
+    """Rows synced before HTML conversion: same hash, so no reset."""
+    from app.moodle import MoodleAdapter
+
+    html = "<p>Trees &amp; <b>graphs</b></p>"
+    client = FakeMoodleClient()
+    client.call = lambda f, **p: {"pages": [{"coursemodule": 11, "content": html}]}
+    sync_all(session, MoodleAdapter(client), user_id)
+    page = _resource(session, "11")
+    page.extracted_text = html  # as the old code stored it
+    page.status = "chunked"
+    session.add(page)
+    session.commit()
+    _derive(session, page, user_id, "page")
+    stats = sync_all(session, MoodleAdapter(client), user_id)["5"]
+    page = _resource(session, "11")
+    assert (page.extracted_text, page.status) == ("Trees & graphs", "chunked")
+    assert _progress(session) == (1, 1, 1)
+    assert stats.resources_updated == 1
+
+
+@pytest.mark.parametrize("url, kind", [
+    ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "video"),
+    ("https://www.youtube.com/embed/dQw4w9WgXcQ", "video"),
+    ("https://youtube.com/live/dQw4w9WgXcQ", "video"),
+    ("https://www.youtube.com/@lecturer", "link"),
+    ("https://www.youtube.com/playlist?list=PL1", "link"),
+    ("https://evil.example/youtu.be/dQw4w9WgXcQ", "link"),
+])
+def test_link_type_youtube_forms(url, kind):
+    assert link_type(url) == kind

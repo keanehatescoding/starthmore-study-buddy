@@ -14,6 +14,8 @@ import json
 import urllib.parse
 import urllib.request
 
+from app.extract import MAX_DOWNLOAD_BYTES, ExtractError, html_to_text, too_large_message
+
 
 class MoodleError(RuntimeError):
     pass
@@ -83,7 +85,10 @@ class MoodleClient:
         )
 
     def download(self, fileurl: str) -> tuple[bytes, str | None]:
-        """Download a fileurl. Returns (bytes, mime_type)."""
+        """Download a fileurl. Returns (bytes, mime_type).
+
+        Over MAX_DOWNLOAD_BYTES raises ExtractError (permanent): refused on
+        Content-Length when sent, else once the streamed body passes the cap."""
         if not self.serves(fileurl):
             raise ForeignURLError(f"refusing to send the Moodle token to {fileurl}")
         sep = "&" if "?" in fileurl else "?"
@@ -91,8 +96,19 @@ class MoodleClient:
         req = urllib.request.Request(url)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                blob = resp.read()
                 mime = resp.headers.get_content_type()
+                length = resp.headers.get("Content-Length", "")
+                if length.isdigit() and int(length) > MAX_DOWNLOAD_BYTES:
+                    raise ExtractError(too_large_message())
+                parts, size = [], 0
+                while chunk := resp.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_DOWNLOAD_BYTES:
+                        raise ExtractError(too_large_message())
+                    parts.append(chunk)
+                blob = b"".join(parts)
+        except ExtractError:
+            raise
         except Exception as e:
             raise MoodleError(f"download failed for {fileurl}: {e}") from e
         if mime == "text/html" and blob.lstrip()[:1] == b"<":
@@ -111,6 +127,19 @@ from app.sync import (  # noqa: E402
     TopicData,
     link_type,
 )
+
+
+def _file_data(topic_source_id: str, source_id: str, title: str, c: dict) -> ResourceData:
+    return ResourceData(
+        topic_source_id=topic_source_id,
+        source_id=source_id,
+        type="file",
+        title=title,
+        raw_url=c["fileurl"],
+        mime_type=c.get("mimetype"),
+        fingerprint=_file_fingerprint(c),
+        size=c.get("filesize"),
+    )
 
 
 def _file_fingerprint(c: dict) -> str:
@@ -209,17 +238,11 @@ class MoodleAdapter:
                 for c in mod.get("contents", []):
                     if c.get("type") != "file":
                         continue
-                    out.append(
-                        ResourceData(
-                            topic_source_id=topic_source_id,
-                            source_id=f"{mod['id']}:{c.get('filepath', '/')}{c['filename']}",
-                            type="file",
-                            title=c["filename"],
-                            raw_url=c["fileurl"],
-                            mime_type=c.get("mimetype"),
-                            fingerprint=_file_fingerprint(c),
-                        )
-                    )
+                    out.append(_file_data(
+                        topic_source_id,
+                        f"{mod['id']}:{c.get('filepath', '/')}{c['filename']}",
+                        c["filename"], c,
+                    ))
             elif modname == "url":
                 contents = mod.get("contents", [])
                 target = contents[0]["fileurl"] if contents else None
@@ -236,7 +259,7 @@ class MoodleAdapter:
                     )
                 )
             elif modname == "page":
-                text = self._page_text(course_source_id, mod["id"])
+                html = self._page_text(course_source_id, mod["id"])
                 out.append(
                     ResourceData(
                         topic_source_id=topic_source_id,
@@ -244,9 +267,12 @@ class MoodleAdapter:
                         type="page_text",
                         title=mod.get("name", "Page"),
                         raw_url=(mod.get("url")),
-                        # no text -> no hash: sync keeps what it has instead of
-                        # treating an outage as an edit that purges progress
-                        text=text,
+                        # Hash the raw HTML (as before this was converted), store
+                        # the text. No HTML -> no hash: sync keeps what it has
+                        # instead of treating an outage as an edit that purges
+                        # progress.
+                        content_bytes=None if html is None else html.encode("utf-8"),
+                        text=None if html is None else html_to_text(html),
                     )
                 )
             elif modname == "resource":
@@ -255,30 +281,17 @@ class MoodleAdapter:
                     continue
                 if len(files) == 1:
                     c = files[0]
-                    out.append(
-                        ResourceData(
-                            topic_source_id=topic_source_id,
-                            source_id=str(mod["id"]),
-                            type="file",
-                            title=mod.get("name") or c["filename"],
-                            raw_url=c["fileurl"],
-                            mime_type=c.get("mimetype"),
-                            fingerprint=_file_fingerprint(c),
-                        )
-                    )
+                    out.append(_file_data(
+                        topic_source_id, str(mod["id"]),
+                        mod.get("name") or c["filename"], c,
+                    ))
                 else:  # same per-file treatment as folders
                     for c in files:
-                        out.append(
-                            ResourceData(
-                                topic_source_id=topic_source_id,
-                                source_id=f"{mod['id']}:{c.get('filepath', '/')}{c['filename']}",
-                                type="file",
-                                title=c["filename"],
-                                raw_url=c["fileurl"],
-                                mime_type=c.get("mimetype"),
-                                fingerprint=_file_fingerprint(c),
-                            )
-                        )
+                        out.append(_file_data(
+                            topic_source_id,
+                            f"{mod['id']}:{c.get('filepath', '/')}{c['filename']}",
+                            c["filename"], c,
+                        ))
             # else: unknown modname — skip silently in v1 (visible via counts)
         return out
 

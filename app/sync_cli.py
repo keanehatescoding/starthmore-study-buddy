@@ -10,6 +10,7 @@ for GOOGLE_REFRESH_TOKEN_OWNER.
 from __future__ import annotations
 
 import argparse
+import sys
 
 from sqlmodel import Session, select
 
@@ -76,6 +77,7 @@ def main() -> None:
                      if has_credentials(args.source, u)]
             if not users:
                 print(f"no users have connected {args.source}")
+            failed = 0
             for u in users:
                 if args.enqueue:
                     from app.jobs import enqueue
@@ -86,8 +88,16 @@ def main() -> None:
                         "user_email": u.email,
                     })
                     print(f"enqueued {job.id} for {u.email}")
-                else:
+                    continue
+                try:  # one user's revoked token or outage mustn't stop the rest
                     _sync_inline(session, args.source, u, args.course)
+                except Exception as e:
+                    session.rollback()
+                    failed += 1
+                    print(f"{u.email}: sync failed: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+            if failed:
+                raise SystemExit(f"sync failed for {failed} of {len(users)} users")
             return
 
         from app.auth import find_user
@@ -106,22 +116,26 @@ def main() -> None:
             print(f"enqueued {job.id} (run `python -m app.worker` to drain)")
             return
 
-        _sync_inline(session, args.source, user, args.course)
+        try:
+            _sync_inline(session, args.source, user, args.course)
+        except NotConnectedError as e:
+            raise SystemExit(str(e)) from None
 
 
 def _sync_inline(session, source: str, user: User, course: str | None) -> None:
-    from app.sync import sync_all, sync_course
+    from app.sync import failed_courses, sync_all, sync_course
 
-    try:
-        adapter = build_adapter(source, user)
-    except NotConnectedError as e:
-        raise SystemExit(str(e)) from None
+    adapter = build_adapter(source, user)
     if course:
         stats = sync_course(session, adapter, course, user.id)
         print(user.email, course, stats.as_dict())
-    else:
-        for course_id, stats in sync_all(session, adapter, user.id).items():
-            print(user.email, course_id, stats.as_dict())
+        return
+    results = sync_all(session, adapter, user.id)
+    for course_id, stats in results.items():
+        print(user.email, course_id, stats.as_dict())
+    failed = failed_courses(results)
+    if results and len(failed) == len(results):
+        raise RuntimeError(f"every course failed, e.g. {results[failed[0]].error}")
 
 
 if __name__ == "__main__":

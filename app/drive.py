@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import re
 
-from app.extract import ExtractError
+from app.extract import MAX_DOWNLOAD_BYTES, ExtractError
 
 SCOPE = "https://www.googleapis.com/auth/drive.readonly"
-MAX_BYTES = 50 * 1024 * 1024
+MAX_BYTES = MAX_DOWNLOAD_BYTES
 
 # Google-native types -> export mime the extractor reads
 EXPORTS = {
