@@ -6,7 +6,8 @@ from app.models import Course, Resource, Topic
 def test_browser_flow(testapp):
     client, Session = testapp["client"], testapp["Session"]
     with Session() as s:
-        course = Course(source="moodle", source_id="c1", name="CS 301", code="CS 301")
+        course = Course(user_id=testapp["user_id"], source="moodle", source_id="c1",
+                        name="CS 301", code="CS 301")
         s.add(course)
         s.commit()
         s.refresh(course)
@@ -34,3 +35,15 @@ def test_browser_flow(testapp):
 
     assert client.get("/courses/00000000-0000-0000-0000-000000000000").status_code == 404
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_unowned_course_hidden(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    with Session() as s:
+        course = Course(source="moodle", source_id="c9", name="Pre-auth course")
+        s.add(course)
+        s.commit()
+        course_id = course.id
+    home = client.get("/")
+    assert home.status_code == 200 and "Pre-auth course" not in home.text
+    assert client.get(f"/courses/{course_id}").status_code == 404

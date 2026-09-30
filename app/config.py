@@ -1,4 +1,5 @@
 import os
+import warnings
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,10 +13,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://studybuddy:studybuddy@localhost:5432/studybuddy"
     moodle_base_url: str = "https://elearning.strathmore.edu"
     moodle_token: str = ""
-    moodle_token_owner: str = ""  # email allowed to use MOODLE_TOKEN; empty = anyone
+    moodle_token_owner: str = ""  # the only email allowed to use MOODLE_TOKEN
     google_client_id: str = ""
     google_client_secret: str = ""
     google_refresh_token: str = ""
+    google_refresh_token_owner: str = ""  # the only email allowed to use GOOGLE_REFRESH_TOKEN
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_chunk_model: str = "gemini-3.6-flash"
@@ -40,6 +42,18 @@ class Settings(BaseSettings):
         )
         if in_prod and self.secret_key in ("", INSECURE_SECRET_KEY):
             raise ValueError("SECRET_KEY must be set to a random value in production")
+        return self
+
+    @model_validator(mode="after")
+    def _warn_unowned_shared_tokens(self):
+        # A shared token acts as one real account, so it is only ever used for
+        # its named owner; with no owner it is unused (it used to go to everyone).
+        for token, owner in (("MOODLE_TOKEN", "MOODLE_TOKEN_OWNER"),
+                             ("GOOGLE_REFRESH_TOKEN", "GOOGLE_REFRESH_TOKEN_OWNER")):
+            if getattr(self, token.lower()) and not getattr(self, owner.lower()).strip():
+                warnings.warn(f"{token} is set but {owner} is empty, so no user will "
+                              f"get it; set {owner} to the account it belongs to",
+                              stacklevel=2)
         return self
 
 

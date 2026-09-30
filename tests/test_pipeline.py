@@ -252,6 +252,35 @@ def test_run_extraction_counts(session):
     assert counts == {"extracted": 1, "skipped": 1, "failed": 0}
 
 
+def test_run_extraction_only_touches_its_source(session):
+    # a Moodle downloader appends the Moodle token: it must never see Drive URLs
+    _resource(session, source_id="m", raw_url="https://m.example/notes.txt")
+    _resource(session, source_id="g", source="classroom",
+              raw_url="https://drive.google.com/file/d/x/view")
+    seen = []
+
+    def downloader(url):
+        seen.append(url)
+        return b"notes", "text/plain"
+
+    counts = run_extraction(session, downloader, source="moodle").counts
+    assert counts["extracted"] == 1
+    assert seen == ["https://m.example/notes.txt"]
+    by_id = {r.source_id: r for r in session.exec(select(Resource)).all()}
+    assert by_id["g"].status == "pending"
+
+
+def test_run_extraction_fails_foreign_urls(session):
+    from app.moodle import MoodleClient
+
+    _resource(session, source_id="g", raw_url="https://drive.google.com/file/d/x/view")
+    client = MoodleClient("https://m.example", "TOKEN")
+    counts = run_extraction(session, client.download).counts
+    assert counts["failed"] == 1
+    r = session.exec(select(Resource)).one()
+    assert r.status == "failed" and "refusing" in r.error and "TOKEN" not in r.error
+
+
 def test_run_extraction_survives_download_errors(session):
     _resource(session, source_id="down", raw_url="https://m.example/down.txt")
     _resource(session, source_id="bad", raw_url="https://m.example/bad.bin")

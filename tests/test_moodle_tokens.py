@@ -70,10 +70,11 @@ def test_shared_token_only_for_owner(shared_token):
     assert token_for(User(email="someone@x.edu")) is None
 
 
-def test_shared_token_for_anyone_when_owner_unset(monkeypatch):
+def test_shared_token_for_nobody_when_owner_unset(monkeypatch):
     monkeypatch.setattr(settings, "moodle_token", "GLOBAL")
     monkeypatch.setattr(settings, "moodle_token_owner", "")
-    assert token_for(User(email="someone@x.edu")) == "GLOBAL"
+    assert token_for(User(email="someone@x.edu")) is None
+    assert token_for(None) is None
 
 
 def test_build_adapter_uses_users_token(shared_token):
@@ -119,13 +120,27 @@ def test_pipeline_downloads_as_course_owner(testapp, shared_token):
             s.commit()
             resources[owner.email] = r.id
 
+        # an unowned pre-auth course never gets the shared token
+        orphan = Course(source="moodle", source_id="orphan", name="C")
+        s.add(orphan)
+        s.commit()
+        orphan_topic = Topic(course_id=orphan.id, source_id="t", title="T")
+        s.add(orphan_topic)
+        s.commit()
+        orphan_r = Resource(topic_id=orphan_topic.id, source="moodle", source_id="r",
+                            type="file", title="notes", status="pending",
+                            raw_url="https://m.example/f.txt")
+        s.add(orphan_r)
+        s.commit()
+
         downloader_for = moodle_downloader_for(s)
+        assert downloader_for(orphan_r) is None
         alice_dl = downloader_for(s.get(Resource, resources["alice@x.edu"]))
         assert alice_dl.__self__.token == "ALICE"
         assert downloader_for(s.get(Resource, resources["bob@x.edu"])) is None
 
         counts = run_extraction(s, None, downloader_for=lambda r: None).counts
-        assert counts["no_token"] == 2
+        assert counts["no_token"] == 3  # alice, bob, orphan
         assert all(s.get(Resource, rid).status == "pending" for rid in resources.values())
 
 
@@ -194,3 +209,49 @@ def test_disconnect_clears_token(testapp):
 def test_settings_posts_require_csrf(testapp, path):
     resp = testapp["client"].post(path, data={"token": "x", "username": "u", "password": "p"})
     assert resp.status_code == 403
+
+
+def test_download_only_to_own_pluginfile(monkeypatch):
+    from app.moodle import ForeignURLError, MoodleClient
+
+    client = MoodleClient("https://m.example/moodle", "TOKEN")
+    assert client.serves("https://m.example/moodle/webservice/pluginfile.php/1/a.pdf")
+    assert client.serves("https://M.example/moodle/pluginfile.php/1/a.pdf")
+    for url in ("https://drive.google.com/file/d/x/view",
+                "https://m.example.evil.com/moodle/pluginfile.php/1/a.pdf",
+                "http://m.example/moodle/pluginfile.php/1/a.pdf",
+                "https://m.example/other/pluginfile.php/1/a.pdf",
+                "https://m.example/moodle/login/index.php"):
+        assert not client.serves(url), url
+
+    def no_network(*a, **kw):
+        raise AssertionError("must not fetch")
+
+    monkeypatch.setattr(moodle_tokens.urllib.request, "urlopen", no_network)
+    with pytest.raises(ForeignURLError) as exc:
+        client.download("https://drive.google.com/file/d/x/view")
+    assert "TOKEN" not in str(exc.value)
+
+
+def test_classroom_shared_token_only_for_owner(monkeypatch):
+    from app.auth import classroom_token_for
+    from app.crypto import seal
+    from app.sync_cli import has_credentials
+
+    monkeypatch.setattr(settings, "google_refresh_token", "SHARED")
+    monkeypatch.setattr(settings, "google_refresh_token_owner", "")
+    assert classroom_token_for(User(email="a@x.edu")) is None
+    monkeypatch.setattr(settings, "google_refresh_token_owner", "Owner@x.edu")
+    assert classroom_token_for(User(email="owner@x.edu")) == "SHARED"
+    assert classroom_token_for(User(email="a@x.edu")) is None
+    assert not has_credentials("classroom", User(email="a@x.edu"))
+    assert has_credentials("classroom", User(email="owner@x.edu"))
+    own = User(email="a@x.edu", google_refresh_token=seal("google-refresh-token", "MINE"))
+    assert classroom_token_for(own) == "MINE"
+
+
+def test_unowned_shared_token_warns():
+    from app.config import Settings
+
+    with pytest.warns(UserWarning, match="MOODLE_TOKEN_OWNER"):
+        Settings(_env_file=None, moodle_token="T", moodle_token_owner="")

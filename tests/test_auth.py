@@ -51,7 +51,7 @@ def _memory_session():
 
 
 def test_sign_in_upserts_and_claims(monkeypatch):
-    monkeypatch.setattr(settings, "moodle_token_owner", "")
+    monkeypatch.setattr(settings, "moodle_token_owner", "new@x.edu")
     with _memory_session() as s:
         s.add(Course(source="moodle", source_id="c9", name="Orphan"))
         s.commit()
@@ -71,6 +71,15 @@ def test_refresh_token_encrypted_at_rest():
         assert "rt-secret" not in user.google_refresh_token
         # plaintext left over from before encryption is not trusted
         assert auth_mod.refresh_token_for(User(email="b@x.edu", google_refresh_token="rt")) is None
+
+
+def test_first_account_does_not_claim_without_owner(monkeypatch):
+    monkeypatch.setattr(settings, "moodle_token_owner", "")
+    with _memory_session() as s:
+        s.add(Course(source="moodle", source_id="c9", name="Orphan"))
+        s.commit()
+        auth_mod.sign_in(s, "first@x.edu")
+        assert s.exec(select(Course)).one().user_id is None
 
 
 def test_second_user_does_not_steal_unowned_courses(monkeypatch):
@@ -94,6 +103,49 @@ def test_only_token_owner_claims_unowned_courses(monkeypatch):
         assert s.exec(select(Course)).one().user_id is None
         owner = auth_mod.sign_in(s, "owner@x.edu")
         assert s.exec(select(Course)).one().user_id == owner.id
+
+
+def test_token_owner_sign_in_claims_only_moodle_courses(monkeypatch):
+    # the owner's claim comes from the shared Moodle token, so an unowned
+    # Classroom course stays unowned; the CLI can still assign it
+    monkeypatch.setattr(settings, "moodle_token_owner", "owner@x.edu")
+    with _memory_session() as s:
+        s.add(Course(source="moodle", source_id="m1", name="Moodle orphan"))
+        s.add(Course(source="classroom", source_id="g1", name="Classroom orphan"))
+        s.commit()
+        owner = auth_mod.sign_in(s, "owner@x.edu")
+        owners = {c.source: c.user_id for c in s.exec(select(Course)).all()}
+        assert owners == {"moodle": owner.id, "classroom": None}
+        assert auth_mod.claim_unowned(s, owner) == (1, 0)
+
+
+def test_claim_unowned_assigns_only_orphans():
+    with _memory_session() as s:
+        other = auth_mod.sign_in(s, "other@x.edu")
+        s.add(Course(source="moodle", source_id="o1", name="Orphan 1"))
+        s.add(Course(source="moodle", source_id="o2", name="Orphan 2"))
+        s.add(Course(source="moodle", source_id="m", name="Mine", user_id=other.id))
+        s.commit()
+        target = auth_mod.sign_in(s, "target@x.edu")
+        assert auth_mod.claim_unowned(s, target) == (2, 0)
+        owners = {c.source_id: c.user_id for c in s.exec(select(Course)).all()}
+        assert owners == {"o1": target.id, "o2": target.id, "m": other.id}
+        assert auth_mod.claim_unowned(s, target) == (0, 0)
+
+
+def test_claim_unowned_skips_courses_user_already_has():
+    # (user_id, source, source_id) is unique: claiming a duplicate would fail
+    # the whole commit, so it is skipped and the rest are still claimed
+    with _memory_session() as s:
+        target = auth_mod.sign_in(s, "target@x.edu")
+        s.add(Course(source="moodle", source_id="dup", name="Mine", user_id=target.id))
+        s.add(Course(source="moodle", source_id="dup", name="Old copy"))
+        s.add(Course(source="moodle", source_id="new", name="Orphan"))
+        s.commit()
+        assert auth_mod.claim_unowned(s, target) == (1, 1)
+        rows = {(c.source_id, c.name): c.user_id for c in s.exec(select(Course)).all()}
+        assert rows == {("dup", "Mine"): target.id, ("dup", "Old copy"): None,
+                        ("new", "Orphan"): target.id}
 
 
 def test_email_is_case_insensitive():

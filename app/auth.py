@@ -94,6 +94,19 @@ def refresh_token_for(user: User | None) -> str | None:
     return unseal(_REFRESH_PURPOSE, getattr(user, "google_refresh_token", None))
 
 
+def classroom_token_for(user: User | None) -> str | None:
+    """The refresh token to act as `user` in Classroom: their own, else the
+    shared GOOGLE_REFRESH_TOKEN, but only for GOOGLE_REFRESH_TOKEN_OWNER."""
+    from app.moodle_tokens import is_owner
+
+    own = refresh_token_for(user)
+    if own:
+        return own
+    if settings.google_refresh_token and is_owner(user, settings.google_refresh_token_owner):
+        return settings.google_refresh_token
+    return None
+
+
 def find_user(session: Session, email: str) -> User | None:
     """Case-insensitive, so rows stored before normalization still match
     (an exact, already-normalized row wins)."""
@@ -119,22 +132,42 @@ def sign_in(
     session.add(user)
     session.commit()
     session.refresh(user)
-    if _may_claim_unowned(session, user, is_new):
-        for course in session.exec(select(Course).where(Course.user_id.is_(None))).all():
-            course.user_id = user.id
-            session.add(course)
-        session.commit()
+    if _may_claim_unowned(user):
+        claim_unowned(session, user, source="moodle")
         session.refresh(user)
     return user
 
 
-def _may_claim_unowned(session: Session, user: User, is_new: bool) -> bool:
+def claim_unowned(
+    session: Session, user: User, source: str | None = None
+) -> tuple[int, int]:
+    """Give unowned (pre-auth) courses to `user`, optionally only from
+    `source`. Returns (claimed, skipped): a course the user already has their
+    own copy of (same source and id) is skipped, since (user_id, source,
+    source_id) is unique."""
+    have = set(session.exec(
+        select(Course.source, Course.source_id).where(Course.user_id == user.id)
+    ).all())
+    q = select(Course).where(Course.user_id.is_(None))
+    if source is not None:
+        q = q.where(Course.source == source)
+    claimed = skipped = 0
+    for course in session.exec(q).all():
+        if (course.source, course.source_id) in have:
+            skipped += 1
+            continue
+        have.add((course.source, course.source_id))
+        course.user_id = user.id
+        session.add(course)
+        claimed += 1
+    session.commit()
+    return claimed, skipped
+
+
+def _may_claim_unowned(user: User) -> bool:
     """Courses with no owner were synced with the shared MOODLE_TOKEN before
-    sign-in existed, so only that token's owner may claim them. Without a
-    configured owner, only the very first account to sign in does."""
-    owner = normalize_email(settings.moodle_token_owner)
-    if owner:
-        return user.email == owner
-    if not is_new:
-        return False
-    return session.exec(select(func.count()).select_from(User)).one() == 1
+    sign-in existed, so only that token's owner may claim them automatically.
+    With no owner configured nobody does; use `app.admin_cli claim-unowned`."""
+    from app.moodle_tokens import is_owner
+
+    return is_owner(user, settings.moodle_token_owner)

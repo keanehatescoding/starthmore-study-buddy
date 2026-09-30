@@ -20,7 +20,7 @@ from app.db import engine
 from app.extract import ExtractError, SkipResource, extract_resource_text
 from app.llm import QuotaExhaustedError
 from app.models import Chunk, Course, Resource, Topic, User
-from app.moodle import MoodleError
+from app.moodle import ForeignURLError, MoodleError
 from app.quiz import chunk_needs_quiz, generate_for_chunk
 
 
@@ -37,29 +37,35 @@ class StageResult:
                       if self.quota_exhausted else "")
 
 
-def _in_course(q, course_id):
-    """Restrict a Resource-joinable query to one course (None = all)."""
+def _scoped(q, course_id, source):
+    """Restrict a Resource-joinable query to one course and/or source (None = all).
+
+    The source filter matters for extraction: a Moodle downloader must never
+    see a Classroom URL, since it appends the Moodle token to whatever it fetches.
+    """
+    if source is not None:
+        q = q.where(Resource.source == source)
     if course_id is None:
         return q
     return q.join(Topic, Topic.id == Resource.topic_id).where(Topic.course_id == course_id)
 
 
-def pending_resource_ids(session: Session, course_id=None) -> list:
+def pending_resource_ids(session: Session, course_id=None, source=None) -> list:
     q = select(Resource.id).where(Resource.status == "pending").order_by(Resource.id)
-    return session.exec(_in_course(q, course_id)).all()
+    return session.exec(_scoped(q, course_id, source)).all()
 
 
-def chunkable_resource_ids(session: Session, course_id=None) -> list:
+def chunkable_resource_ids(session: Session, course_id=None, source=None) -> list:
     # ids only: loading every extracted_text up front is what blew memory
     q = (select(Resource.id).where(Resource.extracted_text.is_not(None))
          .order_by(Resource.id))
-    return session.exec(_in_course(q, course_id)).all()
+    return session.exec(_scoped(q, course_id, source)).all()
 
 
-def quiz_chunk_ids(session: Session, course_id=None) -> list:
+def quiz_chunk_ids(session: Session, course_id=None, source=None) -> list:
     q = (select(Chunk.id).join(Resource, Resource.id == Chunk.resource_id)
          .order_by(Chunk.resource_id, Chunk.order))
-    return session.exec(_in_course(q, course_id)).all()
+    return session.exec(_scoped(q, course_id, source)).all()
 
 
 def moodle_downloader_for(session: Session):
@@ -67,7 +73,8 @@ def moodle_downloader_for(session: Session):
 
     Returns a function resource -> downloader, or None when the owner has no
     usable token (their file resources then stay pending until they connect).
-    Legacy courses without an owner use the global MOODLE_TOKEN.
+    Unowned pre-auth courses get none: the shared MOODLE_TOKEN belongs to
+    MOODLE_TOKEN_OWNER alone, who claims them on sign-in.
     """
     from app.moodle import MoodleClient
     from app.moodle_tokens import token_for
@@ -80,7 +87,7 @@ def moodle_downloader_for(session: Session):
         owner_id = course.user_id if course else None
         if owner_id not in cache:
             user = session.get(User, owner_id) if owner_id else None
-            token = token_for(user) if user else settings.moodle_token
+            token = token_for(user) if user else None
             cache[owner_id] = (
                 MoodleClient(settings.moodle_base_url, token).download if token else None
             )
@@ -90,10 +97,10 @@ def moodle_downloader_for(session: Session):
 
 
 def run_extraction(session: Session, downloader, course_id=None,
-                   downloader_for=None) -> StageResult:
+                   downloader_for=None, source=None) -> StageResult:
     result = StageResult(Counter(extracted=0, skipped=0, failed=0))
     counts = result.counts
-    ids = pending_resource_ids(session, course_id)
+    ids = pending_resource_ids(session, course_id, source)
     for i, rid in enumerate(ids, 1):
         r = session.get(Resource, rid)
         dl = downloader_for(r) if downloader_for else downloader
@@ -110,6 +117,10 @@ def run_extraction(session: Session, downloader, course_id=None,
             r.status = "skipped"
             r.error = None
             counts["skipped"] += 1
+        except ForeignURLError as e:
+            r.status = "failed"  # not a Moodle file; retrying can't help
+            r.error = str(e)[:500]
+            counts["failed"] += 1
         except MoodleError as e:
             # network blip or rejected token: keep pending so the next run retries
             r.error = str(e)[:500]
@@ -128,10 +139,11 @@ def run_extraction(session: Session, downloader, course_id=None,
     return result
 
 
-def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0) -> StageResult:
+def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
+                 source=None) -> StageResult:
     result = StageResult(Counter(chunks=0, cached=0, resources=0))
     counts = result.counts
-    ids = chunkable_resource_ids(session, course_id)
+    ids = chunkable_resource_ids(session, course_id, source)
     for i, rid in enumerate(ids, 1):
         r = session.get(Resource, rid)
         has_chunks = session.exec(
@@ -165,7 +177,7 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0) -> St
 
 
 def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
-             pace: float = 0.0) -> StageResult:
+             pace: float = 0.0, source=None) -> StageResult:
     from uuid import UUID
 
     from app.notify import course_of_chunk, enqueue_new_material
@@ -173,7 +185,7 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
     result = StageResult(Counter(items=0, chunks=0, skipped=0))
     counts = result.counts
     per_course: Counter[str] = Counter()
-    ids = quiz_chunk_ids(session, course_id)
+    ids = quiz_chunk_ids(session, course_id, source)
     for chunk_id in ids:
         if not chunk_needs_quiz(session, chunk_id, attempt):
             counts["skipped"] += 1
@@ -239,23 +251,29 @@ def main() -> None:
         )
 
     with Session(engine) as session:
-        course_id = None
+        course_ids = [None]
         if args.course:
-            course = session.exec(
-                select(Course).where(
-                    Course.source == args.source, Course.source_id == args.course
-                )
-            ).first()
-            if course is None:
+            # every user enrolled in the course has their own copy of it
+            course_ids = session.exec(
+                select(Course.id).where(
+                    Course.source == args.source, Course.source_id == args.course,
+                    Course.user_id.is_not(None),
+                ).order_by(Course.id)
+            ).all()
+            if not course_ids:
                 raise SystemExit(f"course {args.course} not synced — run sync_cli first")
-            course_id = course.id
-        if not args.chunk_only and not args.quiz_only:
-            downloader_for = moodle_downloader_for(session) if args.source == "moodle" else None
-            print("extraction:", run_extraction(session, downloader, course_id, downloader_for))
-        if not args.extract_only and not args.quiz_only:
-            print("chunking:", run_chunking(session, chunk_llm, course_id, pace=args.pace))
-        if not args.extract_only and not args.chunk_only:
-            print("quiz:", run_quiz(session, quiz_llm, course_id, pace=args.pace))
+        src = args.source
+        for course_id in course_ids:
+            if not args.chunk_only and not args.quiz_only:
+                downloader_for = moodle_downloader_for(session) if src == "moodle" else None
+                print("extraction:", run_extraction(session, downloader, course_id,
+                                                    downloader_for, source=src))
+            if not args.extract_only and not args.quiz_only:
+                print("chunking:", run_chunking(session, chunk_llm, course_id,
+                                                pace=args.pace, source=src))
+            if not args.extract_only and not args.chunk_only:
+                print("quiz:", run_quiz(session, quiz_llm, course_id,
+                                        pace=args.pace, source=src))
 
 
 if __name__ == "__main__":
