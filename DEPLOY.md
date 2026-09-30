@@ -4,7 +4,9 @@
 
 1. `railway init`, add the repo. Add a Postgres plugin (sets `DATABASE_URL`).
 2. Set env vars (see `.env.example`): `MOODLE_TOKEN`, `MOODLE_BASE_URL`,
-   `GOOGLE_CLIENT_ID/SECRET` (after classroom consent), `LLM_*`, `RESEND_API_KEY`,
+   `GOOGLE_CLIENT_ID/SECRET` (after classroom consent; enable both the Classroom
+   API and the Drive API in that Google Cloud project, since Classroom materials
+   are Drive files read with `drive.readonly`), `LLM_*`, `RESEND_API_KEY`,
    `EMAIL_FROM`, `EMAIL_TO`, `APP_BASE_URL` (the public web URL, used in
    email links). Note: `DATABASE_URL` must use the `psycopg`
    driver as-is; no code change needed.
@@ -24,9 +26,13 @@
    the job queue — one job per connected user, then the worker drains them
    and sends notifications:
    ```
-   python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.worker
+   python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.sync_cli --source classroom --all-users --enqueue && python -m app.worker
    ```
-   Run chunking/quiz generation paced (`--pace 45`, or set `LLM_PACE`)
+   Signing in with Google also queues a Classroom sync for that user. Users
+   who signed in before Drive access was requested must sign in once more;
+   until then their Drive files stay pending.
+   Then extract/chunk/quiz each source (`python -m app.pipeline --source
+   moodle`, then `--source classroom`). Run chunking/quiz generation paced (`--pace 45`, or set `LLM_PACE`)
    afterwards — the free Gemini tier rate-limits hard, so don't bundle
    them into the same cron slot.
    All three steps are idempotent; re-running is always safe.
@@ -42,7 +48,7 @@ nohup .venv/bin/uvicorn app.main:app --port 8000 &
 Cron (daily 06:00 sync + notify for every connected user):
 
 ```
-0 6 * * * cd /srv/study-buddy && .venv/bin/python -m app.sync_cli --source moodle --all-users --enqueue && .venv/bin/python -m app.worker
+0 6 * * * cd /srv/study-buddy && .venv/bin/python -m app.sync_cli --source moodle --all-users --enqueue && .venv/bin/python -m app.sync_cli --source classroom --all-users --enqueue && .venv/bin/python -m app.worker
 ```
 
 Long LLM pipeline runs (`app.pipeline` chunk/quiz backfills) stay

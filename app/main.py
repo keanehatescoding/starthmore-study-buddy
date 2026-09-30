@@ -156,6 +156,11 @@ def auth_callback(
     if not email_allowed(email):
         raise HTTPException(403, "sign-in not allowed for this account")
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
+    if tokens.get("refresh_token"):
+        # a fresh Classroom (+ Drive) grant: pull their classes now
+        from app.jobs import enqueue_sync_once
+
+        enqueue_sync_once(session, "classroom", user.email)
     request.session["user_id"] = str(user.id)
     return RedirectResponse(url="/", status_code=303)
 

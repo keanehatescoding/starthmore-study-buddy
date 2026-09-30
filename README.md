@@ -54,7 +54,7 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `DATABASE_URL` | Postgres connection |
 | `MOODLE_BASE_URL` | Moodle site; users connect their own account at `/settings/moodle` |
 | `MOODLE_TOKEN`, `MOODLE_TOKEN_OWNER` | Optional fallback token, used only for that owner's email (empty owner = unused) |
-| `GOOGLE_CLIENT_ID/SECRET` | Classroom OAuth (Web app, Testing mode) |
+| `GOOGLE_CLIENT_ID/SECRET` | Classroom + Drive (read-only) OAuth (Web app, Testing mode; enable both APIs) |
 | `GOOGLE_REFRESH_TOKEN`, `GOOGLE_REFRESH_TOKEN_OWNER` | Optional fallback Classroom token, used only for that owner's email |
 | `LLM_BASE_URL`, `LLM_API_KEY` | OpenAI-compatible endpoint |
 | `LLM_CHUNK_MODEL`, `LLM_QUIZ_MODEL`, `LLM_GRADE_MODEL` | Per-stage models (cheap → quality) |

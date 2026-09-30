@@ -15,11 +15,13 @@ import urllib.request
 from sqlmodel import Session, func, select
 
 from app.classroom import SCOPES as CLASSROOM_SCOPES
+from app.drive import SCOPE as DRIVE_SCOPE
 from app.config import settings
 from app.crypto import seal, unseal
 from app.models import Course, User
 
-LOGIN_SCOPES = ["openid", "email", "profile", *CLASSROOM_SCOPES]
+# drive.readonly: Classroom materials are mostly Drive files (app.drive)
+LOGIN_SCOPES = ["openid", "email", "profile", *CLASSROOM_SCOPES, DRIVE_SCOPE]
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"

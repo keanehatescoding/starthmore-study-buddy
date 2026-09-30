@@ -17,6 +17,7 @@ from sqlmodel import Session, func, select
 from app.chunk import chunk_resource, needs_llm
 from app.config import settings
 from app.db import engine
+from app.drive import DriveError
 from app.extract import ExtractError, SkipResource, extract_resource_text
 from app.llm import QuotaExhaustedError
 from app.models import Chunk, Course, Resource, Topic, User
@@ -68,17 +69,12 @@ def quiz_chunk_ids(session: Session, course_id=None, source=None) -> list:
     return session.exec(_scoped(q, course_id, source)).all()
 
 
-def moodle_downloader_for(session: Session):
-    """Per-resource Moodle downloader acting as the course owner.
-
-    Returns a function resource -> downloader, or None when the owner has no
-    usable token (their file resources then stay pending until they connect).
-    Unowned pre-auth courses get none: the shared MOODLE_TOKEN belongs to
-    MOODLE_TOKEN_OWNER alone, who claims them on sign-in.
+def _owner_downloader_for(session: Session, make):
+    """Per-resource downloader acting as the course owner: `make(user)`
+    returns one, or None when the owner has no usable token (their file
+    resources then stay pending until they connect). Unowned pre-auth
+    courses get none: shared tokens belong to their configured owner alone.
     """
-    from app.moodle import MoodleClient
-    from app.moodle_tokens import token_for
-
     cache: dict = {}
 
     def for_resource(r: Resource):
@@ -87,13 +83,39 @@ def moodle_downloader_for(session: Session):
         owner_id = course.user_id if course else None
         if owner_id not in cache:
             user = session.get(User, owner_id) if owner_id else None
-            token = token_for(user) if user else None
-            cache[owner_id] = (
-                MoodleClient(settings.moodle_base_url, token).download if token else None
-            )
+            cache[owner_id] = make(user) if user else None
         return cache[owner_id]
 
     return for_resource
+
+
+def moodle_downloader_for(session: Session):
+    from app.moodle import MoodleClient
+    from app.moodle_tokens import token_for
+
+    def make(user):
+        token = token_for(user)
+        return MoodleClient(settings.moodle_base_url, token).download if token else None
+
+    return _owner_downloader_for(session, make)
+
+
+def classroom_downloader_for(session: Session):
+    """Drive downloads under the owner's Google refresh token (app.drive)."""
+    from app.auth import classroom_token_for
+    from app.drive import DriveClient, build_service
+
+    def make(user):
+        token = classroom_token_for(user)
+        if not token:
+            return None
+        return DriveClient(build_service(
+            settings.google_client_id, settings.google_client_secret, token)).download
+
+    return _owner_downloader_for(session, make)
+
+
+DOWNLOADERS_FOR = {"moodle": moodle_downloader_for, "classroom": classroom_downloader_for}
 
 
 def run_extraction(session: Session, downloader, course_id=None,
@@ -105,7 +127,7 @@ def run_extraction(session: Session, downloader, course_id=None,
         r = session.get(Resource, rid)
         dl = downloader_for(r) if downloader_for else downloader
         if dl is None and r.type == "file" and downloader_for:
-            # owner hasn't connected Moodle: leave pending, retry once they do
+            # owner hasn't connected this source: leave pending, retry once they do
             counts["no_token"] += 1
             continue
         try:
@@ -121,8 +143,9 @@ def run_extraction(session: Session, downloader, course_id=None,
             r.status = "failed"  # not a Moodle file; retrying can't help
             r.error = str(e)[:500]
             counts["failed"] += 1
-        except MoodleError as e:
-            # network blip or rejected token: keep pending so the next run retries
+        except (MoodleError, DriveError) as e:
+            # network blip, rejected token or missing Drive grant: keep
+            # pending so the next run retries
             r.error = str(e)[:500]
             counts["download_errors"] += 1
         except ExtractError as e:
@@ -231,11 +254,6 @@ def main() -> None:
                              "raise it for free-tier rate limits)")
     args = parser.parse_args()
 
-    downloader = None
-    if args.source != "moodle":
-        def downloader(_url):
-            raise ExtractError("classroom drive download needs a drive scope (v1 gap)")
-
     chunk_llm = quiz_llm = None
     if not args.extract_only and not args.quiz_only:
         from app.llm import LLMClient
@@ -265,8 +283,8 @@ def main() -> None:
         src = args.source
         for course_id in course_ids:
             if not args.chunk_only and not args.quiz_only:
-                downloader_for = moodle_downloader_for(session) if src == "moodle" else None
-                print("extraction:", run_extraction(session, downloader, course_id,
+                downloader_for = DOWNLOADERS_FOR[src](session)
+                print("extraction:", run_extraction(session, None, course_id,
                                                     downloader_for, source=src))
             if not args.extract_only and not args.quiz_only:
                 print("chunking:", run_chunking(session, chunk_llm, course_id,
