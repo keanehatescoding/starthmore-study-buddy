@@ -326,6 +326,11 @@ def review_take(
     return _take_page(request, session, user, queue[0])
 
 
+def _result_path(item: QuizItem) -> str:
+    # built from the stored item's id via the route table, not from request input
+    return app.url_path_for("review_result", item_id=str(item.id))
+
+
 @app.post("/review/{item_id}/answer", response_class=HTMLResponse)
 async def review_answer(
     item_id: UUID,
@@ -353,7 +358,7 @@ async def review_answer(
         result = await run_in_threadpool(grade)
     except NotDue:
         # a replayed or double submit: show what was already recorded
-        return RedirectResponse(f"/review/{item_id}/result", status_code=303)
+        return RedirectResponse(_result_path(item), status_code=303)
     except InvalidAnswer as e:
         return _take_page(request, session, user, item, status_code=400,
                           error=str(e), answer=answer)
@@ -371,7 +376,7 @@ async def review_answer(
         "feedback": result["feedback"][:1000],
         "interval_days": result["interval_days"],
     }
-    return RedirectResponse(f"/review/{item_id}/result", status_code=303)
+    return RedirectResponse(_result_path(item), status_code=303)
 
 
 @app.get("/review/{item_id}/result", response_class=HTMLResponse)
