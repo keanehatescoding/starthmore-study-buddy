@@ -212,7 +212,7 @@ def run_due(session: Session, limit: int = 5) -> dict:
 def run_sync_job(session: Session, payload: dict) -> dict:
     """payload: {source, course_id|None, user_email}."""
     from app.auth import find_user
-    from app.sync import sync_all, sync_course
+    from app.sync import failed_courses, sync_all, sync_course
     from app.sync_cli import build_adapter
 
     user = find_user(session, payload["user_email"])
@@ -222,10 +222,13 @@ def run_sync_job(session: Session, payload: dict) -> dict:
     if payload.get("course_id"):
         stats = sync_course(session, adapter, payload["course_id"], user.id)
         return {payload["course_id"]: stats.as_dict()}
-    return {
-        course_id: stats.as_dict()
-        for course_id, stats in sync_all(session, adapter, user.id).items()
-    }
+    results = sync_all(session, adapter, user.id)
+    failed = failed_courses(results)
+    if results and len(failed) == len(results):
+        # nothing synced: fail the job so it retries; a partial sync
+        # completes with each failed course's error in the result
+        raise RuntimeError(f"every course failed, e.g. {results[failed[0]].error}")
+    return {course_id: stats.as_dict() for course_id, stats in results.items()}
 
 
 @handler("send_notifications")

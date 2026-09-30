@@ -71,7 +71,7 @@ class ClassroomClient:
     def _pages(self, collection, request):
         # list_next carries the token itself; the first call sends none.
         while request is not None:
-            resp = request.execute()
+            resp = request.execute(num_retries=3)  # backs off on 429/5xx
             yield resp
             request = collection.list_next(request, resp)
 

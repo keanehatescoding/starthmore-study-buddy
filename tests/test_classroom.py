@@ -19,7 +19,8 @@ class _Request:
     def __init__(self, collection, params, page):
         self.collection, self.params, self.page = collection, params, page
 
-    def execute(self):
+    def execute(self, num_retries=0):
+        self.collection.retries = num_retries
         self.collection.calls.append(self.params)
         return self.collection.pages[self.page]
 
@@ -203,3 +204,9 @@ def test_due_time_omitted_fields_are_zero(due_time, expected):
         work["dueTime"] = due_time
     [a] = ClassroomAdapter(_Coursework(work)).fetch_assignments("c1")
     assert a.due_date == datetime(2026, 10, 1, *expected, tzinfo=timezone.utc)
+
+
+def test_classroom_calls_retry_transient_errors():
+    service = _Service()
+    ClassroomClient(service).list_courses()
+    assert service._courses.retries == 3
