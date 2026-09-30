@@ -148,3 +148,24 @@ def test_0010_requeues_only_drive_files_that_lacked_the_scope(engine):
     with engine.connect() as c:
         got = dict(c.execute(text("SELECT source_id, status FROM resources")).all())
     assert got == {str(i): row[3] for i, row in enumerate(rows)}
+
+
+def test_0011_adds_retry_columns_and_requeues_empty_chunkings(engine):
+    m = _migration("0011_pipeline_retries")
+    with engine.begin() as c:  # the schema as of 0010
+        c.execute(text("ALTER TABLE resources DROP COLUMN attempts"))
+        c.execute(text("ALTER TABLE resources DROP COLUMN retry_after"))
+        c.execute(text("DROP TABLE quiz_attempts"))
+        for sid, error in [("empty", "chunker produced no chunks"),
+                           ("other", "unsupported type (mime=?, file=?)")]:
+            c.execute(text(
+                "INSERT INTO resources (id, topic_id, source, source_id, type, title, "
+                "status, error) VALUES (:i, :t, 'moodle', :sid, 'file', 'R', 'failed', :e)"),
+                {"i": uuid.uuid4().hex, "t": uuid.uuid4().hex, "sid": sid, "e": error})
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        got = {r[0]: tuple(r[1:]) for r in c.execute(text(
+            "SELECT source_id, status, error, attempts, retry_after FROM resources"))}
+        c.execute(text("SELECT chunk_id, attempt FROM quiz_attempts"))
+    assert got == {"empty": ("extracted", None, 0, None),
+                   "other": ("failed", "unsupported type (mime=?, file=?)", 0, None)}

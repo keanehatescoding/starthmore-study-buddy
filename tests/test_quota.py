@@ -18,9 +18,10 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda s: None)
 
 
-def _resp(payload):
+def _resp(payload, finish_reason="stop"):
     content = payload if isinstance(payload, str) else json.dumps(payload)
-    body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+    body = json.dumps({"choices": [{"message": {"content": content},
+                                    "finish_reason": finish_reason}]}).encode()
 
     class FakeResp:
         def __enter__(self):
@@ -35,10 +36,14 @@ def _resp(payload):
     return FakeResp()
 
 
-def _http_error(code: int, retry_after: str = "0"):
+def _http_error(code: int, retry_after: str = "0", body: bytes = b""):
     return urllib.error.HTTPError(
-        "https://x", code, "err", {"Retry-After": retry_after}, io.BytesIO()
+        "https://x", code, "err", {"Retry-After": retry_after}, io.BytesIO(body)
     )
+
+
+JSON_MODE_400 = b'{"error": {"message": "Invalid value for response_format"}}'
+
 
 
 def _client(monkeypatch, script):
@@ -50,6 +55,8 @@ def _client(monkeypatch, script):
         outcome = next(it)
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, tuple):  # (payload, finish_reason)
+            return _resp(*outcome)
         return _resp(outcome)
 
     monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
@@ -94,7 +101,8 @@ def _sent(req) -> dict:
 
 def test_400_on_json_mode_retries_without_it(monkeypatch):
     client, calls = _client(
-        monkeypatch, [_http_error(400), '```json\n{"ok": true}\n```', {"again": 1}]
+        monkeypatch,
+        [_http_error(400, body=JSON_MODE_400), '```json\n{"ok": true}\n```', {"again": 1}]
     )
     assert client.complete_json("s", "u") == {"ok": True}
     assert "response_format" in _sent(calls[0])
@@ -104,10 +112,34 @@ def test_400_on_json_mode_retries_without_it(monkeypatch):
 
 
 def test_400_without_json_mode_is_not_retried(monkeypatch):
-    client, calls = _client(monkeypatch, [_http_error(400), _http_error(400)])
+    client, calls = _client(monkeypatch, [_http_error(400, body=JSON_MODE_400),
+                                          _http_error(400, body=JSON_MODE_400)])
     with pytest.raises(LLMError, match="chat completion failed:"):
         client.complete_json("s", "u")
     assert len(calls) == 2
+
+
+def test_other_400_keeps_json_mode_and_raises(monkeypatch):
+    too_long = b'{"error": {"message": "maximum context length is 8192 tokens"}}'
+    client, calls = _client(monkeypatch, [_http_error(400, body=too_long), {"ok": 1}])
+    with pytest.raises(LLMError, match="context length"):
+        client.complete_json("s", "u")
+    assert len(calls) == 1 and client.json_mode
+    assert client.complete_json("s", "u") == {"ok": 1}
+    assert "response_format" in _sent(calls[1])
+
+
+def test_truncated_reply_raises_instead_of_parsing_a_fragment(monkeypatch):
+    cut = '{"chunks": [{"title": "A", "content": "x"}, {"title": "B", "cont'
+    client, _ = _client(monkeypatch, [(cut, "length")])
+    with pytest.raises(llm_mod.TruncatedError):
+        client.complete_json("s", "u", required_key="chunks")
+
+
+def test_required_key_rejects_an_inner_object(monkeypatch):
+    client, _ = _client(monkeypatch, ['Here: {"title": "A", "content": "x"}'])
+    with pytest.raises(LLMError, match="'chunks'"):
+        client.complete_json("s", "u", required_key="chunks")
 
 
 def test_prose_wrapped_json_is_parsed(monkeypatch):
@@ -209,7 +241,7 @@ def test_run_quiz_aborts_on_quota():
         class DeadLLM:
             calls = 0
 
-            def complete_json(self, *a):
+            def complete_json(self, *a, **kw):
                 type(self).calls += 1
                 raise QuotaExhaustedError("gone")
 

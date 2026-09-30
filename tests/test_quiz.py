@@ -14,7 +14,7 @@ class FakeLLM:
         self.items = items
         self.calls = 0
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, **kw):
         self.calls += 1
         return {"items": self.items}
 
@@ -135,3 +135,49 @@ def test_mcq_index_normalized(setup, raw, stored):
     generate_for_chunk(s, chunk, FakeLLM([item]))
     rows = s.exec(select(QuizItem)).all()
     assert [r.correct_answer for r in rows] == ([stored] if stored else [])
+
+
+def test_zero_item_chunk_is_not_billed_again(setup):
+    s, chunk = setup
+    llm = FakeLLM([GOOD[2]])  # nothing valid
+    assert generate_for_chunk(s, chunk, llm) == []
+    assert not chunk_needs_quiz(s, chunk.id)
+    assert generate_for_chunk(s, chunk, llm) == [] and llm.calls == 1
+    assert chunk_needs_quiz(s, chunk.id, attempt=2)  # a new attempt may retry
+
+
+def test_every_empty_attempt_stays_done(setup):
+    # One marker per chunk would forget attempt 1 once attempt 2 ran.
+    s, chunk = setup
+    llm = FakeLLM([GOOD[2]])  # nothing valid
+    generate_for_chunk(s, chunk, llm, attempt=1)
+    generate_for_chunk(s, chunk, llm, attempt=2)
+    assert llm.calls == 2
+    for attempt in (1, 2, 1, 2):
+        assert not chunk_needs_quiz(s, chunk.id, attempt=attempt)
+        assert generate_for_chunk(s, chunk, llm, attempt=attempt) == []
+    assert llm.calls == 2
+    assert chunk_needs_quiz(s, chunk.id, attempt=3)
+
+
+@pytest.mark.parametrize("patch", [
+    {"question": None}, {"explanation": None}, {"grading_criteria": None},
+    {"correct_answer": None}, {"question": ["a"]}, {"difficulty": 3},
+])
+def test_null_or_odd_fields_do_not_crash(setup, patch):
+    s, chunk = setup
+    generate_for_chunk(s, chunk, FakeLLM([dict(GOOD[0], **patch), GOOD[1]]))
+    assert len(s.exec(select(QuizItem)).all()) >= 1  # the good item survives
+
+
+def test_list_grading_criteria_is_joined(setup):
+    s, chunk = setup
+    item = dict(GOOD[0], grading_criteria=["mentions hierarchy", "mentions nodes"])
+    generate_for_chunk(s, chunk, FakeLLM([item]))
+    row = s.exec(select(QuizItem)).one()
+    assert row.grading_criteria == "mentions hierarchy\nmentions nodes"
+
+
+def test_items_not_a_list_yields_nothing(setup):
+    s, chunk = setup
+    assert generate_for_chunk(s, chunk, FakeLLM("nope")) == []

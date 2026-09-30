@@ -19,7 +19,9 @@ from typing import Any, Protocol
 
 from sqlmodel import Session, delete, func, select, update
 
-from app.models import Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic
+from app.models import (
+    Assignment, Chunk, Course, QuizAttempt, QuizItem, Resource, ReviewState, Topic,
+)
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 
@@ -177,12 +179,13 @@ def _adopt_unowned(session: Session, unowned, user_id) -> Course | None:
 
 
 def _purge_derived(session: Session, resource_id) -> None:
-    """Drop chunks, quiz items and review states built from a resource's old
+    """Drop chunks, quiz items/attempts and review states built from a resource's old
     content. Explicit (not just ON DELETE CASCADE) so it also holds on SQLite."""
     chunk_ids = select(Chunk.id).where(Chunk.resource_id == resource_id)
     item_ids = select(QuizItem.id).where(QuizItem.chunk_id.in_(chunk_ids))
     session.exec(delete(ReviewState).where(ReviewState.quiz_item_id.in_(item_ids)))
     session.exec(delete(QuizItem).where(QuizItem.chunk_id.in_(chunk_ids)))
+    session.exec(delete(QuizAttempt).where(QuizAttempt.chunk_id.in_(chunk_ids)))
     session.exec(delete(Chunk).where(Chunk.resource_id == resource_id))
 
 
@@ -339,6 +342,8 @@ def sync_course(
                 existing.extracted_text = r.text
                 existing.status = "extracted" if r.text else "pending"
                 existing.error = None
+                existing.attempts = 0  # new content: no backoff carried over
+                existing.retry_after = None
                 session.add(existing)
                 session.commit()
                 stats.resources_updated += 1

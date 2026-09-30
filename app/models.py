@@ -67,6 +67,12 @@ class Resource(SQLModel, table=True):
     status: str = Field(default="pending", index=True)  # pending|extracted|failed|skipped
     error: Optional[str] = Field(default=None)
     mime_type: Optional[str] = Field(default=None)
+    # consecutive failed pipeline tries (download/chunking) and when the next
+    # may run, so a dead download or a failing LLM call isn't redone every run
+    attempts: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
+    retry_after: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
 
 
 class Assignment(SQLModel, table=True):
@@ -97,6 +103,17 @@ class Chunk(SQLModel, table=True):
     order: int = Field(default=0)
     start_char: Optional[int] = Field(default=None)
     end_char: Optional[int] = Field(default=None)
+
+
+class QuizAttempt(SQLModel, table=True):
+    """A quiz generation that ran for (chunk, attempt), even one that yielded
+    no items, so a chunk with nothing quizzable isn't re-billed every run."""
+
+    __tablename__ = "quiz_attempts"
+
+    chunk_id: uuid.UUID = Field(foreign_key="chunks.id", primary_key=True,
+                                ondelete="CASCADE")
+    attempt: int = Field(primary_key=True)
 
 
 class QuizItem(SQLModel, table=True):
