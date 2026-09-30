@@ -291,3 +291,70 @@ def test_new_item_past_cap_redirects_to_queue(testapp, monkeypatch):
         == "/review/take"
     with Session() as s:
         assert s.exec(select(ReviewState)).first() is None
+
+
+def _answer_again(Session):
+    """Make the (only) answered item due again."""
+    with Session() as s:
+        state = s.exec(select(ReviewState)).one()
+        state.next_review_date = datetime.now(timezone.utc) - timedelta(minutes=1)
+        s.add(state)
+        s.commit()
+
+
+def test_stats_count_every_answer_not_just_the_latest(testapp):
+    from app.models import ReviewLog
+    from app.stats import compute_stats
+
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    client.post(f"/review/{item_id}/answer", data={"answer": "1", "csrf_token": _token(client)})
+    _answer_again(Session)
+    client.post(f"/review/{item_id}/answer", data={"answer": "0", "csrf_token": _token(client)})
+    with Session() as s:
+        logs = s.exec(select(ReviewLog).order_by(ReviewLog.answered_at)).all()
+        assert [(log.verdict, log.partial_credit) for log in logs] == [
+            ("correct", 1.0), ("incorrect", 0.0)]
+        stats = compute_stats(s, testapp["user_id"])
+    # the second answer overwrote ReviewState.last_result; history still has both
+    assert stats["answered"] == 2 and stats["accuracy"] == 0.5
+
+
+def _log(s, user_id, at):
+    from app.models import ReviewLog
+    s.add(ReviewLog(user_id=user_id, verdict="correct", partial_credit=1.0, answered_at=at))
+
+
+def test_streak_keeps_days_whose_items_were_answered_again(testapp):
+    from app.stats import compute_stats
+
+    Session, user_id = testapp["Session"], testapp["user_id"]
+    now = datetime.now(timezone.utc)
+    with Session() as s:
+        for days_ago in (0, 1, 2):  # the same item re-answered on three days
+            _log(s, user_id, now - timedelta(days=days_ago))
+        s.commit()
+        assert compute_stats(s, user_id, tz=timezone.utc)["streak_days"] == 3
+
+
+def test_streak_days_are_local_dates():
+    from zoneinfo import ZoneInfo
+
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from app.stats import compute_stats
+
+    nairobi = ZoneInfo("Africa/Nairobi")  # UTC+3
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        user = User(email="s@x.edu")
+        s.add(user)
+        s.commit()
+        # 00:30 local on the 30th is still the 29th in UTC
+        _log(s, user.id, datetime(2026, 9, 30, 0, 30, tzinfo=nairobi))
+        _log(s, user.id, datetime(2026, 9, 29, 12, 0, tzinfo=nairobi))
+        s.commit()
+        now = datetime(2026, 9, 30, 1, 0, tzinfo=nairobi)
+        assert compute_stats(s, user.id, tz=nairobi, now=now)["streak_days"] == 2
+        assert compute_stats(s, user.id, tz=timezone.utc, now=now)["streak_days"] == 1

@@ -21,7 +21,9 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
-from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
+from app.models import (
+    Chunk, Course, QuizItem, Resource, ReviewLog, ReviewState, Topic, User,
+)
 from app.srs import (
     PASS_CREDIT, initial_ease_factor, next_interval_days, partial_credit_to_quality, verdict,
 )
@@ -212,6 +214,8 @@ def submit_answer(
     if is_new_item and state.first_answered_at is None:
         state.first_answered_at = now
     session.add(state)
+    session.add(ReviewLog(user_id=user_id, quiz_item_id=item.id, verdict=state.last_result,
+                          partial_credit=partial, answered_at=now))
     session.commit()
     session.refresh(state)
     return {

@@ -5,7 +5,9 @@
 - new_material: one event per course per generation run that produced items
   ("8 new quiz items from CS 301"), never per-item.
 - review_due: created only when due count >= threshold (avoids fatigue),
-  and never duplicated while an unsent one exists.
+  never while an unsent one exists, and not within REVIEW_DUE_COOLDOWN of the
+  last one's delivery (the worker runs hourly; the due count stays high until
+  the user reviews).
 - Delivery: Resend batch REST API (stdlib only, free tier), up to 100 emails
   per request, backing off on 429. No key -> events stay queued; nothing is
   fake-marked sent.
@@ -13,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -20,15 +23,16 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from sqlmodel import Session, select
 
-from app.grade import due_count
+from app.grade import _aware, due_count
 from app.models import Course, NotificationEvent, Resource, Topic, User
 
 REVIEW_DUE_THRESHOLD = 3
+REVIEW_DUE_COOLDOWN = timedelta(hours=23)  # daily, without drifting an hour a day
 RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 BATCH_SIZE = 100  # Resend's per-request batch limit
 MAX_RETRIES = 4
@@ -147,18 +151,23 @@ def enqueue_new_material(session: Session, course_id, new_items: int) -> Notific
 def check_review_due(
     session: Session, user_id, threshold: int = REVIEW_DUE_THRESHOLD
 ) -> NotificationEvent | None:
-    """Create a review_due event if due >= threshold and none unsent exists."""
+    """Create a review_due event if due >= threshold, none is still unsent,
+    and the last one was delivered more than REVIEW_DUE_COOLDOWN ago."""
     due = due_count(session, user_id)
     if due < threshold:
         return None
-    pending = session.exec(
-        select(NotificationEvent).where(
-            NotificationEvent.user_id == user_id,
-            NotificationEvent.type == "review_due",
-            NotificationEvent.sent == False,  # noqa: E712
-        )
+    last = session.exec(
+        select(NotificationEvent)
+        .where(NotificationEvent.user_id == user_id, NotificationEvent.type == "review_due")
+        .order_by(NotificationEvent.created_at.desc())
     ).first()
-    if pending:
+    if last is not None and (
+        not last.sent
+        # from delivery, not creation: a long-queued event must not open the
+        # window at once; rows sent before sent_at existed fall back
+        or _aware(last.sent_at or last.created_at)
+        > datetime.now(timezone.utc) - REVIEW_DUE_COOLDOWN
+    ):
         return None
     event = NotificationEvent(
         user_id=user_id, type="review_due", payload={"due_count": due}
@@ -203,6 +212,9 @@ def recipient_for(session: Session, event: NotificationEvent, fallback: str = ""
 
 # Resend rejected the batch before sending anything: safe to split and resend.
 BATCH_REJECTED = "http_422:validation_error"
+KEY_CONFLICT = "http_409:invalid_idempotent_request"  # same key, different body
+LEGACY_BATCH_PREFIX = "batch-"  # batch_key that was itself the Idempotency-Key
+BATCH_PREFIX = "b2-"  # batch_key that only groups; the key is _idempotency_key
 
 
 def send_pending(
@@ -216,11 +228,17 @@ def send_pending(
     `errors` counts failures by EmailError.reason for the job result.
 
     Duplicate safety: a multi-email batch gets a batch_key, committed before
-    the request and sent as its Idempotency-Key. A failure that might have
-    been delivered (network, 5xx, ...) leaves the batch as-is, so later passes
-    resend the same events under the same key. Only a confirmed validation
-    rejection splits it into single sends (key "event-<id>"). Resend keeps
-    keys for 24h; a batch still unconfirmed after that may be delivered twice.
+    the request, so a failure that might have been delivered (network, 5xx,
+    ...) leaves the batch as-is and later passes resend the same events. The
+    Idempotency-Key hashes the event ids and request body (_idempotency_key):
+    an unchanged resend reuses it, while a changed body (recipient dropped,
+    new base URL) gets a fresh key instead of a 409 for 24h. Only a confirmed
+    validation rejection splits a batch into single sends. Resend keeps keys
+    for 24h; a batch still unconfirmed after that may be delivered twice.
+
+    Batches persisted before payload-derived keys ("batch-..." batch_key) were
+    sent with the batch_key itself, so they keep it until delivered, or until
+    Resend confirms their body changed (409), when they move to BATCH_PREFIX.
     """
     sent = 0
     errors: Counter[str] = Counter()  # reason token -> failed deliveries
@@ -277,17 +295,40 @@ def _result(sent: int, errors: Counter) -> dict:
     return {"sent": sent, "failed": sum(errors.values()), "errors": dict(errors)}
 
 
+def _idempotency_key(batch) -> str:
+    """Stable for the same events and body; the event ids keep two events
+    with identical emails from being deduped into one delivery."""
+    emails = [email for _, email in batch]
+    blob = json.dumps({"events": [str(event.id) for event, _ in batch], "emails": emails},
+                      sort_keys=True)
+    return f"sb-{hashlib.sha256(blob.encode()).hexdigest()}"
+
+
+def _tag_batch(session: Session, batch) -> None:
+    key = f"{BATCH_PREFIX}{uuid.uuid4()}"
+    for event, _ in batch:
+        event.batch_key = key
+        session.add(event)
+    session.commit()  # before the request: a lost response must resend this batch
+
+
 def _deliver(session: Session, api_key: str, batch, sleep) -> None:
-    key = batch[0][0].batch_key
-    if key is None and len(batch) == 1:
-        key = f"event-{batch[0][0].id}"  # stable across passes, nothing to store
-    elif key is None:
-        key = f"batch-{uuid.uuid4()}"
-        for event, _ in batch:
-            event.batch_key = key
-            session.add(event)
-        session.commit()  # before the request: a lost response must reuse it
-    send_batch(api_key, [email for _, email in batch], key, sleep=sleep)
+    emails = [email for _, email in batch]
+    legacy = batch[0][0].batch_key or ""
+    if legacy.startswith(LEGACY_BATCH_PREFIX):
+        try:
+            send_batch(api_key, emails, legacy, sleep=sleep)
+        except EmailError as e:
+            if e.reason != KEY_CONFLICT:
+                raise
+            # the body changed since the legacy attempt, so that key can't be
+            # reused; like any changed body, it goes out under a fresh key
+            _tag_batch(session, batch)
+            send_batch(api_key, emails, _idempotency_key(batch), sleep=sleep)
+    else:
+        if len(batch) > 1 and batch[0][0].batch_key is None:
+            _tag_batch(session, batch)
+        send_batch(api_key, emails, _idempotency_key(batch), sleep=sleep)
     now = datetime.now(timezone.utc)
     for event, _ in batch:
         event.sent = True

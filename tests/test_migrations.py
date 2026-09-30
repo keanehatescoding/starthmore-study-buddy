@@ -107,3 +107,22 @@ def test_0005_env_var_beats_dotenv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SECRET_KEY", "from-env")
     assert m._secret_key() == "from-env"
+
+
+def test_0009_backfills_review_logs_from_answered_states(engine):
+    m = _migration("0009_review_log")
+    with engine.begin() as c:
+        c.execute(text("DROP TABLE review_logs"))
+        for result, answered in (("correct", "2026-09-01 10:00:00"), (None, None)):
+            c.execute(
+                text("INSERT INTO review_states (id, user_id, quiz_item_id, ease_factor, "
+                     "interval_days, next_review_date, last_result, repetitions, lapses, "
+                     "answered_at) VALUES (:i, :u, :q, 2.5, 1, '2026-09-02', :r, 1, 0, :a)"),
+                {"i": uuid.uuid4().hex, "u": uuid.uuid4().hex, "q": uuid.uuid4().hex,
+                 "r": result, "a": answered},
+            )
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        rows = c.execute(text(
+            "SELECT verdict, partial_credit, answered_at FROM review_logs")).all()
+    assert [tuple(r) for r in rows] == [("correct", None, "2026-09-01 10:00:00")]
