@@ -126,3 +126,25 @@ def test_0009_backfills_review_logs_from_answered_states(engine):
         rows = c.execute(text(
             "SELECT verdict, partial_credit, answered_at FROM review_logs")).all()
     assert [tuple(r) for r in rows] == [("correct", None, "2026-09-01 10:00:00")]
+
+
+def test_0010_requeues_only_drive_files_that_lacked_the_scope(engine):
+    m = _migration("0010_retry_drive_files")
+    rows = [  # (source, status, error) -> expected status after upgrade
+        ("classroom", "failed",
+         "classroom drive download needs a drive scope (v1 gap)", "pending"),
+        ("classroom", "failed", "unsupported type (mime=?, file=?)", "failed"),
+        ("moodle", "failed", "classroom drive download needs a drive scope (v1 gap)",
+         "failed"),
+    ]
+    with engine.begin() as c:
+        for i, (source, status, error, _) in enumerate(rows):
+            c.execute(text(
+                "INSERT INTO resources (id, topic_id, source, source_id, type, title, status, "
+                "error) VALUES (:i, :t, :s, :sid, 'file', 'R', :st, :e)"),
+                {"i": uuid.uuid4().hex, "t": uuid.uuid4().hex, "s": source,
+                 "sid": str(i), "st": status, "e": error})
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        got = dict(c.execute(text("SELECT source_id, status FROM resources")).all())
+    assert got == {str(i): row[3] for i, row in enumerate(rows)}

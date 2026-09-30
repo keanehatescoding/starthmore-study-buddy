@@ -346,3 +346,67 @@ def test_stage_ids_are_scoped_to_course(session):
     my_course_id = session.get(Topic, mine.topic_id).course_id
     assert quiz_chunk_ids(session, my_course_id) == [mine_chunk.id]
     assert len(quiz_chunk_ids(session)) == 2
+
+
+def _classroom_file(session, owner_email):
+    from app.models import User
+
+    user = User(email=owner_email)
+    session.add(user)
+    session.commit()
+    course = Course(user_id=user.id, source="classroom", source_id="gc1", name="GC")
+    session.add(course)
+    session.commit()
+    topic = Topic(course_id=course.id, source_id="t", title="T")
+    session.add(topic)
+    session.commit()
+    return _resource(session, topic_id=topic.id, source="classroom", source_id="m:0",
+                     raw_url="https://drive.google.com/file/d/1AbCdEfGhIjKlMnOp/view")
+
+
+def _fake_drive(monkeypatch, download):
+    import app.auth
+    import app.drive
+
+    monkeypatch.setattr(app.auth, "classroom_token_for",
+                        lambda user: "rt" if user.email == "has@x.edu" else None)
+    monkeypatch.setattr(app.drive, "build_service", lambda *a: None)
+    monkeypatch.setattr(app.drive.DriveClient, "download", lambda self, url: download(url))
+
+
+def test_classroom_drive_files_are_extracted_as_owner(session, monkeypatch):
+    from app.pipeline import DOWNLOADERS_FOR
+
+    _fake_drive(monkeypatch, lambda url: (b"lecture notes", "text/plain"))
+    _classroom_file(session, "has@x.edu")
+    counts = run_extraction(session, None, source="classroom",
+                            downloader_for=DOWNLOADERS_FOR["classroom"](session)).counts
+    assert counts["extracted"] == 1
+    r = session.exec(select(Resource)).one()
+    assert (r.status, r.extracted_text) == ("extracted", "lecture notes")
+
+
+def test_classroom_owner_without_token_or_drive_grant_stays_pending(session, monkeypatch):
+    from app.drive import DriveError
+    from app.pipeline import DOWNLOADERS_FOR
+
+    def no_grant(url):
+        raise DriveError("token lacks Drive access; the owner must sign in again")
+
+    _fake_drive(monkeypatch, no_grant)
+    _classroom_file(session, "none@x.edu")
+    counts = run_extraction(session, None, source="classroom",
+                            downloader_for=DOWNLOADERS_FOR["classroom"](session)).counts
+    assert counts["no_token"] == 1
+    # the owner signs in (now has a token) but it predates the Drive grant
+    from app.models import User
+
+    owner = session.exec(select(User)).one()
+    owner.email = "has@x.edu"
+    session.add(owner)
+    session.commit()
+    counts = run_extraction(session, None, source="classroom",
+                            downloader_for=DOWNLOADERS_FOR["classroom"](session)).counts
+    assert counts["download_errors"] == 1
+    r = session.exec(select(Resource)).one()
+    assert r.status == "pending" and "sign in again" in r.error

@@ -8,12 +8,10 @@ Required scopes (coursework alone misses materials/topics):
 google-* imports are lazy so the module (and tests with fakes) load
 without the google libs installed.
 
-Known v1 limitation: Drive-file materials need a Drive scope to download,
-which the plan's minimal scope set deliberately excludes. Those resources
-sync as metadata (hash of the Drive file id) with status pending; extraction
-will mark them failed/skipped with a clear error until the scope is added.
-Without that scope, edits inside the same Drive file can't be seen; swapping
-the attachment for another file (new id) or renaming it is picked up.
+Drive-file materials sync as metadata (hash of the Drive file id) with a
+Drive URL; the pipeline downloads them via app.drive under the owner's
+drive.readonly grant. Edits inside the same Drive file aren't seen as a
+change; swapping the attachment for another file (new id) or renaming it is.
 
 Materials with no topic, or whose topic was deleted, sync under a synthetic
 "Other materials" topic (UNTAGGED_TOPIC_ID) instead of being dropped.
@@ -183,7 +181,7 @@ class ClassroomAdapter:
                     out.append(
                         ResourceData(
                             topic_source_id, sid, "file", df.get("title") or title,
-                            raw_url=df.get("alternateLink"),
+                            raw_url=_drive_url(df),
                             content_bytes=_drive_marker(df),
                         )
                     )
@@ -230,6 +228,14 @@ UNTAGGED_TITLE = "Other materials"
 def _topic_of(material: dict, known: set[str]) -> str:
     topic_id = material.get("topicId")
     return topic_id if topic_id in known else UNTAGGED_TOPIC_ID
+
+
+def _drive_url(drive_file: dict) -> str | None:
+    """alternateLink, else a URL built from the id so app.drive can fetch it."""
+    if drive_file.get("alternateLink"):
+        return drive_file["alternateLink"]
+    fid = drive_file.get("id")
+    return f"https://drive.google.com/file/d/{fid}/view" if fid else None
 
 
 def _drive_marker(drive_file: dict) -> bytes | None:

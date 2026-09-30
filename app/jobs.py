@@ -56,6 +56,20 @@ def enqueue(
     return job
 
 
+def enqueue_sync_once(session: Session, source: str, user_email: str) -> Job | None:
+    """Queue a full sync of `source` for the user unless one is already
+    pending or running for them. Returns the new job, or None."""
+    active = session.exec(
+        select(Job).where(Job.type == "sync", Job.status.in_(("pending", "running")))
+    ).all()
+    if any(j.payload.get("source") == source and j.payload.get("user_email") == user_email
+           for j in active):
+        return None
+    return enqueue(session, "sync", {
+        "source": source, "course_id": None, "user_email": user_email,
+    })
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 

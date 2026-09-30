@@ -339,3 +339,45 @@ def test_timezone_setting_must_be_an_iana_zone():
     assert str(Settings(_env_file=None).tz) == "Africa/Nairobi"
     with pytest.raises(ValueError, match="TIMEZONE"):
         Settings(_env_file=None, timezone="Mars/Olympus")
+
+
+def test_login_requests_drive_readonly():
+    url = auth_mod.login_url("cid", "https://x/cb", "state123")
+    assert "drive.readonly" in url
+
+
+def test_sign_in_with_refresh_token_queues_classroom_sync(monkeypatch):
+    from sqlmodel import select
+
+    from app.config import settings
+    from app.db import get_session
+    from app.models import Job
+
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("new@x.edu", monkeypatch)
+    monkeypatch.setattr(auth_mod, "exchange_code",
+                        lambda *a: {"access_token": "tok", "refresh_token": "rt"})
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 303
+        with next(app.dependency_overrides[get_session]()) as s:
+            jobs = s.exec(select(Job)).all()
+        assert [(j.type, j.payload) for j in jobs] == [
+            ("sync", {"source": "classroom", "course_id": None, "user_email": "new@x.edu"})]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_enqueue_sync_once_skips_while_one_is_active():
+    from app.jobs import enqueue_sync_once
+
+    with _memory_session() as s:
+        first = enqueue_sync_once(s, "classroom", "a@x.edu")
+        assert first is not None
+        assert enqueue_sync_once(s, "classroom", "a@x.edu") is None  # still pending
+        assert enqueue_sync_once(s, "moodle", "a@x.edu") is not None  # other source
+        assert enqueue_sync_once(s, "classroom", "b@x.edu") is not None  # other user
+        first.status = "completed"
+        s.add(first)
+        s.commit()
+        assert enqueue_sync_once(s, "classroom", "a@x.edu") is not None

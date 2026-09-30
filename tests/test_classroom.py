@@ -130,7 +130,8 @@ def test_drive_file_uses_inner_title_and_id_marker():
     adapter = ClassroomAdapter(ClassroomClient(service))
     adapter.fetch_topics("c1")
     [r] = adapter.fetch_resources("c1", UNTAGGED_TOPIC_ID)
-    assert r.title == "notes.pdf" and r.raw_url is None
+    assert r.title == "notes.pdf"
+    assert r.raw_url == "https://drive.google.com/file/d/F1/view"  # built from the id
     assert content_hash(r) is not None  # no link, still hashable by id
 
     swapped = _Service(materials=[_material("m1", materials=[_drive("F2", link=None)])])
