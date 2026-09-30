@@ -317,6 +317,22 @@ def test_concurrent_new_item_rechecked_under_user_lock(setup, monkeypatch, same_
     assert len(s.exec(select(ReviewState)).all()) == 1
 
 
+def test_review_of_pre_cap_row_spends_no_slot(setup, monkeypatch):
+    s, user, mcq, short = setup
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 1)
+    submit_answer(s, user.id, mcq.id, "1")
+    # a row from before migration 0008 has no first_answered_at
+    state = s.exec(select(ReviewState)).one()
+    state.first_answered_at = None
+    s.add(state)
+    s.commit()
+    _make_due(s, user, mcq)
+    submit_answer(s, user.id, mcq.id, "1")
+    s.refresh(state)
+    assert state.first_answered_at is None
+    assert short.id in [i.id for i in due_items(s, user.id)]  # today's slot still free
+
+
 def test_new_item_past_daily_cap_rejected(setup, monkeypatch):
     s, user, mcq, short = setup
     monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 1)

@@ -169,6 +169,9 @@ def submit_answer(
         state = session.exec(_state_query(user_id, item.id)).first()
         if state is None and _new_allowance(session, user_id, now) <= 0:
             raise NotDue(quiz_item_id)  # a new item past today's cap isn't in the queue
+    # Only a first answer spends a slot: a row predating first_answered_at
+    # (NULL after migration 0008) is a review, not a new item.
+    is_new_item = state is None
     if not _is_due(state, now):
         raise NotDue(quiz_item_id)
 
@@ -206,7 +209,7 @@ def submit_answer(
         state.lapses += 1
     state.next_review_date = now + timedelta(days=interval)
     state.answered_at = now
-    if state.first_answered_at is None:
+    if is_new_item and state.first_answered_at is None:
         state.first_answered_at = now
     session.add(state)
     session.commit()
