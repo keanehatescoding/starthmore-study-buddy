@@ -146,6 +146,20 @@ def test_zero_item_chunk_is_not_billed_again(setup):
     assert chunk_needs_quiz(s, chunk.id, attempt=2)  # a new attempt may retry
 
 
+def test_every_empty_attempt_stays_done(setup):
+    # One marker per chunk would forget attempt 1 once attempt 2 ran.
+    s, chunk = setup
+    llm = FakeLLM([GOOD[2]])  # nothing valid
+    generate_for_chunk(s, chunk, llm, attempt=1)
+    generate_for_chunk(s, chunk, llm, attempt=2)
+    assert llm.calls == 2
+    for attempt in (1, 2, 1, 2):
+        assert not chunk_needs_quiz(s, chunk.id, attempt=attempt)
+        assert generate_for_chunk(s, chunk, llm, attempt=attempt) == []
+    assert llm.calls == 2
+    assert chunk_needs_quiz(s, chunk.id, attempt=3)
+
+
 @pytest.mark.parametrize("patch", [
     {"question": None}, {"explanation": None}, {"grading_criteria": None},
     {"correct_answer": None}, {"question": ["a"]}, {"difficulty": 3},

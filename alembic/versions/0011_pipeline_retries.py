@@ -1,4 +1,4 @@
-"""add resources.attempts/retry_after and chunks.quiz_attempt (issue #27)
+"""add resources.attempts/retry_after and quiz_attempts (issue #27)
 
 Revision ID: 0011
 Revises: 0010_retry_drive_files
@@ -18,7 +18,14 @@ def upgrade() -> None:
                                          server_default="0"))
     op.add_column("resources", sa.Column("retry_after", sa.DateTime(timezone=True),
                                          nullable=True))
-    op.add_column("chunks", sa.Column("quiz_attempt", sa.Integer(), nullable=True))
+    # every (chunk, attempt) quiz generation that ran, including empty ones
+    op.create_table(
+        "quiz_attempts",
+        sa.Column("chunk_id", sa.Uuid(), nullable=False),
+        sa.Column("attempt", sa.Integer(), nullable=False),
+        sa.ForeignKeyConstraint(["chunk_id"], ["chunks.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("chunk_id", "attempt"),
+    )
     # Chunking used to fail a resource on its first empty reply, often a
     # truncated one; give those the bounded retries chunking now gets.
     op.execute(
@@ -28,6 +35,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("chunks", "quiz_attempt")
+    op.drop_table("quiz_attempts")
     op.drop_column("resources", "retry_after")
     op.drop_column("resources", "attempts")

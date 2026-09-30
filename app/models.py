@@ -103,9 +103,17 @@ class Chunk(SQLModel, table=True):
     order: int = Field(default=0)
     start_char: Optional[int] = Field(default=None)
     end_char: Optional[int] = Field(default=None)
-    # last quiz attempt generated for this chunk, even one that yielded no
-    # items, so a chunk with nothing quizzable isn't re-billed every run
-    quiz_attempt: Optional[int] = Field(default=None)
+
+
+class QuizAttempt(SQLModel, table=True):
+    """A quiz generation that ran for (chunk, attempt), even one that yielded
+    no items, so a chunk with nothing quizzable isn't re-billed every run."""
+
+    __tablename__ = "quiz_attempts"
+
+    chunk_id: uuid.UUID = Field(foreign_key="chunks.id", primary_key=True,
+                                ondelete="CASCADE")
+    attempt: int = Field(primary_key=True)
 
 
 class QuizItem(SQLModel, table=True):

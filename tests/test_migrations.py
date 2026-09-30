@@ -155,7 +155,7 @@ def test_0011_adds_retry_columns_and_requeues_empty_chunkings(engine):
     with engine.begin() as c:  # the schema as of 0010
         c.execute(text("ALTER TABLE resources DROP COLUMN attempts"))
         c.execute(text("ALTER TABLE resources DROP COLUMN retry_after"))
-        c.execute(text("ALTER TABLE chunks DROP COLUMN quiz_attempt"))
+        c.execute(text("DROP TABLE quiz_attempts"))
         for sid, error in [("empty", "chunker produced no chunks"),
                            ("other", "unsupported type (mime=?, file=?)")]:
             c.execute(text(
@@ -166,6 +166,6 @@ def test_0011_adds_retry_columns_and_requeues_empty_chunkings(engine):
     with engine.connect() as c:
         got = {r[0]: tuple(r[1:]) for r in c.execute(text(
             "SELECT source_id, status, error, attempts, retry_after FROM resources"))}
-        c.execute(text("SELECT quiz_attempt FROM chunks"))
+        c.execute(text("SELECT chunk_id, attempt FROM quiz_attempts"))
     assert got == {"empty": ("extracted", None, 0, None),
                    "other": ("failed", "unsupported type (mime=?, file=?)", 0, None)}

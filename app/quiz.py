@@ -8,7 +8,7 @@ Guardrails (from plan):
 - Difficulty tagged recall|application|synthesis (feeds scheduler).
 - Idempotent: generation_key = chunk_id + attempt. A retried call after a
   timeout returns existing rows instead of duplicating them, and
-  Chunk.quiz_attempt marks an attempt done even when it yielded no items.
+  a QuizAttempt row marks each attempt done even when it yielded no items.
 - Model output is untrusted: a malformed item is dropped, not the chunk.
 """
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from app.llm import LLMClient
-from app.models import Chunk, QuizItem
+from app.models import QuizAttempt, QuizItem
 from sqlalchemy import or_
 
 SYSTEM = """You write quiz questions testing study material the lecturer covered.
@@ -107,7 +107,7 @@ def generate_for_chunk(
             QuizItem.chunk_id == chunk.id, _key_matches(QuizItem.generation_key, key)
         )
     ).all()
-    if existing or chunk.quiz_attempt == attempt:
+    if existing or session.get(QuizAttempt, (chunk.id, attempt)) is not None:
         return list(existing)
     data = llm.complete_json(
         SYSTEM, f"Write quiz questions for this study material:\n\n{chunk.content}",
@@ -122,15 +122,13 @@ def generate_for_chunk(
                        generation_key=key if single else f"{key}:{i}")
         session.add(row)
         created.append(row)
-    chunk.quiz_attempt = attempt
-    session.add(chunk)
+    session.add(QuizAttempt(chunk_id=chunk.id, attempt=attempt))
     session.commit()
     return created
 
 
 def chunk_needs_quiz(session: Session, chunk_id, attempt: int = 1) -> bool:
-    chunk = session.get(Chunk, chunk_id)
-    if chunk is not None and chunk.quiz_attempt == attempt:
+    if session.get(QuizAttempt, (chunk_id, attempt)) is not None:
         return False  # tried, even if nothing was quizzable
     key = f"{chunk_id}:{attempt}"
     return not session.exec(
