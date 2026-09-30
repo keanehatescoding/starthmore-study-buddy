@@ -4,6 +4,11 @@ Authenticated: current_user is overridden to a fixture user, so web tests
 exercise the owned-data paths. Auth flow itself is tested in test_auth.py.
 """
 
+import os
+
+# settings are read at import: the public default SECRET_KEY needs DEV=1
+os.environ.setdefault("DEV", "1")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
@@ -12,6 +17,7 @@ from sqlmodel import Session, SQLModel, create_engine
 from app.db import get_session
 from app.main import app, current_user
 from app.models import User
+from app.security import hit_table
 
 
 @pytest.fixture()
@@ -39,6 +45,7 @@ def testapp():
 
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[current_user] = override_user
+    hit_table(app, "moodle_login_hits").clear()  # app is shared across tests
     yield {"client": TestClient(app), "Session": lambda: Session(engine),
            "user_id": user_id}
     app.dependency_overrides.clear()

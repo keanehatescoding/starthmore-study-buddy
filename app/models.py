@@ -21,6 +21,8 @@ class User(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     google_refresh_token: Optional[str] = Field(default=None)
     moodle_token: Optional[str] = Field(default=None)
+    # bumped to revoke every session: sessions carry the value they began with
+    session_version: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
     created_at: datetime = Field(
         default_factory=_utcnow, sa_column=Column(DateTime(timezone=True), nullable=False)
     )

@@ -120,13 +120,24 @@ Backups (nightly pg_dump, 14-day retention):
   for platform restart decisions.
 - Sign-in is limited by `ALLOWED_EMAILS` (default `@strathmore.edu`): a
   comma-separated mix of exact addresses and `@domain` entries. Anyone else
-  gets 403 at the callback. Set it to your address for personal-tool mode,
-  or to an empty value to admit any Google account.
+  is sent back to `/login` with an explanation. Set it to your address for
+  personal-tool mode, or to an empty value to admit any Google account.
+  Removing an address ends that account's existing sessions on its next
+  request.
+- Sessions last `SESSION_MAX_AGE` seconds without use (default 7 days).
+  Logging out ends the session server-side, so a copied cookie stops
+  working too; `python -m app.admin_cli revoke-sessions EMAIL` signs an
+  account out on every device (e.g. after a lost laptop).
+- Moodle password sign-in (`/settings/moodle`) is limited to 5 attempts per
+  15 minutes per account and per Moodle username, so it can't be used to
+  guess another student's password. Like the POST limit, it is per-process.
 - Cron observability: set `HEALTHCHECK_PING_URL` (e.g. a healthchecks.io
   check) — the worker pings it after every successful pass, so a silent
   6am failure pages you instead of showing up as missing quizzes.
 - Web UI requires Google sign-in (`/login`). Generate a real secret:
-  `openssl rand -hex 32` → `SECRET_KEY`. Set `SESSION_SECURE_COOKIE=true`
+  `openssl rand -hex 32` → `SECRET_KEY`. Every service refuses to start
+  with the public default key unless `DEV=1` is set, which is for local
+  development only — never set it on a server. Set `SESSION_SECURE_COOKIE=true`
   behind HTTPS. The Google OAuth consent screen must list your production
   origin as an authorized redirect (`.../auth/callback`).
 - Never commit `.env` (gitignored). Rotate Moodle/Google credentials if exposed.

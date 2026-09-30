@@ -175,6 +175,51 @@ def test_connect_with_password_stores_encrypted_and_enqueues(testapp, monkeypatc
         assert [j.payload["user_email"] for j in jobs] == ["test@x.edu"]
 
 
+def test_moodle_password_attempts_are_limited(testapp, monkeypatch):
+    # the form checks passwords against Moodle: without a tight limit it is
+    # a password-guessing oracle for other students' accounts
+    from app.main import app
+
+    client = testapp["client"]
+    tried = []
+
+    def wrong_password(base, username, password):
+        tried.append((username, password))
+        raise MoodleError("Invalid login, please try again")
+
+    monkeypatch.setattr(moodle_tokens, "fetch_token", wrong_password)
+    app.state.moodle_login_limit = (3, 900)
+    try:
+        for guess in ("a", "b", "c", "d"):
+            resp = client.post("/settings/moodle/login", data={
+                "csrf_token": _csrf(client), "username": "victim", "password": guess,
+            })
+        assert "Too many Moodle sign-in attempts" in resp.text
+        assert [p for _, p in tried] == ["a", "b", "c"]
+        # also per account: other usernames don't reset the budget
+        client.post("/settings/moodle/login", data={
+            "csrf_token": _csrf(client), "username": "someone-else", "password": "e",
+        })
+        assert len(tried) == 3
+    finally:
+        del app.state.moodle_login_limit
+
+
+def test_moodle_username_limit_spans_accounts(testapp, monkeypatch):
+    from starlette.requests import Request
+
+    from app.main import _moodle_login_wait, app
+
+    app.state.moodle_login_limit = (2, 900)
+    try:
+        request = Request({"type": "http", "app": app})
+        for n in range(2):
+            assert _moodle_login_wait(request, User(email=f"u{n}@x.edu"), "Victim") is None
+        assert _moodle_login_wait(request, User(email="u9@x.edu"), "victim") is not None
+    finally:
+        del app.state.moodle_login_limit
+
+
 def test_rejected_token_is_not_saved(testapp, monkeypatch):
     client = testapp["client"]
 

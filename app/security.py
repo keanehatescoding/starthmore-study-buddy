@@ -86,12 +86,13 @@ class HitTable:
         return None
 
 
-def hit_table(app) -> HitTable:
-    """The app's hit table. Lives on app.state so it dies with the app —
-    nothing accumulates at class level across reloads or test apps."""
-    table = getattr(app.state, "rate_limit_hits", None)
+def hit_table(app, name: str = "rate_limit_hits") -> HitTable:
+    """The app's hit table `name`. Lives on app.state so it dies with the
+    app — nothing accumulates at class level across reloads or test apps."""
+    table = getattr(app.state, name, None)
     if table is None:
-        table = app.state.rate_limit_hits = HitTable()
+        table = HitTable()
+        setattr(app.state, name, table)
     return table
 
 

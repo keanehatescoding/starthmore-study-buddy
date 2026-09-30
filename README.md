@@ -30,7 +30,7 @@ Requirements: Python 3.11–3.13, podman or docker.
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e .
-cp .env.example .env   # fill in MOODLE_TOKEN etc.
+cp .env.example .env   # fill in MOODLE_TOKEN etc.; uncomment DEV=1 (or set SECRET_KEY)
 podman-compose up -d db
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --port 8000
@@ -62,6 +62,8 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_TO` | Notifications (Resend free tier) |
 | `APP_BASE_URL` | Public origin for links in emails (default `http://localhost:8000`) |
 | `TIMEZONE` | IANA zone for study days: streaks start at local midnight (default `Africa/Nairobi`) |
+| `SECRET_KEY`, `DEV` | Signs sessions and encrypts stored tokens; the public default is refused unless `DEV=1` (local only) |
+| `SESSION_MAX_AGE` | Seconds a sign-in lasts without use (default 7 days) |
 
 ## Layout
 

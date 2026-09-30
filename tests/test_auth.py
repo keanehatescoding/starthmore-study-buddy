@@ -196,12 +196,19 @@ def test_default_secret_key_rejected_in_prod(monkeypatch):
 
     monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
     monkeypatch.delenv("RAILWAY_ENVIRONMENT_NAME", raising=False)
-    Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY)  # dev is fine
+    monkeypatch.delenv("DEV", raising=False)
+    # a plain VPS deploy: nothing says "production", but the key is public
+    with pytest.raises(ValidationError, match="DEV=1"):
+        Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY)
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY, session_secure_cookie=True)
+        Settings(_env_file=None, secret_key="")
+    Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY, dev=True)  # explicit dev
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY, dev=True,
+                 session_secure_cookie=True)
     monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY)
+        Settings(_env_file=None, secret_key=INSECURE_SECRET_KEY, dev=True)
     Settings(_env_file=None, secret_key="a-real-random-value")
 
 
@@ -234,17 +241,12 @@ def test_cross_user_isolation(testapp):
     assert "Other course" not in client.get("/").text
 
 
-def _callback_client(email: str, monkeypatch):
+def _callback_client(email: str, monkeypatch, **session_data):
     """TestClient with a signed session holding oauth_state + mocked Google."""
-    import json
-    from base64 import b64encode
-
-    import itsdangerous
     from fastapi.testclient import TestClient
     from sqlalchemy.pool import StaticPool
     from sqlmodel import Session, SQLModel, create_engine
 
-    from app.config import settings
     from app.db import get_session
 
     engine = create_engine(
@@ -264,10 +266,23 @@ def _callback_client(email: str, monkeypatch):
     )
     monkeypatch.setattr(auth_mod, "fetch_email", lambda tok: email)
     client = TestClient(app, follow_redirects=False)
-    signer = itsdangerous.TimestampSigner(str(settings.secret_key))
-    raw = b64encode(json.dumps({"oauth_state": "s1"}).encode()).decode()
-    client.cookies.set("session", signer.sign(raw).decode())
+    _set_session_cookie(client, _signed_session({"oauth_state": "s1", **session_data}))
     return client
+
+
+def _signed_session(data: dict) -> str:
+    import json
+    from base64 import b64encode
+
+    import itsdangerous
+
+    signer = itsdangerous.TimestampSigner(str(settings.secret_key))
+    return signer.sign(b64encode(json.dumps(data).encode()).decode()).decode()
+
+
+def _set_session_cookie(client, value: str) -> None:
+    # the domain the app's own Set-Cookie uses, so the two don't coexist
+    client.cookies.set("session", value, domain="testserver.local")
 
 
 def test_allowlist_blocks_stranger(monkeypatch):
@@ -277,7 +292,7 @@ def test_allowlist_blocks_stranger(monkeypatch):
     client = _callback_client("stranger@x.com", monkeypatch)
     try:
         r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
-        assert r.status_code == 403
+        _assert_login_failed(client, r, "stranger@x.com isn")
     finally:
         app.dependency_overrides.clear()
 
@@ -328,7 +343,7 @@ def test_domain_allowlist_blocks_outsider_at_callback(monkeypatch):
     client = _callback_client("someone@gmail.com", monkeypatch)
     try:
         r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
-        assert r.status_code == 403
+        _assert_login_failed(client, r, "use your university account")
     finally:
         app.dependency_overrides.clear()
 
@@ -381,3 +396,187 @@ def test_enqueue_sync_once_skips_while_one_is_active():
         s.add(first)
         s.commit()
         assert enqueue_sync_once(s, "classroom", "a@x.edu") is not None
+
+
+def _session_data(client) -> dict:
+    import json
+    from base64 import b64decode
+
+    import itsdangerous
+
+    cookie = client.cookies.get("session")
+    if cookie is None:  # an emptied session deletes its cookie
+        return {}
+    signer = itsdangerous.TimestampSigner(str(settings.secret_key))
+    return json.loads(b64decode(signer.unsign(cookie)))
+
+
+def _assert_login_failed(client, response, message: str):
+    """Redirected to /login, the reason shown there, and not signed in."""
+    assert response.status_code == 303 and response.headers["location"] == "/login"
+    page = client.get("/login")
+    assert page.status_code == 200 and message.lower() in page.text.lower()
+    assert "user_id" not in _session_data(client)
+    assert client.get("/").headers["location"] == "/login"
+
+
+def test_callback_google_error_redirects_to_login(monkeypatch):
+    client = _callback_client("owner@x.edu", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"error": "access_denied", "state": "s1"})
+        _assert_login_failed(client, r, "sign-in was cancelled")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_callback_expired_code_redirects_to_login(monkeypatch):
+    # Google rejects an expired or already-used code: that was a 500
+    def rejected(*a):
+        raise auth_mod.AuthError("token exchange failed: HTTP Error 400: invalid_grant")
+
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("owner@x.edu", monkeypatch)
+    monkeypatch.setattr(auth_mod, "exchange_code", rejected)
+    try:
+        r = client.get("/auth/callback", params={"code": "used", "state": "s1"})
+        _assert_login_failed(client, r, "didn&#39;t complete")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_callback_without_access_token_redirects_to_login(monkeypatch):
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("owner@x.edu", monkeypatch)
+    monkeypatch.setattr(auth_mod, "exchange_code", lambda *a: {"error": "invalid_grant"})
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        _assert_login_failed(client, r, "didn&#39;t complete")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_callback_bad_state_redirects_to_login(monkeypatch):
+    client = _callback_client("owner@x.edu", monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "forged"})
+        _assert_login_failed(client, r, "link expired")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _signed_in_client(monkeypatch, email="owner@x.edu", **session_data):
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client(email, monkeypatch, **session_data)
+    r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+    assert r.status_code == 303 and r.headers["location"] == "/"
+    assert client.get("/").status_code == 200
+    return client
+
+
+def test_login_starts_a_fresh_session(monkeypatch):
+    # a CSRF token (or anything else) planted before sign-in must not survive it
+    try:
+        client = _signed_in_client(monkeypatch, csrf_token="planted", flash={"x": 1})
+        data = _session_data(client)
+        assert data.get("csrf_token") != "planted" and "flash" not in data
+        assert set(data) >= {"user_id", "session_version"}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _csrf(client) -> str:
+    import re
+
+    return re.search(r'name="csrf_token" value="([^"]+)"', client.get("/").text).group(1)
+
+
+def test_logout_revokes_copies_of_the_session(monkeypatch):
+    try:
+        client = _signed_in_client(monkeypatch)
+        stolen = client.cookies["session"]
+        stolen_csrf = _session_data(client)["csrf_token"]
+        r = client.post("/logout", data={"csrf_token": _csrf(client)})
+        assert r.status_code == 303
+        thief = TestClient(app, follow_redirects=False)
+        _set_session_cookie(thief, stolen)
+        assert thief.get("/").headers["location"] == "/login"
+        # signed in again; the dead copy must not be able to keep revoking
+        _set_session_cookie(client, _signed_session({"oauth_state": "s1"}))
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 303 and client.get("/").status_code == 200
+        _set_session_cookie(thief, stolen)
+        r = thief.post("/logout", data={"csrf_token": stolen_csrf})
+        assert r.status_code == 303  # passed CSRF, but revoked nothing
+        assert client.get("/").status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_removed_from_allowlist_ends_session(monkeypatch):
+    try:
+        client = _signed_in_client(monkeypatch, email="leaver@x.edu")
+        monkeypatch.setattr(settings, "allowed_emails", "@strathmore.edu")
+        r = client.get("/")
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        assert "user_id" not in _session_data(client)
+        assert client.get("/login").status_code == 200  # no redirect loop
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_revoke_sessions_ends_existing_sessions(monkeypatch):
+    from app.db import get_session
+
+    try:
+        client = _signed_in_client(monkeypatch)
+        with next(app.dependency_overrides[get_session]()) as s:
+            auth_mod.revoke_sessions(s, auth_mod.find_user(s, "owner@x.edu"))
+        assert client.get("/").headers["location"] == "/login"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overlapping_revocations_both_count(tmp_path):
+    # two revocations load the same session_version N; a read-modify-write
+    # would leave N+1 and keep alive a cookie issued between the commits
+    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(User(email="owner@x.edu"))
+        s.commit()
+    with Session(engine) as a, Session(engine) as b:
+        user_a = auth_mod.find_user(a, "owner@x.edu")
+        user_b = auth_mod.find_user(b, "owner@x.edu")
+        assert user_a.session_version == user_b.session_version == 0
+        auth_mod.revoke_sessions(a, user_a)
+        auth_mod.revoke_sessions(b, user_b)
+    with Session(engine) as s:
+        assert auth_mod.find_user(s, "owner@x.edu").session_version == 2
+
+
+def test_session_has_explicit_max_age():
+    from starlette.middleware.sessions import SessionMiddleware
+
+    mw = next(m for m in app.user_middleware if m.cls is SessionMiddleware)
+    assert mw.kwargs["max_age"] == settings.session_max_age == 7 * 24 * 3600
+
+
+def test_concurrent_first_sign_in_updates_the_winner(monkeypatch):
+    # two first logins race: both miss the lookup, the loser's INSERT hits
+    # the unique email constraint; it must update the winner's row, not 500
+    real_find = auth_mod.find_user
+    calls = []
+
+    def racing_find(session, email):
+        calls.append(email)
+        if len(calls) == 1:
+            session.add(User(email=email))  # the other request's row
+            session.commit()
+            return None
+        return real_find(session, email)
+
+    with _memory_session() as s:
+        monkeypatch.setattr(auth_mod, "find_user", racing_find)
+        user = auth_mod.sign_in(s, "race@x.edu", refresh_token="rt")
+        assert len(s.exec(select(User)).all()) == 1
+        assert auth_mod.refresh_token_for(user) == "rt" and len(calls) == 2
