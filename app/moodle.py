@@ -176,7 +176,8 @@ class MoodleAdapter:
         return topics
 
     def _page_text(self, course_source_id: str, module_id: int) -> str | None:
-        """Best-effort page content. Returns None if the function isn't allowed."""
+        """Best-effort page content. None when it couldn't be fetched this run
+        (function not allowed, request failed, page missing from the reply)."""
         if course_source_id not in self._pages:
             try:
                 pages = self.client.call(
@@ -243,11 +244,9 @@ class MoodleAdapter:
                         type="page_text",
                         title=mod.get("name", "Page"),
                         raw_url=(mod.get("url")),
+                        # no text -> no hash: sync keeps what it has instead of
+                        # treating an outage as an edit that purges progress
                         text=text,
-                        content_bytes=(
-                            None if text is not None
-                            else f"page:{mod['id']}".encode()
-                        ),
                     )
                 )
             elif modname == "resource":

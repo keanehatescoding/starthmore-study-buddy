@@ -409,3 +409,59 @@ def test_old_copy_with_progress_wins_over_empty_destination_copy(session, user_i
     assert kept.id == old.id and kept.topic_id == t2.id  # moved into the destination
     assert [c.title for c in session.exec(select(Chunk)).all()] == ["old"]
     assert len(session.exec(select(ReviewState)).all()) == 1
+
+
+class _PagesDown(FakeMoodleClient):
+    """Course contents load, but the page API fails (timeout, 5xx, ...)."""
+
+    def call(self, function, **params):
+        from app.moodle import MoodleError
+
+        self.calls.append(function)
+        raise MoodleError(f"{function} request failed: timed out")
+
+
+class _PageMissing(FakeMoodleClient):
+    def call(self, function, **params):
+        self.calls.append(function)
+        return {"pages": []}
+
+
+def _progress(session):
+    return tuple(len(session.exec(select(m)).all()) for m in (Chunk, QuizItem, ReviewState))
+
+
+@pytest.mark.parametrize("broken", [_PagesDown, _PageMissing])
+def test_page_fetch_failure_keeps_content_and_progress(session, user_id, broken):
+    from app.moodle import MoodleAdapter
+
+    sync_all(session, MoodleAdapter(FakeMoodleClient()), user_id)
+    page = _resource(session, "11")
+    page.status = "chunked"
+    session.add(page)
+    session.commit()
+    _derive(session, page, user_id, "page")
+    digest = page.content_hash
+    stats = sync_all(session, MoodleAdapter(broken()), user_id)["5"]
+    assert _progress(session) == (1, 1, 1)
+    page = _resource(session, "11")
+    assert (page.extracted_text, page.status, page.content_hash) == ("page 11", "chunked", digest)
+    assert stats.resources_updated == 0
+    # a real edit afterwards still resets the page
+    client = FakeMoodleClient()
+    client.call = lambda function, **p: {"pages": [{"coursemodule": 11, "content": "v2"}]}
+    sync_all(session, MoodleAdapter(client), user_id)
+    assert _progress(session) == (0, 0, 0)
+    assert _resource(session, "11").extracted_text == "v2"
+
+
+def test_page_first_seen_during_outage_is_filled_in_later(session, user_id):
+    from app.moodle import MoodleAdapter
+
+    sync_all(session, MoodleAdapter(_PagesDown()), user_id)
+    page = _resource(session, "11")
+    assert (page.extracted_text, page.content_hash, page.status) == (None, None, "pending")
+    sync_all(session, MoodleAdapter(FakeMoodleClient()), user_id)
+    page = _resource(session, "11")
+    assert (page.extracted_text, page.status) == ("page 11", "extracted")
+    assert page.content_hash is not None
