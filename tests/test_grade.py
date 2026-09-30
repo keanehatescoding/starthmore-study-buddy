@@ -292,6 +292,31 @@ def test_daily_new_item_cap(setup, monkeypatch):
     assert due_count(s, user.id) == 4  # mcq + 3 new
 
 
+@pytest.mark.parametrize("same_item", [True, False])
+def test_concurrent_new_item_rechecked_under_user_lock(setup, monkeypatch, same_item):
+    s, user, mcq, short = setup
+    if not same_item:  # same item: the post-lock state re-read rejects it, cap or not
+        monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 1)
+    llm = ReplyLLM({"correct": True, "partial_credit": 1.0})
+    original = grade._lock_user
+
+    def racing(session, user_id):
+        # another request took the last slot while this one waited on the lock
+        monkeypatch.setattr(grade, "_lock_user", original)
+        with Session(s.get_bind()) as other:
+            if same_item:
+                submit_answer(other, user.id, short.id, "because", llm)
+            else:
+                submit_answer(other, user.id, mcq.id, "1")
+        original(session, user_id)
+
+    monkeypatch.setattr(grade, "_lock_user", racing)
+    with pytest.raises(NotDue):
+        submit_answer(s, user.id, short.id, "because", llm)
+    assert llm.calls == (1 if same_item else 0)  # the loser never graded
+    assert len(s.exec(select(ReviewState)).all()) == 1
+
+
 def test_new_item_past_daily_cap_rejected(setup, monkeypatch):
     s, user, mcq, short = setup
     monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 1)

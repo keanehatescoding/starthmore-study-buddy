@@ -21,7 +21,7 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
-from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic
+from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 from app.srs import (
     PASS_CREDIT, initial_ease_factor, next_interval_days, partial_credit_to_quality, verdict,
 )
@@ -138,13 +138,20 @@ def _ensure_state(session: Session, user_id, item: QuizItem, now: datetime) -> N
     )
 
 
+def _lock_user(session: Session, user_id) -> None:
+    """Row-lock the user until commit/rollback, serializing their new-item
+    submits so each sees the others' spent daily slots."""
+    session.exec(select(User.id).where(User.id == user_id).with_for_update()).one()
+
+
 def submit_answer(
     session: Session, user_id, quiz_item_id, answer: str, llm: LLMClient | None = None
 ) -> dict:
     """Grade an answer and advance the SM-2 schedule. Returns the outcome.
 
     Raises NotDue if the item isn't due, checked before grading (no LLM call
-    for a replay) and again under a row lock before the schedule moves.
+    for a replay) and again under a row lock before the schedule moves. A new
+    item is also held to the daily cap, checked under a user-row lock.
     """
     item = session.get(QuizItem, quiz_item_id)
     if item is None:
@@ -153,10 +160,17 @@ def submit_answer(
         raise InvalidAnswer(f"Answers are limited to {MAX_ANSWER_CHARS:,} characters.")
     now = datetime.now(timezone.utc)
     state = session.exec(_state_query(user_id, item.id)).first()
+    if state is None:
+        # A first answer spends a daily slot, but first_answered_at only lands
+        # at commit. Hold the user lock through commit (grading included) so
+        # concurrent new-item submits can't overspend the last slot or both
+        # pay for an LLM call; re-read what a submit we waited on committed.
+        _lock_user(session, user_id)
+        state = session.exec(_state_query(user_id, item.id)).first()
+        if state is None and _new_allowance(session, user_id, now) <= 0:
+            raise NotDue(quiz_item_id)  # a new item past today's cap isn't in the queue
     if not _is_due(state, now):
         raise NotDue(quiz_item_id)
-    if state is None and _new_allowance(session, user_id, now) <= 0:
-        raise NotDue(quiz_item_id)  # a new item past today's cap isn't in the queue
 
     if item.question_type == "mcq":
         partial = grade_mcq(item, answer)
