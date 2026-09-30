@@ -314,6 +314,7 @@ def sync_course(
             meta = {"title": r.title, "raw_url": r.raw_url, "type": r.type,
                     "mime_type": r.mime_type}
             meta_changed = any(getattr(existing, k) != v for k, v in meta.items())
+            # no digest = content unknown this run (e.g. fetch failed): keep it
             hash_changed = digest is not None and existing.content_hash != digest
             if (hash_changed and digest.startswith(FINGERPRINT_PREFIX)
                     and existing.content_hash
