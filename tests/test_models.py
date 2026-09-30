@@ -23,6 +23,7 @@ from app.srs import (
     initial_ease_factor,
     next_interval_days,
     partial_credit_to_quality,
+    verdict,
 )
 
 
@@ -95,10 +96,16 @@ def test_generation_key_idempotent(session: Session):
 def test_quality_mapping():
     assert partial_credit_to_quality(1.0) == 5
     assert partial_credit_to_quality(0.0) == 0
-    assert partial_credit_to_quality(0.5) in (2, 3)  # round(2.5) == 2 (banker's)
     assert partial_credit_to_quality(0.8) == 4
     assert partial_credit_to_quality(2.0) == 5  # clamped
     assert partial_credit_to_quality(-1.0) == 0  # clamped
+
+
+@pytest.mark.parametrize("credit", [0.0, 0.1, 0.29, 0.3, 0.5, 0.55, 0.59, 0.6, 0.61, 0.7,
+                                    0.8, 0.9, 1.0])
+def test_quality_agrees_with_verdict(credit):
+    # a pass is scheduled exactly when it's shown as correct
+    assert (partial_credit_to_quality(credit) >= 3) == (verdict(credit) == "correct")
 
 
 def test_sm2_steps():

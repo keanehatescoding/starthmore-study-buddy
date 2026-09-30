@@ -216,3 +216,13 @@ def test_run_quiz_aborts_on_quota():
         result = run_quiz(s, DeadLLM(), pace=0)
         assert result.quota_exhausted is True
         assert result.counts["items"] == 0 and DeadLLM.calls == 1  # stopped, not ground through
+
+
+def test_max_attempts_bounds_retries_and_backoff(monkeypatch):
+    slept = []
+    monkeypatch.setattr("time.sleep", slept.append)
+    _, calls = _client(monkeypatch, [_http_error(503, "120")] * 5)
+    client = LLMClient("https://x/v1", "key", "m", timeout=30, max_attempts=2, max_backoff=5)
+    with pytest.raises(LLMError, match="after retries"):
+        client.complete_json("s", "u")
+    assert len(calls) == 2 and slept == [5]

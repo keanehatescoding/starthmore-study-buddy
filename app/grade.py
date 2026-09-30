@@ -7,18 +7,27 @@
   (partial_credit_to_quality), then ReviewState advances via srs.next_interval_days.
 - ReviewState rows are created lazily on first answer; items without one
   count as due immediately (equivalent to next_review_date = now at creation).
+- Only due items can be answered: a replayed or concurrent submit is rejected
+  (NotDue) instead of advancing the schedule twice.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime, time, timedelta, timezone
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic
-from app.srs import initial_ease_factor, next_interval_days, partial_credit_to_quality
+from app.srs import (
+    PASS_CREDIT, initial_ease_factor, next_interval_days, partial_credit_to_quality, verdict,
+)
+
+MAX_ANSWER_CHARS = 4000
+NEW_ITEMS_PER_DAY = 20
 
 GRADE_SYSTEM = """You grade a student's short answer leniently on phrasing.
 You are given the question, a reference answer, and the key points a correct
@@ -32,6 +41,15 @@ def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def _flag(value) -> bool | None:
+    """A JSON boolean, tolerating "true"/"false" strings (bool("false") is True)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
 def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
     data = llm.complete_json(
         GRADE_SYSTEM,
@@ -40,20 +58,29 @@ def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
         temperature=0.0,
     )
     try:
-        partial = float(data.get("partial_credit", 0.0))
-    except (TypeError, ValueError):
-        partial = 0.0
+        partial = float(data["partial_credit"])
+    except (KeyError, TypeError, ValueError):
+        partial = None
+    if partial is None or partial != partial:  # missing, garbage or NaN
+        # fall back to the grader's verdict instead of scoring it a lapse
+        partial = 1.0 if _flag(data.get("correct")) else 0.0
     partial = min(1.0, max(0.0, partial))
     feedback = str(data.get("feedback") or "").strip() or "No feedback provided."
     return {
-        "correct": bool(data.get("correct", False)) or partial >= 0.6,
+        "correct": partial >= PASS_CREDIT,
         "partial_credit": partial,
         "feedback": feedback,
     }
 
 
 class InvalidAnswer(ValueError):
-    """The submitted answer can't be graded against this item (e.g. bad MCQ index)."""
+    """The submitted answer can't be graded against this item. The message is
+    shown to the student."""
+
+
+class NotDue(Exception):
+    """The item isn't due for this user (already answered, e.g. a replayed or
+    double submit), so grading it again would advance the schedule twice."""
 
 
 def _mcq_index(value: str, n_options: int) -> int | None:
@@ -64,29 +91,69 @@ def _mcq_index(value: str, n_options: int) -> int | None:
     return idx if 0 <= idx < n_options else None
 
 
+def _stored_mcq_index(value, n_options: int) -> int | None:
+    """The item's correct option. Older rows stored the model's raw value,
+    so accept "2.0" and "True"/"False" as well as "2"."""
+    text = str(value).strip()
+    if text in ("True", "False"):
+        return _mcq_index(str(int(text == "True")), n_options)
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return _mcq_index(str(int(number)), n_options) if number.is_integer() else None
+
+
 def grade_mcq(item: QuizItem, answer: str) -> float:
     n = len(item.options or [])
     chosen = _mcq_index(answer, n)
     if chosen is None:
-        raise InvalidAnswer(f"answer must be an option index 0-{n - 1}")
-    return 1.0 if chosen == _mcq_index(item.correct_answer, n) else 0.0
+        raise InvalidAnswer("Pick one of the listed options.")
+    return 1.0 if chosen == _stored_mcq_index(item.correct_answer, n) else 0.0
 
 
-def _verdict(partial: float) -> str:
-    if partial >= 0.6:
-        return "correct"
-    if partial >= 0.3:
-        return "partial"
-    return "incorrect"
+def _is_due(state: ReviewState | None, now: datetime) -> bool:
+    return state is None or _aware(state.next_review_date) <= now
+
+
+def _state_query(user_id, item_id):
+    return select(ReviewState).where(
+        ReviewState.user_id == user_id, ReviewState.quiz_item_id == item_id
+    )
+
+
+def _ensure_state(session: Session, user_id, item: QuizItem, now: datetime) -> None:
+    """Create the user's ReviewState for this item unless one exists. ON
+    CONFLICT DO NOTHING, so two concurrent first answers can't both insert
+    and 500 on uq_review_user_item."""
+    dialect = {"postgresql": postgresql, "sqlite": sqlite}[session.get_bind().dialect.name]
+    session.exec(
+        dialect.insert(ReviewState)
+        .values(
+            id=uuid.uuid4(), user_id=user_id, quiz_item_id=item.id,
+            ease_factor=initial_ease_factor(item.difficulty), interval_days=0,
+            next_review_date=now, repetitions=0, lapses=0,
+        )
+        .on_conflict_do_nothing(index_elements=["user_id", "quiz_item_id"])
+    )
 
 
 def submit_answer(
     session: Session, user_id, quiz_item_id, answer: str, llm: LLMClient | None = None
 ) -> dict:
-    """Grade an answer and advance the SM-2 schedule. Returns the outcome."""
+    """Grade an answer and advance the SM-2 schedule. Returns the outcome.
+
+    Raises NotDue if the item isn't due, checked before grading (no LLM call
+    for a replay) and again under a row lock before the schedule moves.
+    """
     item = session.get(QuizItem, quiz_item_id)
     if item is None:
         raise ValueError(f"quiz item {quiz_item_id} not found")
+    if len(answer) > MAX_ANSWER_CHARS:
+        raise InvalidAnswer(f"Answers are limited to {MAX_ANSWER_CHARS:,} characters.")
+    if not _is_due(session.exec(_state_query(user_id, item.id)).first(),
+                   datetime.now(timezone.utc)):
+        raise NotDue(quiz_item_id)
 
     if item.question_type == "mcq":
         partial = grade_mcq(item, answer)
@@ -98,34 +165,36 @@ def submit_answer(
         partial, feedback = graded["partial_credit"], graded["feedback"]
 
     quality = partial_credit_to_quality(partial)
-    state = session.exec(
-        select(ReviewState).where(
-            ReviewState.user_id == user_id, ReviewState.quiz_item_id == item.id
-        )
-    ).first()
     now = datetime.now(timezone.utc)
-    if state is None:
-        state = ReviewState(
-            user_id=user_id, quiz_item_id=item.id,
-            ease_factor=initial_ease_factor(item.difficulty),
-            interval_days=0, next_review_date=now,
-        )
+    _ensure_state(session, user_id, item, now)
+    # Serialize concurrent submits: the loser waits here, then sees the
+    # winner's future next_review_date and is rejected.
+    state = session.exec(
+        _state_query(user_id, item.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).one()
+    if not _is_due(state, now):
+        session.rollback()
+        raise NotDue(quiz_item_id)
     interval, reps, ease = next_interval_days(
         quality, state.repetitions, state.ease_factor, state.interval_days
     )
     state.interval_days = interval
     state.repetitions = reps
     state.ease_factor = ease
-    state.last_result = _verdict(partial)
+    state.last_result = verdict(partial)
     if quality < 3:
         state.lapses += 1
     state.next_review_date = now + timedelta(days=interval)
     state.answered_at = now
+    if state.first_answered_at is None:
+        state.first_answered_at = now
     session.add(state)
     session.commit()
     session.refresh(state)
     return {
-        "correct": partial >= 0.6,
+        "correct": partial >= PASS_CREDIT,
         "partial_credit": partial,
         "quality": quality,
         "feedback": feedback,
@@ -155,29 +224,57 @@ def user_owns_item(session: Session, user_id, item_id) -> bool:
     ).first() is not None
 
 
-def _due(user_id, now: datetime):
-    """Scoped items with no ReviewState for this user, or one that's come due."""
+def _new(user_id):
+    """Scoped items this user has never answered."""
     return scoped_items(user_id).outerjoin(
         ReviewState,
         and_(ReviewState.quiz_item_id == QuizItem.id, ReviewState.user_id == user_id),
-    ).where(or_(ReviewState.id.is_(None), ReviewState.next_review_date <= now))
+    ).where(ReviewState.id.is_(None))
+
+
+def _overdue(user_id, now: datetime):
+    """Scoped items whose ReviewState has come due."""
+    return scoped_items(user_id).join(
+        ReviewState,
+        and_(ReviewState.quiz_item_id == QuizItem.id, ReviewState.user_id == user_id),
+    ).where(ReviewState.next_review_date <= now)
+
+
+def _new_allowance(session: Session, user_id, now: datetime) -> int:
+    """New items still allowed today (UTC day) under NEW_ITEMS_PER_DAY."""
+    day_start = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+    started = session.exec(
+        select(func.count(ReviewState.id)).where(
+            ReviewState.user_id == user_id, ReviewState.first_answered_at >= day_start
+        )
+    ).one()
+    return max(0, NEW_ITEMS_PER_DAY - started)
 
 
 def due_items(session: Session, user_id, limit: int = 20) -> list[QuizItem]:
-    """Review queue: new items (no ReviewState) first, then most-overdue."""
+    """Review queue: most-overdue reviews first, then new items up to the
+    daily cap, so a backlog of new items can't starve reviews."""
     now = datetime.now(timezone.utc)
-    return list(session.exec(
-        _due(user_id, now)
-        .order_by(
-            ReviewState.id.is_not(None), ReviewState.next_review_date,
-            Topic.order, Chunk.order, QuizItem.generation_key,
-        )
+    items = list(session.exec(
+        _overdue(user_id, now)
+        .order_by(ReviewState.next_review_date, Topic.order, Chunk.order,
+                  QuizItem.generation_key)
         .limit(limit)
     ).all())
+    room = min(limit - len(items), _new_allowance(session, user_id, now))
+    if room > 0:
+        items += session.exec(
+            _new(user_id)
+            .order_by(Topic.order, Chunk.order, QuizItem.generation_key)
+            .limit(room)
+        ).all()
+    return items
 
 
 def due_count(session: Session, user_id) -> int:
     now = datetime.now(timezone.utc)
-    return session.exec(
-        _due(user_id, now).with_only_columns(func.count(QuizItem.id))
+    overdue = session.exec(
+        _overdue(user_id, now).with_only_columns(func.count(QuizItem.id))
     ).one()
+    new = session.exec(_new(user_id).with_only_columns(func.count(QuizItem.id))).one()
+    return overdue + min(new, _new_allowance(session, user_id, now))

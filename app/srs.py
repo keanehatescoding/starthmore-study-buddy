@@ -2,13 +2,31 @@
 scheduling stay in sync: grading returns partial_credit 0.0-1.0,
 SM-2 expects quality 0-5."""
 
+import math
 from datetime import datetime, timedelta, timezone
+
+# One pair of thresholds for both the verdict shown and the schedule: credit at
+# or above PASS_CREDIT is a pass (SM-2 quality >= 3), below it a lapse.
+PASS_CREDIT = 0.6
+PARTIAL_CREDIT = 0.3
 
 
 def partial_credit_to_quality(partial_credit: float) -> int:
-    """Map 0.0-1.0 grading signal to SM-2 quality 0-5. Clamps input."""
+    """Map 0.0-1.0 grading signal to SM-2 quality 0-5. Clamps input.
+
+    Floors each 0.2 band so quality >= 3 exactly when credit >= PASS_CREDIT
+    (round() is banker's rounding: 0.5 lapsed, 0.55 passed but showed "partial").
+    """
     clamped = min(1.0, max(0.0, partial_credit))
-    return round(clamped * 5)
+    return min(5, math.floor(round(clamped * 5, 9)))
+
+
+def verdict(partial_credit: float) -> str:
+    if partial_credit >= PASS_CREDIT:
+        return "correct"
+    if partial_credit >= PARTIAL_CREDIT:
+        return "partial"
+    return "incorrect"
 
 
 def initial_ease_factor(difficulty: str) -> float:

@@ -135,6 +135,10 @@ class ReviewState(SQLModel, table=True):
     answered_at: Optional[datetime] = Field(
         default=None, sa_column=Column(DateTime(timezone=True))
     )
+    # when the item left the "new" pool; feeds the daily new-item cap
+    first_answered_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
 
 
 class NotificationEvent(SQLModel, table=True):

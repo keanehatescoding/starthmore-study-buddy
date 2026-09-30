@@ -15,7 +15,9 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import auth as auth_mod
 from app.config import settings
 from app.db import get_session
-from app.grade import InvalidAnswer, due_count, due_items, submit_answer, user_owns_item
+from app.grade import (
+    MAX_ANSWER_CHARS, InvalidAnswer, NotDue, due_count, due_items, submit_answer, user_owns_item,
+)
 from app.llm import LLMClient, LLMError
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic, User
 from app.security import RateLimitMiddleware, SecurityHeadersMiddleware
@@ -284,6 +286,32 @@ def review_queue(
     )
 
 
+def _take_page(
+    request: Request, session: Session, user: User, item: QuizItem,
+    status_code: int = 200, **ctx,
+):
+    # the answered item is no longer due; an unanswered one still counts itself
+    remaining = due_count(session, user.id)
+    if not ctx.get("result"):
+        remaining = max(0, remaining - 1)
+    return templates.TemplateResponse(
+        request,
+        "take.html",
+        {
+            "item": item,
+            "remaining": remaining,
+            "result": None,
+            "error": None,
+            "answer": "",
+            "max_answer_chars": MAX_ANSWER_CHARS,
+            "csrf_token": csrf_token(request),
+            "user": user,
+            "active_page": "review",
+        } | ctx,
+        status_code=status_code,
+    )
+
+
 @app.get("/review/take", response_class=HTMLResponse)
 def review_take(
     request: Request,
@@ -295,18 +323,7 @@ def review_take(
         return templates.TemplateResponse(
             request, "review.html", {"items": [], "user": user, "active_page": "review"}
         )
-    return templates.TemplateResponse(
-        request,
-        "take.html",
-        {
-            "item": queue[0],
-            "remaining": len(queue) - 1,
-            "result": None,
-            "csrf_token": csrf_token(request),
-            "user": user,
-            "active_page": "review",
-        },
-    )
+    return _take_page(request, session, user, queue[0])
 
 
 @app.post("/review/{item_id}/answer", response_class=HTMLResponse)
@@ -326,33 +343,50 @@ async def review_answer(
         llm = None
         if item.question_type == "short_answer":
             llm = LLMClient(
-                settings.llm_base_url, settings.llm_api_key, settings.llm_grade_model
+                settings.llm_base_url, settings.llm_api_key, settings.llm_grade_model,
+                timeout=settings.llm_grade_timeout,
+                max_attempts=settings.llm_grade_attempts, max_backoff=5,
             )
         return submit_answer(session, user.id, item.id, answer, llm)
 
-    result, error, status = None, None, 200
     try:
         result = await run_in_threadpool(grade)
-    except InvalidAnswer:
-        error, status = "Pick one of the listed options.", 400
+    except NotDue:
+        # a replayed or double submit: show what was already recorded
+        return RedirectResponse(f"/review/{item_id}/result", status_code=303)
+    except InvalidAnswer as e:
+        return _take_page(request, session, user, item, status_code=400,
+                          error=str(e), answer=answer)
     except LLMError:
         # Nothing was recorded; hand the answer back so it isn't lost.
-        error, status = "The grader is unavailable right now. Your answer is below — try again shortly.", 503
-    return templates.TemplateResponse(
-        request,
-        "take.html",
-        {
-            "item": item,
-            "remaining": max(0, due_count(session, user.id) - (1 if error else 0)),
-            "result": result,
-            "error": error,
-            "answer": answer if error else "",
-            "csrf_token": csrf_token(request),
-            "user": user,
-            "active_page": "review",
-        },
-        status_code=status,
-    )
+        return _take_page(
+            request, session, user, item, status_code=503, answer=answer,
+            error="The grader is unavailable right now. Your answer is below — try again shortly.",
+        )
+    # Post/Redirect/Get: refresh or back can't resubmit the answer
+    request.session["review_result"] = {
+        "item_id": str(item_id),
+        "correct": result["correct"],
+        "verdict": result["verdict"],
+        "feedback": result["feedback"][:1000],
+        "interval_days": result["interval_days"],
+    }
+    return RedirectResponse(f"/review/{item_id}/result", status_code=303)
+
+
+@app.get("/review/{item_id}/result", response_class=HTMLResponse)
+def review_result(
+    item_id: UUID,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    result = request.session.get("review_result")
+    item = session.get(QuizItem, item_id)
+    if (not result or result.get("item_id") != str(item_id) or item is None
+            or not user_owns_item(session, user.id, item_id)):
+        return RedirectResponse("/review/take", status_code=303)
+    return _take_page(request, session, user, item, result=result)
 
 
 @app.get("/stats", response_class=HTMLResponse)

@@ -79,13 +79,20 @@ def parse_json_content(content: str) -> dict:
 
 
 class LLMClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 180):
+    def __init__(
+        self, base_url: str, api_key: str, model: str, timeout: int = 180,
+        max_attempts: int = len(BACKOFF), max_backoff: int = MAX_RETRY_AFTER,
+    ):
+        """Batch defaults are patient; interactive callers (grading) pass a
+        short timeout, few attempts and a small max_backoff."""
         if not api_key:
             raise LLMError("LLM API key is empty — set LLM_API_KEY in .env")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.max_attempts = max(1, max_attempts)
+        self.max_backoff = max_backoff
         # Some OpenAI-compatible servers (Ollama, Gemini's shim) 400 on
         # response_format; the first such 400 turns it off for this client.
         self.json_mode = True
@@ -115,8 +122,8 @@ class LLMClient:
         last_error = None
         quota_hits = 0
         attempt = 0
-        while attempt < len(BACKOFF):
-            delay = BACKOFF[attempt]
+        while attempt < self.max_attempts:
+            delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
             try:
                 req = self._request(system, user, temperature)
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -144,8 +151,8 @@ class LLMClient:
                 last_error = e
                 quota_hits = 0
             attempt += 1
-            if attempt < len(BACKOFF):
-                time.sleep(delay)
+            if attempt < self.max_attempts:
+                time.sleep(min(delay, self.max_backoff))
         else:
             raise LLMError(f"chat completion failed after retries: {last_error}") from last_error
         try:

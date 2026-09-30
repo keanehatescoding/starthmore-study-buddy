@@ -125,3 +125,13 @@ def test_single_valid_item_gets_bare_key(setup):
     items = generate_for_chunk(s, chunk, llm)
     assert [i.generation_key for i in items] == [f"{chunk.id}:1"]
     assert not chunk_needs_quiz(s, chunk.id)
+
+
+@pytest.mark.parametrize("raw, stored", [(2, "2"), (2.0, "2"), ("2.0", "2"), (" 2 ", "2"),
+                                         (True, None), (1.5, None), ("two", None)])
+def test_mcq_index_normalized(setup, raw, stored):
+    s, chunk = setup
+    item = dict(GOOD[1], correct_answer=raw)
+    generate_for_chunk(s, chunk, FakeLLM([item]))
+    rows = s.exec(select(QuizItem)).all()
+    assert [r.correct_answer for r in rows] == ([stored] if stored else [])

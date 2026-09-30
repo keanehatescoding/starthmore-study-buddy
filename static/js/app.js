@@ -55,6 +55,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Submit once: a double click would post the answer twice
+  document.querySelectorAll('form.answer-form').forEach(form => {
+    form.addEventListener('submit', () => {
+      form.querySelectorAll('button[type="submit"]').forEach(btn => {
+        btn.disabled = true;
+      });
+    });
+  });
+
   // 3. Quiz Result page shortcut (Enter or Space to advance)
   const nextBtn = document.getElementById('next-question-btn');
   if (nextBtn) {

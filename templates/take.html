@@ -68,7 +68,7 @@
     <div class="notice notice-error" role="alert">{{ error }}</div>
     {% endif %}
     <!-- Answer Submission Form -->
-    <form method="post" action="/review/{{ item.id }}/answer">
+    <form method="post" action="/review/{{ item.id }}/answer" class="answer-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
       {% if item.question_type == "mcq" %}
@@ -84,7 +84,7 @@
       </div>
       {% else %}
       <div class="answer-field">
-        <textarea name="answer" class="answer-textarea" rows="4" cols="60" required placeholder="Type your answer…">{{ answer }}</textarea>
+        <textarea name="answer" class="answer-textarea" rows="4" cols="60" maxlength="{{ max_answer_chars }}" required placeholder="Type your answer…">{{ answer }}</textarea>
         <p class="answer-help">
           The AI grader checks your conceptual understanding leniently on phrasing.
         </p>

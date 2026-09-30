@@ -5,7 +5,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.grade import InvalidAnswer, due_count, due_items, submit_answer, user_owns_item
+from app import grade
+from app.grade import (
+    InvalidAnswer, NotDue, due_count, due_items, grade_short_answer, submit_answer,
+    user_owns_item,
+)
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 
 
@@ -16,6 +20,25 @@ class FakeLLM:
     def complete_json(self, system, user, temperature=0.0):
         return {"correct": self.partial >= 0.6, "partial_credit": self.partial,
                 "feedback": "Good effort."}
+
+
+class ReplyLLM:
+    """Returns a canned grader reply and counts calls."""
+
+    def __init__(self, reply):
+        self.reply, self.calls = reply, 0
+
+    def complete_json(self, system, user, temperature=0.0):
+        self.calls += 1
+        return self.reply
+
+
+def _make_due(s, user, item):
+    state = s.exec(select(ReviewState).where(
+        ReviewState.user_id == user.id, ReviewState.quiz_item_id == item.id)).one()
+    state.next_review_date = datetime.now(timezone.utc) - timedelta(minutes=1)
+    s.add(state)
+    s.commit()
 
 
 @pytest.fixture()
@@ -55,6 +78,7 @@ def setup():
 def test_mcq_instant_no_llm(setup):
     s, user, mcq, _ = setup
     assert submit_answer(s, user.id, mcq.id, "1")["correct"] is True
+    _make_due(s, user, mcq)
     assert submit_answer(s, user.id, mcq.id, "0")["correct"] is False
 
 
@@ -62,6 +86,7 @@ def test_mcq_wrong_resets_interval(setup):
     s, user, mcq, _ = setup
     r1 = submit_answer(s, user.id, mcq.id, "1")
     assert (r1["interval_days"], r1["repetitions"]) == (1, 1)
+    _make_due(s, user, mcq)
     r2 = submit_answer(s, user.id, mcq.id, "2")
     assert (r2["interval_days"], r2["repetitions"]) == (1, 0)
     state = s.exec(select(ReviewState)).one()
@@ -73,6 +98,7 @@ def test_short_answer_uses_criteria(setup):
     out = submit_answer(s, user.id, short.id, "because stuff", FakeLLM(0.8))
     assert out["correct"] is True and out["quality"] == 4
     assert out["feedback"] == "Good effort."
+    _make_due(s, user, short)
     out = submit_answer(s, user.id, short.id, "dunno", FakeLLM(0.1))
     assert out["correct"] is False and out["verdict"] == "incorrect"
 
@@ -80,12 +106,13 @@ def test_short_answer_uses_criteria(setup):
 def test_interval_grows_on_streak(setup):
     s, user, mcq, _ = setup
     submit_answer(s, user.id, mcq.id, "1")
+    _make_due(s, user, mcq)
     out = submit_answer(s, user.id, mcq.id, "1")
     assert (out["interval_days"], out["repetitions"]) == (3, 2)
     assert out["next_review_date"] > datetime.now(timezone.utc)
 
 
-def test_due_queue_new_first_then_overdue(setup):
+def test_due_queue_new_items_after_overdue(setup):
     s, user, mcq, short = setup
     assert [i.id for i in due_items(s, user.id)] == [mcq.id, short.id]
     submit_answer(s, user.id, mcq.id, "1")
@@ -157,3 +184,109 @@ def test_due_count_ignores_limit(setup):
     s, user, _, _ = setup
     assert len(due_items(s, user.id, limit=1)) == 1
     assert due_count(s, user.id) == 2
+
+
+def test_not_due_item_rejected_before_grading(setup):
+    s, user, _, short = setup
+    llm = ReplyLLM({"correct": True, "partial_credit": 1.0, "feedback": "ok"})
+    first = submit_answer(s, user.id, short.id, "because", llm)
+    with pytest.raises(NotDue):
+        submit_answer(s, user.id, short.id, "because", llm)
+    assert llm.calls == 1  # the replay cost no LLM call
+    state = s.exec(select(ReviewState)).one()
+    assert state.repetitions == 1 and state.interval_days == first["interval_days"]
+
+
+def test_concurrent_first_answer_loses_without_500(setup, monkeypatch):
+    s, user, mcq, _ = setup
+    # another request inserted and answered while this one was grading
+    original = grade.grade_mcq
+
+    def racing(item, answer):
+        monkeypatch.setattr(grade, "grade_mcq", original)
+        with Session(s.get_bind()) as other:
+            submit_answer(other, user.id, mcq.id, "1")
+        return original(item, answer)
+
+    monkeypatch.setattr(grade, "grade_mcq", racing)
+    with pytest.raises(NotDue):
+        submit_answer(s, user.id, mcq.id, "1")
+    state = s.exec(select(ReviewState)).one()
+    assert state.repetitions == 1 and state.lapses == 0
+
+
+@pytest.mark.parametrize("reply, credit", [
+    ({"correct": True, "feedback": "Spot on."}, 1.0),
+    ({"correct": "true", "partial_credit": None}, 1.0),
+    ({"correct": False}, 0.0),
+    ({"correct": "false", "partial_credit": "n/a"}, 0.0),
+    ({"correct": True, "partial_credit": 0.4}, 0.4),  # explicit credit wins
+])
+def test_grader_correct_flag_used_when_credit_missing(setup, reply, credit):
+    _, _, _, short = setup
+    out = grade_short_answer(ReplyLLM(reply), short, "because")
+    assert out["partial_credit"] == credit and out["correct"] is (credit >= 0.6)
+
+
+def test_correct_without_credit_schedules_a_pass(setup):
+    s, user, _, short = setup
+    out = submit_answer(s, user.id, short.id, "because",
+                        ReplyLLM({"correct": True, "feedback": "Yes."}))
+    assert out["quality"] == 5 and out["verdict"] == "correct"
+    assert s.exec(select(ReviewState)).one().lapses == 0
+
+
+@pytest.mark.parametrize("stored", ["1", "1.0", " 1 ", "True"])
+def test_mcq_legacy_stored_index(setup, stored):
+    s, user, mcq, _ = setup
+    mcq.correct_answer = stored
+    s.add(mcq)
+    s.commit()
+    assert submit_answer(s, user.id, mcq.id, "1")["correct"] is True
+
+
+def test_short_answer_length_capped(setup):
+    s, user, _, short = setup
+    llm = ReplyLLM({"correct": True, "partial_credit": 1.0})
+    with pytest.raises(InvalidAnswer, match="4,000"):
+        submit_answer(s, user.id, short.id, "x" * (grade.MAX_ANSWER_CHARS + 1), llm)
+    assert llm.calls == 0
+    submit_answer(s, user.id, short.id, "x" * grade.MAX_ANSWER_CHARS, llm)
+
+
+def _add_items(s, chunk_id, n, prefix):
+    items = [QuizItem(chunk_id=chunk_id, question=f"{prefix}{i}?", question_type="mcq",
+                      options=["a", "b", "c", "d"], correct_answer="0", difficulty="recall",
+                      generation_key=f"{prefix}{i:03d}") for i in range(n)]
+    s.add_all(items)
+    s.commit()
+    return items
+
+
+def test_overdue_not_starved_by_new_backlog(setup):
+    s, user, mcq, short = setup
+    submit_answer(s, user.id, mcq.id, "1")
+    _make_due(s, user, mcq)
+    _add_items(s, mcq.chunk_id, 30, "new")
+    queue = due_items(s, user.id)
+    assert queue[0].id == mcq.id and len(queue) == 20
+
+
+def test_daily_new_item_cap(setup, monkeypatch):
+    s, user, mcq, short = setup
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 3)
+    _add_items(s, mcq.chunk_id, 5, "new")  # 7 new items in all
+    assert len(due_items(s, user.id)) == 3 and due_count(s, user.id) == 3
+    submit_answer(s, user.id, mcq.id, "1")
+    submit_answer(s, user.id, short.id, "x", FakeLLM(1.0))
+    assert due_count(s, user.id) == 1
+    # a lapsed review is still due; it isn't new, so the cap doesn't hide it
+    _make_due(s, user, mcq)
+    assert [i.id for i in due_items(s, user.id)][0] == mcq.id
+    assert due_count(s, user.id) == 2
+    # yesterday's first answers don't count against today
+    for state in s.exec(select(ReviewState)).all():
+        state.first_answered_at -= timedelta(days=1)
+        s.add(state)
+    s.commit()
+    assert due_count(s, user.id) == 4  # mcq + 3 new
