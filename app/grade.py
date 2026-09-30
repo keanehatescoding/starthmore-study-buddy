@@ -79,8 +79,8 @@ class InvalidAnswer(ValueError):
 
 
 class NotDue(Exception):
-    """The item isn't due for this user (already answered, e.g. a replayed or
-    double submit), so grading it again would advance the schedule twice."""
+    """The item isn't due for this user: already answered (a replayed or double
+    submit, which would advance the schedule twice) or new past the daily cap."""
 
 
 def _mcq_index(value: str, n_options: int) -> int | None:
@@ -151,9 +151,12 @@ def submit_answer(
         raise ValueError(f"quiz item {quiz_item_id} not found")
     if len(answer) > MAX_ANSWER_CHARS:
         raise InvalidAnswer(f"Answers are limited to {MAX_ANSWER_CHARS:,} characters.")
-    if not _is_due(session.exec(_state_query(user_id, item.id)).first(),
-                   datetime.now(timezone.utc)):
+    now = datetime.now(timezone.utc)
+    state = session.exec(_state_query(user_id, item.id)).first()
+    if not _is_due(state, now):
         raise NotDue(quiz_item_id)
+    if state is None and _new_allowance(session, user_id, now) <= 0:
+        raise NotDue(quiz_item_id)  # a new item past today's cap isn't in the queue
 
     if item.question_type == "mcq":
         partial = grade_mcq(item, answer)

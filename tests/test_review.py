@@ -276,3 +276,18 @@ def test_long_feedback_survives_the_redirect(testapp, monkeypatch):
     assert r.status_code == 200 and "Correct" in r.text
     assert feedback.strip() in r.text
     assert len(client.cookies.get("session", "")) < 4000
+
+
+def test_new_item_past_cap_redirects_to_queue(testapp, monkeypatch):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    from app import grade
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 0)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/settings/moodle").text)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "1", "csrf_token": token.group(1)}, follow_redirects=False)
+    assert r.status_code == 303
+    assert client.get(r.headers["location"], follow_redirects=False).headers["location"] \
+        == "/review/take"
+    with Session() as s:
+        assert s.exec(select(ReviewState)).first() is None

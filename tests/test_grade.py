@@ -290,3 +290,19 @@ def test_daily_new_item_cap(setup, monkeypatch):
         s.add(state)
     s.commit()
     assert due_count(s, user.id) == 4  # mcq + 3 new
+
+
+def test_new_item_past_daily_cap_rejected(setup, monkeypatch):
+    s, user, mcq, short = setup
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 1)
+    llm = ReplyLLM({"correct": True, "partial_credit": 1.0})
+    submit_answer(s, user.id, mcq.id, "1")
+    # short is owned but outside today's queue: no grading, nothing recorded
+    assert [i.id for i in due_items(s, user.id)] == []
+    with pytest.raises(NotDue):
+        submit_answer(s, user.id, short.id, "because", llm)
+    assert llm.calls == 0
+    assert len(s.exec(select(ReviewState)).all()) == 1
+    # a due review of an already-started item is still accepted
+    _make_due(s, user, mcq)
+    assert submit_answer(s, user.id, mcq.id, "1")["correct"] is True
