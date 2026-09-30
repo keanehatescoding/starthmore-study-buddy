@@ -1,11 +1,13 @@
-"""Ops tests: DB-aware /health and worker healthcheck ping."""
+"""Ops tests: DB-aware /health, worker healthcheck ping, DATABASE_URL driver."""
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.config import settings
 from app.db import get_session
+from app.dburl import normalize_database_url
 from app.main import app
 from app.worker import ping_healthcheck
 
@@ -78,3 +80,32 @@ def test_ping_failure_never_fails_run(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", boom)
     monkeypatch.setattr(settings, "healthcheck_ping_url", "https://x/ping")
     ping_healthcheck()  # must not raise
+
+
+def test_ping_fail_hits_fail_endpoint(monkeypatch):
+    urls: list = []
+
+    class FakeResp:
+        def read(self):
+            return b"ok"
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda url, **k: (urls.append(url), FakeResp())[1]
+    )
+    monkeypatch.setattr(settings, "healthcheck_ping_url", "https://x/ping/abc/")
+    ping_healthcheck(fail=True)
+    assert urls == ["https://x/ping/abc/fail"]
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("postgres://u:p@h:5432/db", "postgresql+psycopg://u:p@h:5432/db"),
+    ("postgresql://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+    ("postgresql+psycopg://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+    ("sqlite:///x.db", "sqlite:///x.db"),
+])
+def test_database_url_pinned_to_psycopg(url, expected, monkeypatch):
+    from app.config import Settings
+
+    assert normalize_database_url(url) == expected
+    monkeypatch.setenv("DATABASE_URL", url)
+    assert Settings().database_url == expected

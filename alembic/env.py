@@ -8,6 +8,7 @@ from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
 import app.models  # noqa: F401 -- ensures metadata is populated
+from app.dburl import normalize_database_url
 
 config = context.config
 if config.config_file_name is not None:
@@ -18,6 +19,7 @@ db_url = os.getenv("DATABASE_URL")
 if db_url:
     # Alembic runs sync; convert async URL if ever used.
     db_url = db_url.replace("+asyncpg", "").replace("+async_psycopg", "")
+    db_url = normalize_database_url(db_url)  # Railway's postgres:// -> psycopg
     config.set_main_option("sqlalchemy.url", db_url)
 
 target_metadata = SQLModel.metadata

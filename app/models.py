@@ -217,12 +217,17 @@ class Job(SQLModel, table=True):
             postgresql_where=text(ACTIVE_NOTIFY_WHERE),
             sqlite_where=text(ACTIVE_NOTIFY_WHERE),
         ),
+        # Claiming / the notify busy check (status + available_at), and the
+        # reaper / pruning (status + updated_at). Both lead with status, so
+        # they also cover plain status lookups.
+        Index("ix_jobs_status_available_at", "status", "available_at"),
+        Index("ix_jobs_status_updated_at", "status", "updated_at"),
     )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     type: str = Field(index=True)  # "sync" | "send_notifications" (see app.jobs.HANDLERS)
     payload: Any = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
-    status: str = Field(default="pending", index=True)  # pending|running|completed|failed
+    status: str = Field(default="pending")  # pending|running|completed|failed
     attempts: int = Field(default=0)
     max_attempts: int = Field(default=3)
     error: Optional[str] = Field(default=None, sa_column=Column(Text))
