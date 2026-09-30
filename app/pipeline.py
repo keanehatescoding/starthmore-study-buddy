@@ -3,6 +3,10 @@
 Usage: python -m app.pipeline --source moodle [--course ID]
        [--extract-only] [--chunk-only]
 Chunking needs LLM_* in .env; extraction runs without it.
+
+A resource whose download or chunking fails is deferred with exponential
+backoff (Resource.attempts / retry_after, 1h doubling to 24h) rather than
+retried on every run; chunking gives up ("failed") after MAX_CHUNK_ATTEMPTS.
 """
 
 from __future__ import annotations
@@ -11,8 +15,9 @@ import argparse
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
-from sqlmodel import Session, func, select
+from sqlmodel import Session, func, or_, select
 
 from app.chunk import chunk_resource, needs_llm
 from app.config import settings
@@ -51,14 +56,42 @@ def _scoped(q, course_id, source):
     return q.join(Topic, Topic.id == Resource.topic_id).where(Topic.course_id == course_id)
 
 
+MAX_CHUNK_ATTEMPTS = 3
+RETRY_BASE = timedelta(hours=1)
+RETRY_CAP = timedelta(hours=24)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _defer(r: Resource, error: str) -> None:
+    """Count a failed try and push the next one out: 1h, 2h, 4h ... 24h."""
+    r.attempts = (r.attempts or 0) + 1
+    r.retry_after = _now() + min(RETRY_BASE * 2 ** (r.attempts - 1), RETRY_CAP)
+    r.error = error[:500]
+
+
+def _succeeded(r: Resource) -> None:
+    r.attempts = 0
+    r.retry_after = None
+
+
+def _due():
+    return or_(Resource.retry_after.is_(None), Resource.retry_after <= _now())
+
+
 def pending_resource_ids(session: Session, course_id=None, source=None) -> list:
-    q = select(Resource.id).where(Resource.status == "pending").order_by(Resource.id)
+    q = (select(Resource.id).where(Resource.status == "pending", _due())
+         .order_by(Resource.id))
     return session.exec(_scoped(q, course_id, source)).all()
 
 
 def chunkable_resource_ids(session: Session, course_id=None, source=None) -> list:
     # ids only: loading every extracted_text up front is what blew memory
-    q = (select(Resource.id).where(Resource.extracted_text.is_not(None))
+    q = (select(Resource.id)
+         .where(Resource.extracted_text.is_not(None),
+                Resource.status.not_in(["failed", "skipped"]), _due())
          .order_by(Resource.id))
     return session.exec(_scoped(q, course_id, source)).all()
 
@@ -132,9 +165,15 @@ def run_extraction(session: Session, downloader, course_id=None,
             continue
         try:
             r.extracted_text = extract_resource_text(r, dl)
-            r.status = "extracted"
-            r.error = None
-            counts["extracted"] += 1
+            _succeeded(r)
+            if r.extracted_text and r.extracted_text.strip():
+                r.status = "extracted"
+                r.error = None
+                counts["extracted"] += 1
+            else:  # nothing to chunk or quiz on; don't bill a chunker call
+                r.status = "skipped"
+                r.error = "no text extracted"
+                counts["skipped"] += 1
         except SkipResource:
             r.status = "skipped"
             r.error = None
@@ -145,8 +184,8 @@ def run_extraction(session: Session, downloader, course_id=None,
             counts["failed"] += 1
         except (MoodleError, DriveError) as e:
             # network blip, rejected token or missing Drive grant: keep
-            # pending so the next run retries
-            r.error = str(e)[:500]
+            # pending, retried after a backoff instead of on every run
+            _defer(r, str(e))
             counts["download_errors"] += 1
         except ExtractError as e:
             r.status = "failed"
@@ -187,9 +226,20 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
             break
         except Exception as e:
             session.rollback()
+            r = session.get(Resource, rid)
+            _defer(r, f"{type(e).__name__}: {e}")
+            if r.attempts >= MAX_CHUNK_ATTEMPTS:
+                r.status = "failed"  # existing chunks, if any, are kept
+            session.add(r)
+            session.commit()
             counts["errors"] += 1
-            print(f"  error on resource {rid}: {str(e)[:120]}", flush=True)
+            print(f"  error on resource {rid} (try {r.attempts}): {str(e)[:120]}",
+                  flush=True)
             continue
+        if r.attempts or r.retry_after:
+            _succeeded(r)
+            session.add(r)
+            session.commit()
         counts["chunks"] += n
         print(f"  chunk {i}/{len(ids)} +{n}: {r.title[:60]}", flush=True)
         if n:

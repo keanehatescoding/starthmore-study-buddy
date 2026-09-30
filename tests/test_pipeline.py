@@ -21,7 +21,7 @@ from app.pipeline import quiz_chunk_ids, run_chunking, run_extraction
 
 
 class FakeLLM:
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, **kw):
         # verbatim halves of the section -> offsets must resolve
         text = user.split("\n\n", 1)[1]
         half = len(text) // 2
@@ -410,3 +410,177 @@ def test_classroom_owner_without_token_or_drive_grant_stays_pending(session, mon
     assert counts["download_errors"] == 1
     r = session.exec(select(Resource)).one()
     assert r.status == "pending" and "sign in again" in r.error
+
+
+# -- issue #27: presplit fallbacks, truncation, build-then-swap, backoff ------
+
+
+def test_presplit_falls_back_to_lines_then_spaces_then_slices():
+    lines = "a transcript line\n" * 2000  # no blank lines at all
+    parts = presplit(lines, 1000)
+    assert len(parts) > 1 and all(len(p) <= 1000 for p in parts)
+    words = "word " * 3000
+    assert all(len(p) <= 1000 for p in presplit(words, 1000))
+    blob = "x" * 2500
+    assert presplit(blob, 1000) == ["x" * 1000, "x" * 1000, "x" * 500]
+    assert presplit("   \n\n  ", 1000) == []
+
+
+class TruncatingLLM(FakeLLM):
+    """Truncates any section longer than `limit`, like a capped max_tokens."""
+
+    def __init__(self, limit):
+        self.limit, self.sizes = limit, []
+
+    def complete_json(self, system, user, **kw):
+        from app.llm import TruncatedError
+
+        size = len(user.split("\n\n", 1)[1])
+        self.sizes.append(size)
+        if size > self.limit:
+            raise TruncatedError("finish_reason=length")
+        return super().complete_json(system, user, **kw)
+
+
+def test_truncated_section_is_halved_and_retried():
+    from app.chunk import chunk_sections
+
+    llm = TruncatingLLM(1500)
+    out = chunk_sections(["para\n\n" * 500], llm)  # 3000 chars
+    assert out and llm.sizes[0] == 3000
+    assert all(s <= 1500 for s in llm.sizes[1:])
+
+
+def test_truncation_on_a_small_section_raises():
+    from app.chunk import chunk_sections
+    from app.llm import TruncatedError
+
+    with pytest.raises(TruncatedError):
+        chunk_sections(["x" * 500], TruncatingLLM(100))
+
+
+class MessyLLM:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def complete_json(self, system, user, **kw):
+        assert kw.get("required_key") == "chunks"
+        return {"chunks": self.chunks}
+
+
+def test_malformed_chunks_are_dropped_not_crashed_on():
+    from app.chunk import chunk_sections
+
+    good = {"title": "T", "content": "real text"}
+    assert chunk_sections(["s"], MessyLLM("oops")) == []
+    out = chunk_sections(["s"], MessyLLM([
+        "a string", None, {"title": "no content"}, {"content": None},
+        {"content": ["list"]}, {"title": None, "content": "untitled ok"}, good,
+    ]))
+    assert out == [{"title": "Untitled", "content": "untitled ok"}, good]
+
+
+class FailingLLM:
+    calls = 0
+
+    def complete_json(self, system, user, **kw):
+        type(self).calls += 1
+        raise RuntimeError("provider exploded")
+
+
+def test_failed_rechunk_keeps_the_old_chunks(session):
+    from app.chunk import ChunkingError
+
+    r = _resource(session, status="extracted", extracted_text="x" * 500)
+    chunk_resource(session, r, FakeLLM())
+    r.status = "pending"
+    session.add(r)
+    session.commit()
+    with pytest.raises(RuntimeError):
+        chunk_resource(session, r, FailingLLM())
+    session.rollback()
+    assert len(session.exec(select(Chunk)).all()) == 2
+    with pytest.raises(ChunkingError):
+        chunk_resource(session, r, MessyLLM([]))
+    session.rollback()
+    assert len(session.exec(select(Chunk)).all()) == 2
+
+
+def test_blank_text_is_skipped_without_a_chunk(session):
+    r = _resource(session, status="extracted", extracted_text="  \n ")
+    assert chunk_resource(session, r, None) == 0
+    session.refresh(r)
+    assert r.status == "skipped" and not session.exec(select(Chunk)).all()
+
+
+def test_extraction_of_empty_text_is_skipped(session):
+    _resource(session, source_id="e", raw_url="https://m.example/empty.txt")
+    counts = run_extraction(session, lambda url: (b"   ", "text/plain")).counts
+    assert counts["skipped"] == 1 and counts["extracted"] == 0
+    assert session.exec(select(Resource)).one().status == "skipped"
+
+
+def _age(session, r):
+    """Pretend the backoff has elapsed."""
+    from datetime import datetime, timedelta, timezone
+
+    r.retry_after = datetime.now(timezone.utc) - timedelta(seconds=1)
+    session.add(r)
+    session.commit()
+
+
+def test_chunking_failure_backs_off_then_gives_up(session):
+    from app.pipeline import MAX_CHUNK_ATTEMPTS, chunkable_resource_ids
+
+    r = _resource(session, status="extracted", extracted_text="x" * 500)
+    FailingLLM.calls = 0
+    for attempt in range(1, MAX_CHUNK_ATTEMPTS + 1):
+        assert run_chunking(session, FailingLLM()).counts["errors"] == 1
+        session.refresh(r)
+        assert r.attempts == attempt and r.retry_after is not None
+        # deferred: the very next run doesn't bill it again
+        assert run_chunking(session, FailingLLM()).counts["errors"] == 0
+        _age(session, r)
+    assert FailingLLM.calls == MAX_CHUNK_ATTEMPTS
+    assert r.status == "failed" and "provider exploded" in r.error
+    assert chunkable_resource_ids(session) == []
+
+
+def test_backoff_doubles_and_is_capped():
+    from datetime import datetime, timedelta, timezone
+
+    from app.pipeline import _defer
+
+    r = Resource(topic_id=None, source="moodle", source_id="x", type="file", title="R")
+    gaps = []
+    for _ in range(7):
+        _defer(r, "e")
+        gaps.append(round((r.retry_after - datetime.now(timezone.utc)) / timedelta(hours=1)))
+    assert gaps == [1, 2, 4, 8, 16, 24, 24]
+
+
+def test_success_after_a_failure_resets_the_backoff(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500)
+    run_chunking(session, FailingLLM())
+    _age(session, r)
+    assert run_chunking(session, FakeLLM()).counts["chunks"] == 2
+    session.refresh(r)
+    assert r.attempts == 0 and r.retry_after is None and r.status == "extracted"
+
+
+def test_download_errors_back_off_but_stay_pending(session):
+    from app.pipeline import pending_resource_ids
+
+    r = _resource(session, source_id="down", raw_url="https://m.example/down.txt")
+
+    def down(url):
+        raise MoodleError("timed out")
+
+    assert run_extraction(session, down).counts["download_errors"] == 1
+    session.refresh(r)
+    assert r.status == "pending" and r.attempts == 1
+    assert pending_resource_ids(session) == []  # not retried until due
+    _age(session, r)
+    assert run_extraction(session, lambda url: (b"notes", "text/plain")).counts["extracted"] == 1
+    session.refresh(r)
+    assert r.attempts == 0 and r.retry_after is None

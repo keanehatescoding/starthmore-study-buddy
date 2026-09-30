@@ -19,6 +19,11 @@ class LLMError(RuntimeError):
     pass
 
 
+class TruncatedError(LLMError):
+    """The reply hit the output-token limit (finish_reason "length"). Its
+    JSON is cut off, so callers should send a smaller input instead."""
+
+
 class QuotaExhaustedError(LLMError):
     """Repeated 429s: the quota is gone, not a transient blip. Callers
     should stop the run (work is resumable) instead of grinding chunks."""
@@ -27,6 +32,8 @@ class QuotaExhaustedError(LLMError):
 RETRYABLE = {429, 500, 502, 503, 504}
 BACKOFF = [5, 15, 30, 60, 90]
 MAX_RETRY_AFTER = 120
+# a 400 whose body names these is about JSON mode, not the request itself
+JSON_MODE_ERRORS = ("response_format", "json_object", "response_mime_type")
 
 
 def _retry_after(err: urllib.error.HTTPError) -> int | None:
@@ -95,6 +102,7 @@ class LLMClient:
         self.max_backoff = max_backoff
         # Some OpenAI-compatible servers (Ollama, Gemini's shim) 400 on
         # response_format; the first such 400 turns it off for this client.
+        # Other 400s (context length, bad model) leave it on and raise.
         self.json_mode = True
 
     def _request(self, system: str, user: str, temperature: float):
@@ -118,7 +126,10 @@ class LLMClient:
             method="POST",
         )
 
-    def complete_json(self, system: str, user: str, temperature: float = 0.2) -> dict:
+    def complete_json(self, system: str, user: str, temperature: float = 0.2,
+                      required_key: str | None = None) -> dict:
+        """The reply as a JSON object. `required_key` must be a top-level key:
+        without it, the prose fallback could return some inner object."""
         last_error = None
         quota_hits = 0
         attempt = 0
@@ -131,11 +142,12 @@ class LLMClient:
                 break
             except urllib.error.HTTPError as e:
                 last_error = e
-                if e.code == 400 and self.json_mode:
+                detail = _error_body(e) if e.code == 400 else ""
+                if self.json_mode and any(k in detail for k in JSON_MODE_ERRORS):
                     self.json_mode = False  # retry now, without JSON mode
                     continue
                 if e.code not in RETRYABLE:
-                    raise LLMError(f"chat completion failed: {e}") from e
+                    raise LLMError(f"chat completion failed: {e} {detail[:300]}".rstrip()) from e
                 if e.code == 429:
                     quota_hits += 1
                     if quota_hits >= 3:
@@ -156,6 +168,24 @@ class LLMClient:
         else:
             raise LLMError(f"chat completion failed after retries: {last_error}") from last_error
         try:
-            return parse_json_content(body["choices"][0]["message"]["content"])
+            choice = body["choices"][0]
+            finish = choice.get("finish_reason")
+            content = choice["message"]["content"]
         except Exception as e:
             raise LLMError(f"bad LLM response: {e}\n{str(body)[:500]}") from e
+        if finish == "length":
+            raise TruncatedError("LLM reply truncated at the output-token limit")
+        try:
+            data = parse_json_content(content)
+        except Exception as e:
+            raise LLMError(f"bad LLM response: {e}\n{str(body)[:500]}") from e
+        if required_key is not None and required_key not in data:
+            raise LLMError(f"LLM reply has no {required_key!r} key: {str(content)[:300]}")
+        return data
+
+
+def _error_body(err: urllib.error.HTTPError) -> str:
+    try:
+        return (err.read(4096) or b"").decode("utf-8", "replace")
+    except OSError:
+        return ""

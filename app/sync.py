@@ -339,6 +339,8 @@ def sync_course(
                 existing.extracted_text = r.text
                 existing.status = "extracted" if r.text else "pending"
                 existing.error = None
+                existing.attempts = 0  # new content: no backoff carried over
+                existing.retry_after = None
                 session.add(existing)
                 session.commit()
                 stats.resources_updated += 1
