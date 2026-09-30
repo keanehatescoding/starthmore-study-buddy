@@ -1,5 +1,6 @@
 import os
 import warnings
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,6 +37,19 @@ class Settings(BaseSettings):
     # comma-separated addresses and/or "@domain" entries; empty = any Google account
     allowed_emails: str = "@strathmore.edu"
     healthcheck_ping_url: str = ""  # e.g. healthchecks.io ping on worker success
+    timezone: str = "Africa/Nairobi"  # IANA zone whose midnight starts a study day
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
+
+    @model_validator(mode="after")
+    def _require_known_timezone(self):
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"TIMEZONE {self.timezone!r} is not an IANA zone name") from None
+        return self
 
     @model_validator(mode="after")
     def _require_real_secret_in_prod(self):

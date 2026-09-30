@@ -143,6 +143,26 @@ class ReviewState(SQLModel, table=True):
     last_feedback: Optional[str] = Field(default=None, sa_column=Column(Text))
 
 
+class ReviewLog(SQLModel, table=True):
+    """One row per graded answer. ReviewState keeps only the latest answer,
+    so history (streaks, accuracy) is read from here."""
+
+    __tablename__ = "review_logs"
+    __table_args__ = (Index("ix_review_logs_user_answered", "user_id", "answered_at"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="users.id")
+    # history outlives a regenerated item
+    quiz_item_id: Optional[uuid.UUID] = Field(
+        default=None, foreign_key="quiz_items.id", ondelete="SET NULL"
+    )
+    verdict: str  # srs.verdict(): correct | partial | incorrect
+    partial_credit: Optional[float] = Field(default=None)  # NULL on backfilled rows
+    answered_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+
+
 class NotificationEvent(SQLModel, table=True):
     __tablename__ = "notification_events"
 

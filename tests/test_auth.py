@@ -331,3 +331,11 @@ def test_domain_allowlist_blocks_outsider_at_callback(monkeypatch):
         assert r.status_code == 403
     finally:
         app.dependency_overrides.clear()
+
+
+def test_timezone_setting_must_be_an_iana_zone():
+    from app.config import Settings
+
+    assert str(Settings(_env_file=None).tz) == "Africa/Nairobi"
+    with pytest.raises(ValueError, match="TIMEZONE"):
+        Settings(_env_file=None, timezone="Mars/Olympus")

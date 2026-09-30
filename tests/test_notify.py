@@ -56,6 +56,21 @@ def test_new_material_batched_per_course(session):
     assert notify.enqueue_new_material(session, course.id, 0) is None
 
 
+def test_review_due_not_resent_hourly_after_delivery(session, monkeypatch):
+    _fake_batches(monkeypatch)
+    user, _ = _course_with_items(session, n_chunks=3)  # 3 due >= threshold
+    first = notify.check_review_due(session, user.id, threshold=3)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 1
+    # the hourly worker runs again with the same backlog: no new email
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+    # after the cooldown the (still due) user is reminded again
+    first.created_at = first.created_at - notify.REVIEW_DUE_COOLDOWN
+    session.add(first)
+    session.commit()
+    again = notify.check_review_due(session, user.id, threshold=3)
+    assert again is not None and again.id != first.id
+
+
 def test_review_due_threshold_and_dedupe(session):
     user, _ = _course_with_items(session, n_chunks=2)  # 2 due < 3
     assert notify.check_review_due(session, user.id) is None
@@ -341,14 +356,19 @@ def test_single_send_uses_stable_event_key(session, monkeypatch):
     _owned_events(session, 1)
     notify.send_pending(session, "key", "from@x")
     event = session.exec(select(NotificationEvent)).one()
-    assert calls.keys == [f"event-{event.id}"] and event.batch_key is None
+    assert calls.keys == [notify._idempotency_key([(event, calls[0][0])])]
+    assert event.batch_key is None
 
 
 def test_ambiguous_batch_failure_resends_same_batch_same_key(session, monkeypatch):
+    keys = []
+
     def lost(emails):
         raise notify.EmailError("send failed: timed out", "network:TimeoutError")
 
     calls = _fake_batches(monkeypatch, lost)
+    real_key = notify._idempotency_key
+    monkeypatch.setattr(notify, "_idempotency_key", lambda b: keys.append(real_key(b)) or keys[-1])
     _owned_events(session, 3)
     out = notify.send_pending(session, "key", "from@x")
     assert out == {"sent": 0, "failed": 3, "errors": {"network:TimeoutError": 3}}
@@ -356,6 +376,7 @@ def test_ambiguous_batch_failure_resends_same_batch_same_key(session, monkeypatc
     events = session.exec(select(NotificationEvent)).all()
     [key] = {e.batch_key for e in events}
     assert key and key.startswith("batch-")  # persisted, not split into singles
+    [first_key] = keys
 
     # a newer event arrives; the next pass resends the old batch unchanged
     session.add(NotificationEvent(user_id=events[0].user_id, type="review_due",
@@ -364,7 +385,8 @@ def test_ambiguous_batch_failure_resends_same_batch_same_key(session, monkeypatc
     calls = _fake_batches(monkeypatch)
     out = notify.send_pending(session, "key", "from@x")
     assert out == {"sent": 4, "failed": 0, "errors": {}}
-    assert calls.keys == [key, f"event-{_newest(session).id}"]
+    assert calls.keys[0] == first_key  # same events, same body -> same key
+    assert calls.keys[1] != first_key
     assert [len(c) for c in calls] == [3, 1]
 
 
@@ -395,7 +417,7 @@ def test_validation_split_clears_batch_key(session, monkeypatch):
     assert notify.send_pending(session, "key", "from@x")["sent"] == 2
     events = session.exec(select(NotificationEvent)).all()
     assert all(e.batch_key is None for e in events)
-    assert sorted(calls.keys) == sorted(f"event-{e.id}" for e in events)
+    assert len(set(calls.keys)) == 2  # one key per single send
 
 
 def test_send_batch_sends_idempotency_key(monkeypatch):
@@ -408,3 +430,29 @@ def test_send_batch_sends_idempotency_key(monkeypatch):
     monkeypatch.setattr(notify.urllib.request, "urlopen", urlopen)
     notify.send_batch("key", [{"to": ["a@x"]}], "batch-abc")
     assert seen == ["batch-abc"]
+
+
+def test_changed_batch_body_gets_new_idempotency_key(session, monkeypatch):
+    """A kept batch resent with a different body must not reuse the old key
+    (Resend answers 409 for 24h); an unchanged resend must reuse it."""
+    def lost(emails):
+        raise notify.EmailError("send failed: timed out", "network:TimeoutError")
+
+    keys = []
+    real_key = notify._idempotency_key
+    monkeypatch.setattr(notify, "_idempotency_key",
+                        lambda b: keys.append(real_key(b)) or keys[-1])
+    _fake_batches(monkeypatch, lost)
+    _owned_events(session, 2)
+    notify.send_pending(session, "key", "from@x", base_url="https://a.example")
+    notify.send_pending(session, "key", "from@x", base_url="https://a.example")
+    notify.send_pending(session, "key", "from@x", base_url="https://b.example")
+    assert keys[0] == keys[1] and keys[2] != keys[0]
+    assert len({e.batch_key for e in session.exec(select(NotificationEvent))}) == 1
+
+
+def test_identical_emails_for_different_events_get_different_keys():
+    body = {"from": "f@x", "to": ["a@x"], "subject": "s", "text": "t"}
+    one = NotificationEvent(user_id=uuid.UUID(int=0), type="review_due", payload={})
+    two = NotificationEvent(user_id=uuid.UUID(int=0), type="review_due", payload={})
+    assert notify._idempotency_key([(one, body)]) != notify._idempotency_key([(two, body)])

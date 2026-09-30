@@ -61,6 +61,7 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `LLM_PACE` | Seconds between pipeline LLM calls (default 0; `--pace` overrides) |
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_TO` | Notifications (Resend free tier) |
 | `APP_BASE_URL` | Public origin for links in emails (default `http://localhost:8000`) |
+| `TIMEZONE` | IANA zone for study days: streaks start at local midnight (default `Africa/Nairobi`) |
 
 ## Layout
 

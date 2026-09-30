@@ -2,41 +2,52 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, func, select
 
 from app.grade import _aware, scoped_items
-from app.models import QuizItem, ReviewState
+from app.models import QuizItem, ReviewLog, ReviewState
 
 
-def compute_stats(session: Session, user_id) -> dict:
-    states = session.exec(
-        select(ReviewState).where(ReviewState.user_id == user_id)
-    ).all()
-    verdicts = [s.last_result for s in states if s.last_result]
-    correct = sum(1 for v in verdicts if v == "correct")
+def compute_stats(session: Session, user_id, tz=None, now: datetime | None = None) -> dict:
+    """Answered/accuracy/streak count every answer in review_logs, not just
+    each item's latest; streak days are local dates in `tz` (settings.tz)."""
+    if tz is None:
+        from app.config import settings
+
+        tz = settings.tz
+    by_verdict = dict(session.exec(
+        select(ReviewLog.verdict, func.count(ReviewLog.id))
+        .where(ReviewLog.user_id == user_id)
+        .group_by(ReviewLog.verdict)
+    ).all())
+    answered = sum(by_verdict.values())
     items_total = session.exec(
         scoped_items(user_id).with_only_columns(func.count(QuizItem.id))
     ).one()
+    lapses = session.exec(
+        select(func.coalesce(func.sum(ReviewState.lapses), 0))
+        .where(ReviewState.user_id == user_id)
+    ).one()
 
     days = {
-        _aware(s.answered_at).date()
-        for s in states
-        if s.answered_at is not None
+        _aware(at).astimezone(tz).date()
+        for at in session.exec(
+            select(ReviewLog.answered_at).where(ReviewLog.user_id == user_id)
+        )
     }
-    today = datetime.now(timezone.utc).date()
-    yesterday = today.fromordinal(today.toordinal() - 1)
+    today = (now or datetime.now(timezone.utc)).astimezone(tz).date()
+    cursor = today if today in days else today - timedelta(days=1)
     streak = 0
-    cursor = today if today in days else (yesterday if yesterday in days else None)
-    while cursor is not None and cursor in days:
+    while cursor in days:
         streak += 1
-        cursor = cursor.fromordinal(cursor.toordinal() - 1)
+        cursor -= timedelta(days=1)
 
     return {
-        "answered": len(verdicts),
-        "accuracy": round(correct / len(verdicts), 3) if verdicts else None,
+        "answered": answered,
+        "accuracy": round(by_verdict.get("correct", 0) / answered, 3) if answered else None,
         "streak_days": streak,
         "items_total": items_total,
-        "lapses": sum(s.lapses for s in states),
+        "lapses": lapses,
     }
