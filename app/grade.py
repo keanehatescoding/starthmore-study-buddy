@@ -184,6 +184,7 @@ def submit_answer(
     state.repetitions = reps
     state.ease_factor = ease
     state.last_result = verdict(partial)
+    state.last_feedback = feedback
     if quality < 3:
         state.lapses += 1
     state.next_review_date = now + timedelta(days=interval)

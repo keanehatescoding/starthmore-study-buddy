@@ -19,7 +19,9 @@ from app.grade import (
     MAX_ANSWER_CHARS, InvalidAnswer, NotDue, due_count, due_items, submit_answer, user_owns_item,
 )
 from app.llm import LLMClient, LLMError
-from app.models import Assignment, Chunk, Course, QuizItem, Resource, Topic, User
+from app.models import (
+    Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic, User,
+)
 from app.security import RateLimitMiddleware, SecurityHeadersMiddleware
 from app.stats import compute_stats
 
@@ -369,13 +371,9 @@ async def review_answer(
             error="The grader is unavailable right now. Your answer is below — try again shortly.",
         )
     # Post/Redirect/Get: refresh or back can't resubmit the answer
-    request.session["review_result"] = {
-        "item_id": str(item_id),
-        "correct": result["correct"],
-        "verdict": result["verdict"],
-        "feedback": result["feedback"][:1000],
-        "interval_days": result["interval_days"],
-    }
+    # only the id: the result itself is read back from ReviewState, since
+    # feedback can outgrow the signed session cookie
+    request.session["review_result"] = str(item.id)
     return RedirectResponse(_result_path(item), status_code=303)
 
 
@@ -386,11 +384,19 @@ def review_result(
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
-    result = request.session.get("review_result")
     item = session.get(QuizItem, item_id)
-    if (not result or result.get("item_id") != str(item_id) or item is None
-            or not user_owns_item(session, user.id, item_id)):
+    state = session.exec(select(ReviewState).where(
+        ReviewState.user_id == user.id, ReviewState.quiz_item_id == item_id
+    )).first()
+    if (request.session.get("review_result") != str(item_id) or item is None
+            or state is None or not user_owns_item(session, user.id, item_id)):
         return RedirectResponse("/review/take", status_code=303)
+    result = {
+        "correct": state.last_result == "correct",
+        "verdict": state.last_result,
+        "feedback": state.last_feedback or "",
+        "interval_days": state.interval_days,
+    }
     return _take_page(request, session, user, item, result=result)
 
 

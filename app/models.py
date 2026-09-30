@@ -139,6 +139,8 @@ class ReviewState(SQLModel, table=True):
     first_answered_at: Optional[datetime] = Field(
         default=None, sa_column=Column(DateTime(timezone=True))
     )
+    # the grader's feedback on the last answer, shown on the result page
+    last_feedback: Optional[str] = Field(default=None, sa_column=Column(Text))
 
 
 class NotificationEvent(SQLModel, table=True):

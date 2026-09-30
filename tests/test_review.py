@@ -253,3 +253,26 @@ def test_grader_gets_short_timeout(testapp, monkeypatch):
                     data={"answer": "because", "csrf_token": _token(client)})
     assert "Correct" in r.text and "Nice." in r.text
     assert seen["timeout"] <= 30 and seen["max_attempts"] <= 2
+
+
+def test_long_feedback_survives_the_redirect(testapp, monkeypatch):
+    # feedback lives in ReviewState, not the cookie-backed session
+    client, Session = testapp["client"], testapp["Session"]
+    _seed(Session)
+    item_id = _short(Session)
+    from app import main
+    feedback = "🙂 Great answer. " * 300  # ~5k chars, ~50k once JSON-escaped
+
+    class Chatty:
+        def __init__(self, *a, **kw):
+            pass
+
+        def complete_json(self, *a, **k):
+            return {"correct": True, "partial_credit": 1.0, "feedback": feedback}
+
+    monkeypatch.setattr(main, "LLMClient", Chatty)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "because", "csrf_token": _token(client)})
+    assert r.status_code == 200 and "Correct" in r.text
+    assert feedback.strip() in r.text
+    assert len(client.cookies.get("session", "")) < 4000
