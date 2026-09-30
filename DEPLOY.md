@@ -10,7 +10,22 @@
    `EMAIL_FROM`, `EMAIL_TO`, `APP_BASE_URL` (the public web URL, used in
    email links). Note: `DATABASE_URL` must use the `psycopg`
    driver as-is; no code change needed.
-3. Services from `Procfile`: `web` (FastAPI) and `worker` (hourly notification pass).
+3. Services — five in all, counting Postgres:
+
+   | Service | Start command | Schedule |
+   |---|---|---|
+   | `web` | `Procfile` / `Dockerfile` default | always on |
+   | `worker` | `alembic upgrade head && python -m app.worker --loop 3600` | always on |
+   | `sync-cron` | step 5 | `0 3 * * *` |
+   | `pipeline-cron` | step 6 | `0 6 * * *` |
+
+   The worker drains the job queue hourly: queued syncs (sign-in, the Sync
+   button) and the notification pass. Every service starts with `alembic
+   upgrade head`: services deploy independently, and one running new code
+   against an old schema fails (e.g. `column ... does not exist`) until
+   web happens to redeploy. It is a no-op at head, and concurrent runs
+   serialize on a Postgres advisory lock. Point all services at the same
+   repo and branch, so a merge redeploys them together.
 4. Each user connects their own Moodle account at **Moodle** in the nav
    (`/settings/moodle`: sign in once via `login/token.php`, or paste their
    mobile web service key). Tokens are stored encrypted with a key derived
@@ -22,20 +37,30 @@
    `GOOGLE_REFRESH_TOKEN_OWNER`. Courses synced before sign-in existed stay
    hidden until the owner signs in, or `python -m app.admin_cli claim-unowned
    EMAIL` assigns them.
-5. Sync on a schedule with a Railway cron service, daily. Syncs go through
-   the job queue — one job per connected user, then the worker drains them
-   and sends notifications:
+5. `sync-cron`: a Railway cron service, daily at 03:00 UTC. Syncs go
+   through the job queue — one job per connected user, then the worker
+   drains them and sends notifications:
    ```
-   python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.sync_cli --source classroom --all-users --enqueue && python -m app.worker
+   alembic upgrade head && python -m app.sync_cli --source moodle --all-users --enqueue && python -m app.sync_cli --source classroom --all-users --enqueue && python -m app.worker
    ```
    Signing in with Google also queues a Classroom sync for that user. Users
    who signed in before Drive access was requested must sign in once more;
    until then their Drive files stay pending.
-   Then extract/chunk/quiz each source (`python -m app.pipeline --source
-   moodle`, then `--source classroom`). Run chunking/quiz generation paced (`--pace 45`, or set `LLM_PACE`)
-   afterwards — the free Gemini tier rate-limits hard, so don't bundle
-   them into the same cron slot.
-   All three steps are idempotent; re-running is always safe.
+6. `pipeline-cron`: a second cron service, daily at 06:00 UTC — a separate
+   slot from the sync, since paced LLM runs take hours and the free Gemini
+   tier rate-limits hard. It extracts, chunks and writes quizzes for what
+   the sync brought in:
+   ```
+   alembic upgrade head && python -m app.pipeline --source moodle --pace 45 && python -m app.pipeline --source classroom --pace 45
+   ```
+   A run that exhausts the LLM quota stops early (`quota_exhausted`) and the
+   next day's run resumes; resources that keep failing back off and are
+   eventually marked failed instead of being re-billed daily.
+
+   Both crons need the web service's variables (`scripts/railway-sync-cron-env.sh
+   <service>` references them, `LLM_*` included); set `LLM_CHUNK_MODEL` /
+   `LLM_QUIZ_MODEL` on `pipeline-cron` only if they differ from the defaults.
+   All steps are idempotent; re-running is always safe.
 
 ## Single VPS (podman)
 
@@ -51,8 +76,14 @@ Cron (daily 06:00 sync + notify for every connected user):
 0 6 * * * cd /srv/study-buddy && .venv/bin/python -m app.sync_cli --source moodle --all-users --enqueue && .venv/bin/python -m app.sync_cli --source classroom --all-users --enqueue && .venv/bin/python -m app.worker
 ```
 
-Long LLM pipeline runs (`app.pipeline` chunk/quiz backfills) stay
-operator-triggered — they run paced over hours and are not queue jobs yet.
+Pipeline (daily 09:00, after the sync; paced LLM runs take hours):
+
+```
+0 9 * * * cd /srv/study-buddy && .venv/bin/python -m app.pipeline --source moodle --pace 45 && .venv/bin/python -m app.pipeline --source classroom --pace 45
+```
+
+The pipeline is not a queue job: it runs from cron (or by hand for a
+backfill), never inside the worker.
 The quiz/chunk runners abort early with `quota_exhausted` when the LLM
 quota is gone; re-run the same command later to resume (completed chunks
 are skipped via generation keys).

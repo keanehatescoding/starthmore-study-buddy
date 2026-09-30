@@ -22,6 +22,11 @@ if db_url:
 
 target_metadata = SQLModel.metadata
 
+# Every Railway service runs `alembic upgrade head` on start (web, worker,
+# crons), so two may migrate at once; the loser waits here, then finds the
+# schema already at head.
+MIGRATION_LOCK_ID = 0x5B_0A1E  # arbitrary, app-wide
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -39,6 +44,9 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
+            if connection.dialect.name == "postgresql":
+                connection.exec_driver_sql(
+                    f"SELECT pg_advisory_xact_lock({MIGRATION_LOCK_ID})")
             context.run_migrations()
 
 
