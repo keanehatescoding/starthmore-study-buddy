@@ -536,6 +536,24 @@ def test_revoke_sessions_ends_existing_sessions(monkeypatch):
         app.dependency_overrides.clear()
 
 
+def test_overlapping_revocations_both_count(tmp_path):
+    # two revocations load the same session_version N; a read-modify-write
+    # would leave N+1 and keep alive a cookie issued between the commits
+    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(User(email="owner@x.edu"))
+        s.commit()
+    with Session(engine) as a, Session(engine) as b:
+        user_a = auth_mod.find_user(a, "owner@x.edu")
+        user_b = auth_mod.find_user(b, "owner@x.edu")
+        assert user_a.session_version == user_b.session_version == 0
+        auth_mod.revoke_sessions(a, user_a)
+        auth_mod.revoke_sessions(b, user_b)
+    with Session(engine) as s:
+        assert auth_mod.find_user(s, "owner@x.edu").session_version == 2
+
+
 def test_session_has_explicit_max_age():
     from starlette.middleware.sessions import SessionMiddleware
 

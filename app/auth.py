@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, func, select
+from sqlmodel import Session, func, select, update
 
 from app.classroom import SCOPES as CLASSROOM_SCOPES
 from app.config import settings
@@ -154,8 +154,13 @@ def _upsert_user(session: Session, email: str, refresh_token: str | None) -> Use
 def revoke_sessions(session: Session, user: User) -> None:
     """End every session `user` has, on every device: sessions carry the
     session_version they began with, and current_user rejects stale ones."""
-    user.session_version += 1
-    session.add(user)
+    # a database-side increment: two overlapping revocations must land on
+    # N+2, not both write N+1 and let a cookie issued in between survive
+    session.exec(
+        update(User)
+        .where(User.id == user.id)
+        .values(session_version=User.session_version + 1)
+    )
     session.commit()
 
 
