@@ -64,11 +64,37 @@ def test_review_due_not_resent_hourly_after_delivery(session, monkeypatch):
     # the hourly worker runs again with the same backlog: no new email
     assert notify.check_review_due(session, user.id, threshold=3) is None
     # after the cooldown the (still due) user is reminded again
-    first.created_at = first.created_at - notify.REVIEW_DUE_COOLDOWN
+    first.sent_at = first.sent_at - notify.REVIEW_DUE_COOLDOWN
     session.add(first)
     session.commit()
     again = notify.check_review_due(session, user.id, threshold=3)
     assert again is not None and again.id != first.id
+
+
+def test_review_due_cooldown_starts_at_delivery(session, monkeypatch):
+    _fake_batches(monkeypatch)
+    user, _ = _course_with_items(session, n_chunks=3)
+    first = notify.check_review_due(session, user.id, threshold=3)
+    # queued for longer than the cooldown (no API key, outage, ...)
+    first.created_at = first.created_at - notify.REVIEW_DUE_COOLDOWN * 2
+    session.add(first)
+    session.commit()
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 1
+    # the next hourly run must not send a second reminder for the same backlog
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+
+
+def test_review_due_cooldown_falls_back_to_created_at(session):
+    user, _ = _course_with_items(session, n_chunks=3)
+    first = notify.check_review_due(session, user.id, threshold=3)
+    first.sent = True  # delivered before sent_at was recorded
+    session.add(first)
+    session.commit()
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+    first.created_at = first.created_at - notify.REVIEW_DUE_COOLDOWN
+    session.add(first)
+    session.commit()
+    assert notify.check_review_due(session, user.id, threshold=3) is not None
 
 
 def test_review_due_threshold_and_dedupe(session):
@@ -375,7 +401,7 @@ def test_ambiguous_batch_failure_resends_same_batch_same_key(session, monkeypatc
     assert len(calls.keys) == 0  # fake raised before recording
     events = session.exec(select(NotificationEvent)).all()
     [key] = {e.batch_key for e in events}
-    assert key and key.startswith("batch-")  # persisted, not split into singles
+    assert key and key.startswith(notify.BATCH_PREFIX)  # persisted, not split into singles
     [first_key] = keys
 
     # a newer event arrives; the next pass resends the old batch unchanged
@@ -456,3 +482,69 @@ def test_identical_emails_for_different_events_get_different_keys():
     one = NotificationEvent(user_id=uuid.UUID(int=0), type="review_due", payload={})
     two = NotificationEvent(user_id=uuid.UUID(int=0), type="review_due", payload={})
     assert notify._idempotency_key([(one, body)]) != notify._idempotency_key([(two, body)])
+
+
+def _legacy_batch(session, n=2, key="batch-legacy"):
+    """A batch persisted (and maybe delivered) before payload-derived keys."""
+    _owned_events(session, n)
+    events = session.exec(select(NotificationEvent)).all()
+    for event in events:
+        event.batch_key = key
+        session.add(event)
+    session.commit()
+    return events
+
+
+def _record_keys(monkeypatch, fail=lambda key: None):
+    seen = []
+
+    def fake(api_key, emails, key, sleep=None):
+        seen.append(key)
+        fail(key)
+
+    monkeypatch.setattr(notify, "send_batch", fake)
+    return seen
+
+
+def test_legacy_batch_resent_with_its_original_key(session, monkeypatch):
+    seen = _record_keys(monkeypatch)
+    events = _legacy_batch(session)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 2
+    assert seen == ["batch-legacy"]  # Resend dedupes the lost first attempt
+    assert all(e.sent and e.batch_key == "batch-legacy" for e in events)
+
+
+def test_legacy_batch_keeps_key_across_ambiguous_failures(session, monkeypatch):
+    def lost(key):
+        raise notify.EmailError("send failed: timed out", "network:TimeoutError")
+
+    seen = _record_keys(monkeypatch, lost)
+    events = _legacy_batch(session)
+    notify.send_pending(session, "key", "from@x")
+    notify.send_pending(session, "key", "from@x")
+    assert seen == ["batch-legacy", "batch-legacy"]
+    assert all(not e.sent and e.batch_key == "batch-legacy" for e in events)
+
+
+def test_legacy_batch_moves_to_new_key_on_payload_conflict(session, monkeypatch):
+    def conflict(key):
+        if key == "batch-legacy":
+            raise notify.EmailError("409", notify.KEY_CONFLICT)
+
+    seen = _record_keys(monkeypatch, conflict)
+    events = _legacy_batch(session)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 2
+    assert seen[0] == "batch-legacy" and seen[1].startswith("sb-")
+    [key] = {e.batch_key for e in events}
+    assert key.startswith(notify.BATCH_PREFIX)
+
+
+def test_legacy_batch_other_409_keeps_legacy_key(session, monkeypatch):
+    def busy(key):
+        raise notify.EmailError("409", "http_409:concurrent_idempotent_requests")
+
+    seen = _record_keys(monkeypatch, busy)
+    events = _legacy_batch(session)
+    assert notify.send_pending(session, "key", "from@x")["failed"] == 2
+    assert seen == ["batch-legacy"]
+    assert all(e.batch_key == "batch-legacy" for e in events)

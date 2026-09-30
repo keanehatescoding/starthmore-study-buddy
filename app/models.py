@@ -177,8 +177,9 @@ class NotificationEvent(SQLModel, table=True):
     sent_at: Optional[datetime] = Field(
         default=None, sa_column=Column(DateTime(timezone=True))
     )
-    # Resend Idempotency-Key of the multi-email batch this event was last sent
-    # in; kept so an ambiguous failure is retried as the same batch, same key.
+    # Multi-email batch this event was last sent in; kept so an ambiguous
+    # failure is retried as the same batch. "b2-..." only groups (the key is
+    # derived from the payload); legacy "batch-..." was the Idempotency-Key.
     batch_key: Optional[str] = Field(default=None, index=True)
 
 
