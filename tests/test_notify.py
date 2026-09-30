@@ -177,10 +177,19 @@ def test_unowned_course_enqueues_nothing_and_creates_no_user(session):
     assert session.exec(select(NotificationEvent)).all() == []
 
 
-def test_review_due_counts_all_due_items(session):
+def test_review_due_counts_all_due_items(session, monkeypatch):
+    from app import grade
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 100)
     user, _ = _course_with_items(session, n_chunks=25)  # > due_items' default page
     event = notify.check_review_due(session, user.id, threshold=3)
     assert event.payload == {"due_count": 25}
+
+
+def test_review_due_respects_daily_new_cap(session):
+    from app import grade
+    user, _ = _course_with_items(session, n_chunks=25)
+    event = notify.check_review_due(session, user.id, threshold=3)
+    assert event.payload == {"due_count": grade.NEW_ITEMS_PER_DAY}
 
 
 def _owned_events(session, n):

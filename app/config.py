@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     llm_chunk_model: str = "gemini-3.6-flash"
     llm_quiz_model: str = "gemini-3.6-flash"
     llm_grade_model: str = "gemini-3.6-flash"
+    # grading runs inside a web request, so it fails fast instead of retrying for minutes
+    llm_grade_timeout: int = 30
+    llm_grade_attempts: int = 2
     llm_pace: float = 0.0  # seconds between pipeline LLM calls; ~5-45 on free tiers
     app_base_url: str = "http://localhost:8000"  # public origin for links in emails
     resend_api_key: str = ""

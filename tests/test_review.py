@@ -54,7 +54,9 @@ def test_review_flow(testapp):
     assert r.status_code == 200 and 'name="answer"' in r.text
 
     r = client.post(f"/review/{item_id}/answer",
-                    data={"answer": "1", "csrf_token": _token(client)})
+                    data={"answer": "1", "csrf_token": _token(client)}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == f"/review/{item_id}/result"
+    r = client.get(r.headers["location"])
     assert r.status_code == 200 and "Correct" in r.text and "Because b." in r.text
 
     r = client.get("/review")
@@ -161,7 +163,7 @@ def test_grader_failure_keeps_answer(testapp, monkeypatch):
     from app.llm import LLMError
 
     class Down:
-        def __init__(self, *a):
+        def __init__(self, *a, **kw):
             pass
 
         def complete_json(self, *a, **k):
@@ -187,3 +189,105 @@ def test_grader_misconfigured_keeps_answer(testapp, monkeypatch):
     r = client.post(f"/review/{item_id}/answer",
                     data={"answer": "my answer", "csrf_token": _token(client)})
     assert r.status_code == 503 and "my answer</textarea>" in r.text
+
+
+def test_replayed_answer_not_regraded(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    token = _token(client)
+    client.post(f"/review/{item_id}/answer", data={"answer": "1", "csrf_token": token})
+    # back + resubmit with a different answer: shows the recorded result
+    r = client.post(f"/review/{item_id}/answer", data={"answer": "0", "csrf_token": token})
+    assert r.status_code == 200 and "Correct" in r.text
+    with Session() as s:
+        state = s.exec(select(ReviewState)).one()
+        assert state.repetitions == 1 and state.lapses == 0
+
+
+def test_result_page_needs_a_result(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    r = client.get(f"/review/{item_id}/result", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/review/take"
+
+
+def test_long_short_answer_rejected(testapp, monkeypatch):
+    client, Session = testapp["client"], testapp["Session"]
+    _seed(Session)
+    item_id = _short(Session)
+    from app import main
+    calls = []
+
+    class Counting:
+        def __init__(self, *a, **kw):
+            pass
+
+        def complete_json(self, *a, **k):
+            calls.append(a)
+            return {"correct": True}
+
+    monkeypatch.setattr(main, "LLMClient", Counting)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "x" * 4001, "csrf_token": _token(client)})
+    assert calls == []  # rejected before grading
+    assert r.status_code == 400 and "limited to 4,000 characters" in r.text
+    assert 'maxlength="4000"' in r.text
+
+
+def test_grader_gets_short_timeout(testapp, monkeypatch):
+    client, Session = testapp["client"], testapp["Session"]
+    _seed(Session)
+    item_id = _short(Session)
+    from app import main
+    seen = {}
+
+    class Fast:
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        def complete_json(self, *a, **k):
+            return {"correct": True, "feedback": "Nice."}
+
+    monkeypatch.setattr(main, "LLMClient", Fast)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "because", "csrf_token": _token(client)})
+    assert "Correct" in r.text and "Nice." in r.text
+    assert seen["timeout"] <= 30 and seen["max_attempts"] <= 2
+
+
+def test_long_feedback_survives_the_redirect(testapp, monkeypatch):
+    # feedback lives in ReviewState, not the cookie-backed session
+    client, Session = testapp["client"], testapp["Session"]
+    _seed(Session)
+    item_id = _short(Session)
+    from app import main
+    feedback = "🙂 Great answer. " * 300  # ~5k chars, ~50k once JSON-escaped
+
+    class Chatty:
+        def __init__(self, *a, **kw):
+            pass
+
+        def complete_json(self, *a, **k):
+            return {"correct": True, "partial_credit": 1.0, "feedback": feedback}
+
+    monkeypatch.setattr(main, "LLMClient", Chatty)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "because", "csrf_token": _token(client)})
+    assert r.status_code == 200 and "Correct" in r.text
+    assert feedback.strip() in r.text
+    assert len(client.cookies.get("session", "")) < 4000
+
+
+def test_new_item_past_cap_redirects_to_queue(testapp, monkeypatch):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    from app import grade
+    monkeypatch.setattr(grade, "NEW_ITEMS_PER_DAY", 0)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/settings/moodle").text)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "1", "csrf_token": token.group(1)}, follow_redirects=False)
+    assert r.status_code == 303
+    assert client.get(r.headers["location"], follow_redirects=False).headers["location"] \
+        == "/review/take"
+    with Session() as s:
+        assert s.exec(select(ReviewState)).first() is None

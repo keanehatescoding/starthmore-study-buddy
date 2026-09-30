@@ -32,6 +32,18 @@ Rules:
   "grading_criteria": "...", "explanation": "...", "difficulty": "recall"|"application"|"synthesis"}]}"""
 
 
+def _mcq_answer(value) -> int | None:
+    """The model's MCQ answer as an option index. JSON gives 2, 2.0 or "2";
+    a bool (int(True) == 1) or a fractional index isn't an answer."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else None
+
+
 def _valid(item: dict) -> bool:
     if not item.get("question", "").strip():
         return False
@@ -39,11 +51,8 @@ def _valid(item: dict) -> bool:
         return False
     if item.get("question_type") == "mcq":
         opts = item.get("options") or []
-        try:
-            idx = int(item.get("correct_answer"))
-        except (TypeError, ValueError):
-            return False
-        return len(opts) == 4 and 0 <= idx < 4
+        idx = _mcq_answer(item.get("correct_answer"))
+        return len(opts) == 4 and idx is not None and 0 <= idx < 4
     if item.get("question_type") == "short_answer":
         return bool(item.get("grading_criteria", "").strip()) and bool(
             str(item.get("correct_answer", "")).strip()
@@ -86,7 +95,9 @@ def generate_for_chunk(
             question=item["question"].strip(),
             question_type=qtype,
             options=item.get("options") if qtype == "mcq" else None,
-            correct_answer=str(item["correct_answer"]).strip(),
+            # stored as "2", the form the grader compares a submitted index to
+            correct_answer=(str(_mcq_answer(item["correct_answer"])) if qtype == "mcq"
+                            else str(item["correct_answer"]).strip()),
             grading_criteria=item.get("grading_criteria"),
             explanation=item.get("explanation"),
             difficulty=item["difficulty"],
