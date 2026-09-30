@@ -20,6 +20,10 @@
       Sign in with your Google account. One consent covers login and Google Classroom sync.
     </p>
 
+    {% if flash %}
+    <div class="notice notice-{{ flash.kind }}" role="alert">{{ flash.text }}</div>
+    {% endif %}
+
     <!-- Google Sign In Button -->
     <a href="/login/google" class="google-btn">
       <svg width="20" height="20" viewBox="0 0 24 24">

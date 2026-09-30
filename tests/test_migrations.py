@@ -169,3 +169,13 @@ def test_0011_adds_retry_columns_and_requeues_empty_chunkings(engine):
         c.execute(text("SELECT chunk_id, attempt FROM quiz_attempts"))
     assert got == {"empty": ("extracted", None, 0, None),
                    "other": ("failed", "unsupported type (mime=?, file=?)", 0, None)}
+
+
+def test_0012_existing_users_start_at_session_version_zero(engine):
+    m = _migration("0012_session_version")
+    with engine.begin() as c:  # the schema as of 0011
+        c.execute(text("ALTER TABLE users DROP COLUMN session_version"))
+    _users(engine, [("a@x.edu", None)])
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        assert c.execute(text("SELECT session_version FROM users")).scalars().all() == [0]

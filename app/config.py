@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     email_to: str = ""
     secret_key: str = INSECURE_SECRET_KEY
     session_secure_cookie: bool = False
+    session_max_age: int = 7 * 24 * 3600  # seconds a sign-in lasts without use
+    dev: bool = False  # local development: allows the public default SECRET_KEY
     # comma-separated addresses and/or "@domain" entries; empty = any Google account
     allowed_emails: str = "@strathmore.edu"
     healthcheck_ping_url: str = ""  # e.g. healthchecks.io ping on worker success
@@ -52,13 +54,18 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _require_real_secret_in_prod(self):
-        # SECRET_KEY signs sessions and encrypts stored tokens; the default is public.
+    def _require_real_secret(self):
+        # SECRET_KEY signs sessions and encrypts stored tokens; the default is
+        # public, so only an explicit DEV=1 accepts it, and never on a host
+        # that is clearly production (HTTPS cookies, Railway).
         in_prod = self.session_secure_cookie or any(
             os.environ.get(k) for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME")
         )
-        if in_prod and self.secret_key in ("", INSECURE_SECRET_KEY):
-            raise ValueError("SECRET_KEY must be set to a random value in production")
+        if self.secret_key in ("", INSECURE_SECRET_KEY) and (in_prod or not self.dev):
+            raise ValueError(
+                "SECRET_KEY must be set to a random value (openssl rand -hex 32); "
+                "for local development only, set DEV=1 to use the default"
+            )
         return self
 
     @model_validator(mode="after")

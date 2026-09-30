@@ -3,6 +3,7 @@ from uuid import UUID
 
 import hmac
 import secrets
+import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -22,7 +23,7 @@ from app.llm import LLMClient, LLMError
 from app.models import (
     Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic, User,
 )
-from app.security import RateLimitMiddleware, SecurityHeadersMiddleware
+from app.security import RateLimitMiddleware, SecurityHeadersMiddleware, hit_table
 from app.stats import compute_stats
 
 app = FastAPI(title="Strathmore Study Buddy")
@@ -33,6 +34,7 @@ app.add_middleware(
     secret_key=settings.secret_key,
     same_site="lax",
     https_only=settings.session_secure_cookie,
+    max_age=settings.session_max_age,
 )
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
 static_dir = Path(__file__).parent.parent / "static"
@@ -60,11 +62,25 @@ def email_allowed(email: str) -> bool:
 def current_user(
     request: Request, session: Session = Depends(get_session)
 ) -> User:
+    """The signed-in user. A session ends when the user is deleted, their
+    sessions are revoked (session_version bumped: logout, admin_cli), or
+    their address leaves ALLOWED_EMAILS."""
     user_id = request.session.get("user_id")
-    user = session.get(User, user_id) if user_id else None
-    if user is None:
+    user = session.get(User, UUID(user_id)) if _is_uuid(user_id) else None
+    if (user is None
+            or request.session.get("session_version") != user.session_version
+            or not email_allowed(user.email)):
+        request.session.clear()  # so /login doesn't bounce back to /
         raise HTTPException(status_code=401, detail="login required")
     return user
+
+
+def _is_uuid(value) -> bool:
+    try:
+        UUID(str(value))
+    except ValueError:
+        return False
+    return True
 
 
 def owned_course(session: Session, user: User, course_id: UUID) -> Course:
@@ -127,7 +143,8 @@ def health(session: Session = Depends(get_session)):
 def login_page(request: Request):
     if request.session.get("user_id"):
         return RedirectResponse(url="/", status_code=303)
-    return templates.TemplateResponse(request, "login.html", {})
+    return templates.TemplateResponse(
+        request, "login.html", {"flash": request.session.pop("flash", None)})
 
 
 @app.get("/login/google")
@@ -141,33 +158,63 @@ def login_google(request: Request):
     )
 
 
+def _login_failed(request: Request, text: str, status_code: int = 303):
+    _flash(request, "error", text)
+    return RedirectResponse(url="/login", status_code=status_code)
+
+
 @app.get("/auth/callback")
 def auth_callback(
     request: Request, session: Session = Depends(get_session),
-    code: str = "", state: str = "",
+    code: str = "", state: str = "", error: str = "",
 ):
-    if not code or state != request.session.pop("oauth_state", None):
-        raise HTTPException(400, "invalid oauth state")
+    expected_state = request.session.pop("oauth_state", None)
+    if error:
+        # e.g. access_denied: they cancelled on Google's consent screen
+        return _login_failed(request, "Google sign-in was cancelled. Try again when you're ready.")
+    if not code or not expected_state or state != expected_state:
+        return _login_failed(request, "That sign-in link expired. Please sign in again.")
     redirect_uri = str(request.url_for("auth_callback"))
-    tokens = auth_mod.exchange_code(
-        settings.google_client_id, settings.google_client_secret, code, redirect_uri
-    )
-    email = auth_mod.fetch_email(tokens["access_token"])
+    try:
+        tokens = auth_mod.exchange_code(
+            settings.google_client_id, settings.google_client_secret, code, redirect_uri
+        )
+        if not tokens.get("access_token"):
+            raise auth_mod.AuthError("token response had no access_token")
+        email = auth_mod.fetch_email(tokens["access_token"])
+    except auth_mod.AuthError:
+        # expired or reused code, Google unreachable, unverified email
+        return _login_failed(request, "Google sign-in didn't complete. Please try again.")
     if not email_allowed(email):
-        raise HTTPException(403, "sign-in not allowed for this account")
+        return _login_failed(
+            request, f"{email} isn't allowed to sign in here. Use your university account.")
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
     if tokens.get("refresh_token"):
         # a fresh Classroom (+ Drive) grant: pull their classes now
         from app.jobs import enqueue_sync_once
 
         enqueue_sync_once(session, "classroom", user.email)
+    # a fresh session: nothing from before sign-in (CSRF token, flash) carries over
+    request.session.clear()
     request.session["user_id"] = str(user.id)
+    request.session["session_version"] = user.session_version
     return RedirectResponse(url="/", status_code=303)
 
 
+def _revoke_user_sessions(session: Session, user_id, version) -> None:
+    user = session.get(User, UUID(user_id)) if _is_uuid(user_id) else None
+    # only a live session may revoke: an already-revoked copy of the cookie
+    # must not be able to keep signing the user out
+    if user is not None and user.session_version == version:
+        auth_mod.revoke_sessions(session, user)
+
+
 @app.post("/logout")
-async def logout(request: Request):
+async def logout(request: Request, session: Session = Depends(get_session)):
     await checked_form(request)
+    # server-side too: a copied cookie stops working, not just this browser's
+    await run_in_threadpool(_revoke_user_sessions, session, request.session.get("user_id"),
+                            request.session.get("session_version"))
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
 
@@ -347,22 +394,26 @@ async def review_answer(
 ):
     form = await checked_form(request)
     answer = str(form.get("answer", ""))
+    # the DB work and grading are blocking: keep them off the event loop
+    return await run_in_threadpool(_answer_and_redirect, request, session, user, item_id, answer)
+
+
+def _answer_and_redirect(
+    request: Request, session: Session, user: User, item_id: UUID, answer: str,
+):
     item = session.get(QuizItem, item_id)
     if item is None or not user_owns_item(session, user.id, item_id):
         raise HTTPException(404, "quiz item not found")
-
-    def grade():
+    try:
         llm = None
         if item.question_type == "short_answer":
+            # raises LLMError when unconfigured: handled like an outage below
             llm = LLMClient(
                 settings.llm_base_url, settings.llm_api_key, settings.llm_grade_model,
                 timeout=settings.llm_grade_timeout,
                 max_attempts=settings.llm_grade_attempts, max_backoff=5,
             )
-        return submit_answer(session, user.id, item.id, answer, llm)
-
-    try:
-        result = await run_in_threadpool(grade)
+        submit_answer(session, user.id, item.id, answer, llm)
     except NotDue:
         # a replayed or double submit: show what was already recorded
         return RedirectResponse(_result_path(item), status_code=303)
@@ -478,6 +529,25 @@ async def _connect_and_redirect(request, session, user, get_token) -> RedirectRe
     return RedirectResponse("/settings/moodle", status_code=303)
 
 
+MOODLE_LOGIN_LIMIT = (5, 15 * 60)  # attempts per window, per account and per username
+
+
+def _moodle_login_wait(request: Request, user: User, username: str) -> float | None:
+    """Seconds to wait before another Moodle password attempt, else None.
+
+    The form checks passwords against Moodle, so the global POST budget alone
+    would let one account guess another student's password 120 times a
+    minute. Limit by our account (one user trying many usernames) and by the
+    Moodle username (many accounts trying one username)."""
+    limit, window = getattr(request.app.state, "moodle_login_limit", MOODLE_LOGIN_LIMIT)
+    table = hit_table(request.app, "moodle_login_hits")
+    now = time.monotonic()
+    waits = [table.hit(key, limit, window, now)
+             for key in (f"user:{user.id}", f"moodle:{username.lower()}")]
+    waits = [w for w in waits if w is not None]
+    return max(waits) if waits else None
+
+
 @app.post("/settings/moodle/login")
 async def moodle_login(
     request: Request,
@@ -491,6 +561,11 @@ async def moodle_login(
     password = str(form.get("password", ""))
     if not username or not password:
         _flash(request, "error", "Enter your Moodle username and password.")
+        return RedirectResponse("/settings/moodle", status_code=303)
+    wait = _moodle_login_wait(request, user, username)
+    if wait is not None:
+        _flash(request, "error", "Too many Moodle sign-in attempts. Try again in "
+               f"{int(wait // 60) + 1} minute(s), or paste your key below instead.")
         return RedirectResponse("/settings/moodle", status_code=303)
     return await _connect_and_redirect(
         request, session, user,
@@ -512,6 +587,12 @@ async def moodle_token(
     return await _connect_and_redirect(request, session, user, lambda: token)
 
 
+def _disconnect_moodle(session: Session, user: User) -> None:
+    user.moodle_token = None
+    session.add(user)
+    session.commit()
+
+
 @app.post("/settings/moodle/disconnect")
 async def moodle_disconnect(
     request: Request,
@@ -519,9 +600,7 @@ async def moodle_disconnect(
     user: User = Depends(current_user),
 ):
     await checked_form(request)
-    user.moodle_token = None
-    session.add(user)
-    session.commit()
+    await run_in_threadpool(_disconnect_moodle, session, user)
     _flash(request, "success",
            "Disconnected. Already-synced courses stay; new material won't sync.")
     return RedirectResponse("/settings/moodle", status_code=303)

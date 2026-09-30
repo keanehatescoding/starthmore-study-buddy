@@ -22,6 +22,7 @@ jobs:
           --health-interval=5s --health-timeout=5s --health-retries=10
     env:
       DATABASE_URL: postgresql+psycopg://studybuddy:studybuddy@localhost:5432/studybuddy
+      DEV: "1"  # the public default SECRET_KEY is fine for tests
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -12,12 +12,13 @@ import secrets
 import urllib.parse
 import urllib.request
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, func, select
 
 from app.classroom import SCOPES as CLASSROOM_SCOPES
-from app.drive import SCOPE as DRIVE_SCOPE
 from app.config import settings
 from app.crypto import seal, unseal
+from app.drive import SCOPE as DRIVE_SCOPE
 from app.models import Course, User
 
 # drive.readonly: Classroom materials are mostly Drive files (app.drive)
@@ -123,8 +124,21 @@ def sign_in(
 ) -> User:
     """Upsert user by email, store Classroom refresh token, claim courses."""
     email = normalize_email(email)
+    try:
+        user = _upsert_user(session, email, refresh_token)
+    except IntegrityError:
+        # a concurrent first sign-in for this email inserted the row between
+        # our lookup and commit; the retry finds and updates that row
+        session.rollback()
+        user = _upsert_user(session, email, refresh_token)
+    if _may_claim_unowned(user):
+        claim_unowned(session, user, source="moodle")
+        session.refresh(user)
+    return user
+
+
+def _upsert_user(session: Session, email: str, refresh_token: str | None) -> User:
     user = find_user(session, email)
-    is_new = user is None
     if user is None:
         user = User(email=email)
     elif user.email != email:
@@ -134,10 +148,15 @@ def sign_in(
     session.add(user)
     session.commit()
     session.refresh(user)
-    if _may_claim_unowned(user):
-        claim_unowned(session, user, source="moodle")
-        session.refresh(user)
     return user
+
+
+def revoke_sessions(session: Session, user: User) -> None:
+    """End every session `user` has, on every device: sessions carry the
+    session_version they began with, and current_user rejects stale ones."""
+    user.session_version += 1
+    session.add(user)
+    session.commit()
 
 
 def claim_unowned(
