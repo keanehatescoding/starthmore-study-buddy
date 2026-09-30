@@ -90,21 +90,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> int:
-    """Recover jobs whose worker died mid-run. Returns how many were reaped."""
+def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> dict:
+    """Recover jobs whose worker died mid-run. Returns {"reaped": n} plus
+    {"failed": m} for those out of attempts, so callers count them as failures."""
     cutoff = _utcnow() - timeout
     stale = session.exec(
         select(Job)
         .where(Job.status == "running", Job.updated_at < cutoff)
         .with_for_update(skip_locked=True)
     ).all()
+    out: dict = {}
     for job in stale:
         job.error = f"timed out after {timeout} in running (worker died?)"
         job.status = "failed" if job.attempts >= job.max_attempts else "pending"
         job.available_at = job.updated_at = _utcnow()
         session.add(job)
+        if job.status == "failed":
+            out["failed"] = out.get("failed", 0) + 1
     session.commit()
-    return len(stale)
+    if stale:
+        out["reaped"] = len(stale)
+    return out
 
 
 def prune_finished(session: Session, older_than: timedelta) -> int:
@@ -203,9 +209,8 @@ def run_due(session: Session, limit: int = 5) -> dict:
     """Claim and execute up to `limit` due pending jobs. Returns a summary."""
     global in_handler
     summary: dict = {"completed": 0, "failed": 0, "retried": 0}
-    reaped = reap_stale(session)
-    if reaped:
-        summary["reaped"] = reaped
+    for key, n in reap_stale(session).items():
+        summary[key] = summary.get(key, 0) + n
     for _ in range(limit):
         if STOP.is_set():
             break
@@ -220,6 +225,8 @@ def run_due(session: Session, limit: int = 5) -> dict:
                 raise ValueError(f"no handler for job type {job.type!r}")
             in_handler = True
             try:
+                if STOP.is_set():  # SIGTERM landed during the claim
+                    raise Shutdown("stop requested before handler start")
                 with _Heartbeat(session.get_bind(), job_id, claim):
                     result = fn(session, payload)
             finally:

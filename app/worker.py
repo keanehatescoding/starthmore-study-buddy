@@ -50,9 +50,8 @@ def _drain() -> dict:
     with Session(engine) as session:
         # Reap first: a notify job orphaned by a crashed worker would
         # otherwise block this pass's enqueue and then be failed unrun.
-        reaped = reap_stale(session)
-        if reaped:
-            totals["reaped"] = reaped
+        for key, n in reap_stale(session).items():
+            totals[key] = totals.get(key, 0) + n
         pruned = prune_finished(session, timedelta(days=settings.job_retention_days))
         if pruned:
             totals["pruned"] = pruned

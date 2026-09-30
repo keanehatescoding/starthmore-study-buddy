@@ -302,6 +302,24 @@ def test_shutdown_hands_running_job_back_with_attempt_refunded(session, monkeypa
     assert not jobs.in_handler
 
 
+def test_stop_during_claim_hands_job_back_unrun(session, fake_handler, monkeypatch):
+    claim = jobs._claim_next
+
+    def claim_then_sigterm(s):
+        job = claim(s)
+        jobs.STOP.set()  # signal lands mid-claim, before in_handler is set
+        return job
+
+    monkeypatch.setattr(jobs, "_claim_next", claim_then_sigterm)
+    job = enqueue(session, "fake", {"n": 1})
+    with pytest.raises(Shutdown):
+        run_due(session)
+    assert fake_handler == []
+    row = session.get(Job, job.id)
+    session.refresh(row)
+    assert row.status == "pending" and row.attempts == 0
+
+
 def test_stop_flag_stops_claiming(session, fake_handler):
     enqueue(session, "fake", {"n": 1})
     jobs.STOP.set()
@@ -340,6 +358,24 @@ def test_worker_pings_fail_when_a_job_fails(worker_engine, monkeypatch):
     assert worker.run_once()["failed"] == 1
     worker.run_once()
     assert pings == [True, False]
+
+
+def test_worker_pings_fail_only_when_a_reaped_job_fails(worker_engine, monkeypatch):
+    pings: list = []
+    monkeypatch.setattr(worker, "ping_healthcheck", lambda fail=False: pings.append(fail))
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: None)
+    monkeypatch.setitem(HANDLERS, "fake", lambda s, p: None)
+    old = datetime.now(timezone.utc) - RUNNING_TIMEOUT - timedelta(minutes=1)
+    with Session(worker_engine) as s:
+        _set(s, enqueue(s, "fake", {}), status="running", attempts=1, updated_at=old)
+    out = worker.run_once()  # requeued and rerun: healthy
+    assert out["reaped"] == 1 and out["failed"] == 0
+    with Session(worker_engine) as s:
+        _set(s, enqueue(s, "fake", {}, max_attempts=1),
+             status="running", attempts=1, updated_at=old)
+    out = worker.run_once()  # out of attempts: a terminal failure
+    assert out["reaped"] == 1 and out["failed"] == 1
+    assert pings == [False, True]
 
 
 def test_worker_pings_fail_when_the_pass_crashes(worker_engine, monkeypatch):
