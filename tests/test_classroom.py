@@ -1,5 +1,7 @@
 """Classroom adapter: pagination, untopic'd materials, Drive change markers."""
 
+from datetime import datetime, timezone
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -177,3 +179,26 @@ def test_material_moved_to_other_materials_is_moved_not_duplicated(session):
     after = session.exec(select(Resource)).one()
     assert after.id == before.id
     assert session.get(Topic, after.topic_id).source_id == UNTAGGED_TOPIC_ID
+
+
+class _Coursework:
+    def __init__(self, work):
+        self.work = work
+
+    def list_coursework(self, course_id):
+        return [self.work]
+
+
+@pytest.mark.parametrize("due_time, expected", [
+    ({"hours": 14}, (14, 0, 0)),
+    ({}, (0, 0, 0)),
+    ({"hours": 14, "minutes": 30, "seconds": 45}, (14, 30, 45)),
+    ({"minutes": 5}, (0, 5, 0)),
+    (None, (23, 59, 59)),  # no dueTime at all: end of the due day
+])
+def test_due_time_omitted_fields_are_zero(due_time, expected):
+    work = {"id": "w1", "dueDate": {"year": 2026, "month": 10, "day": 1}}
+    if due_time is not None:
+        work["dueTime"] = due_time
+    [a] = ClassroomAdapter(_Coursework(work)).fetch_assignments("c1")
+    assert a.due_date == datetime(2026, 10, 1, *expected, tzinfo=timezone.utc)

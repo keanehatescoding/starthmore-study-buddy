@@ -203,10 +203,13 @@ class ClassroomAdapter:
             due = None
             if w.get("dueDate"):
                 d = w["dueDate"]
-                t = w.get("dueTime", {})
+                # proto3 JSON omits zero fields ({"hours": 14} is 14:00, {} is
+                # midnight); only a missing dueTime means end of day
+                t = w.get("dueTime", {"hours": 23, "minutes": 59, "seconds": 59})
                 due = datetime(
                     d["year"], d.get("month", 1), d.get("day", 1),
-                    t.get("hours", 23), t.get("minutes", 59), tzinfo=timezone.utc,
+                    t.get("hours", 0), t.get("minutes", 0), t.get("seconds", 0),
+                    tzinfo=timezone.utc,
                 )
             out.append(
                 AssignmentData(
