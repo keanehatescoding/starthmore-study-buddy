@@ -18,6 +18,7 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from app.llm import LLMClient, TruncatedError
+from app.llm_schemas import ChunkReply
 from app.models import Chunk
 
 MAX_SECTION_CHARS = 10000
@@ -97,21 +98,6 @@ def locate(content: str, full: str) -> tuple[int | None, int | None]:
     return start_orig, end_orig
 
 
-def _chunks_of(data: dict) -> list[dict]:
-    """Usable chunks from a reply; malformed entries are dropped."""
-    raw = data["chunks"] if isinstance(data["chunks"], list) else []
-    out = []
-    for c in raw:
-        if not isinstance(c, dict) or not isinstance(c.get("content"), str):
-            continue
-        if not c["content"].strip():
-            continue
-        title = c.get("title")
-        title = title.strip() if isinstance(title, str) and title.strip() else "Untitled"
-        out.append({"title": title[:200], "content": c["content"]})
-    return out
-
-
 def chunk_sections(sections: list[str], llm: LLMClient) -> list[dict]:
     out = []
     for i, section in enumerate(sections):
@@ -128,7 +114,7 @@ def chunk_sections(sections: list[str], llm: LLMClient) -> list[dict]:
             # the reply outgrew the output limit: two halves fit
             out.extend(chunk_sections(presplit(section, len(section) // 2 + 1), llm))
             continue
-        out.extend(_chunks_of(data))
+        out.extend(c.model_dump() for c in ChunkReply.model_validate(data).chunks)
     return out
 
 

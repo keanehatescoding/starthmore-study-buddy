@@ -21,6 +21,7 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
+from app.llm_schemas import GradeOut
 from app.models import (
     Chunk,
     Course,
@@ -54,15 +55,6 @@ def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _flag(value) -> bool | None:
-    """A JSON boolean, tolerating "true"/"false" strings (bool("false") is True)."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
-        return value.strip().lower() == "true"
-    return None
-
-
 def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
     data = llm.complete_json(
         GRADE_SYSTEM,
@@ -70,19 +62,11 @@ def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
         f"Key points: {item.grading_criteria}\nStudent answer: {answer}",
         temperature=0.0,
     )
-    try:
-        partial = float(data["partial_credit"])
-    except (KeyError, TypeError, ValueError):
-        partial = None
-    if partial is None or partial != partial:  # missing, garbage or NaN
-        # fall back to the grader's verdict instead of scoring it a lapse
-        partial = 1.0 if _flag(data.get("correct")) else 0.0
-    partial = min(1.0, max(0.0, partial))
-    feedback = str(data.get("feedback") or "").strip() or "No feedback provided."
+    graded = GradeOut.model_validate(data)
     return {
-        "correct": partial >= PASS_CREDIT,
-        "partial_credit": partial,
-        "feedback": feedback,
+        "correct": graded.partial_credit >= PASS_CREDIT,
+        "partial_credit": graded.partial_credit,
+        "feedback": graded.feedback,
     }
 
 

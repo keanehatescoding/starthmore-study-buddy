@@ -10,6 +10,7 @@ dependencies = [
     "sqlmodel>=0.0.22",
     "alembic>=1.13",
     "psycopg[binary]>=3.1",
+    "pydantic>=2.7",
     "pydantic-settings>=2.5",
     "python-dotenv>=1.0",  # migration 0005 reads .env the way pydantic-settings does
     "python-multipart>=0.0.18",
