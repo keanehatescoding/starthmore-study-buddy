@@ -103,21 +103,40 @@ document.addEventListener('DOMContentLoaded', () => {
       }, 2000);
     };
 
-    copyBtn.addEventListener('click', async () => {
-      try {
-        const url = copyBtn.dataset.fullTextUrl;
-        let text = extractedPre.textContent;
-        if (url) {
-          const resp = await fetch(url, { credentials: 'same-origin' });
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          text = await resp.text();
-        }
-        await navigator.clipboard.writeText(text);
-        flash('✓ Copied!', true);
-      } catch (err) {
-        console.error('Failed to copy text', err);
-        flash('Copy failed', false);
+    const fetchFullText = async (url) => {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return resp.text();
+    };
+
+    // The clipboard write must start synchronously inside the click handler:
+    // Safari rejects writes issued after an await (user activation is lost).
+    // For the full-text case, hand ClipboardItem a promise so the fetch can
+    // resolve later while the write itself starts now.
+    const copy = () => {
+      const url = copyBtn.dataset.fullTextUrl;
+      if (!url) return navigator.clipboard.writeText(extractedPre.textContent);
+      if (typeof ClipboardItem === 'undefined') {
+        return fetchFullText(url).then((text) => navigator.clipboard.writeText(text));
       }
+      const blob = fetchFullText(url).then((text) => new Blob([text], { type: 'text/plain' }));
+      return navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })]);
+    };
+
+    copyBtn.addEventListener('click', () => {
+      let pending;
+      try {
+        pending = copy();
+      } catch (err) {
+        pending = Promise.reject(err);
+      }
+      pending.then(
+        () => flash('✓ Copied!', true),
+        (err) => {
+          console.error('Failed to copy text', err);
+          flash('Copy failed', false);
+        },
+      );
     });
   }
 });
