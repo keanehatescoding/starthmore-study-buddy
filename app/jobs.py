@@ -15,6 +15,10 @@ instead of blocking the CLI caller.
   worker whose claim was reaped and re-taken can't record its result.
 - send_notifications is only claimed once no other job is running or due,
   on any worker, so it never notifies about half-synced data.
+- A worker told to stop (SIGTERM on redeploy) raises Shutdown into the
+  running handler; the job goes straight back to pending with its attempt
+  refunded, instead of waiting out the lease and burning a retry.
+- prune_finished() deletes completed/failed jobs past their retention.
 - Job types: "sync" (Moodle/Classroom course sync), "send_notifications".
 """
 
@@ -23,7 +27,7 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, exists, or_, update
+from sqlalchemy import and_, delete, exists, or_, update
 from sqlalchemy.orm import aliased
 from sqlmodel import Session, select
 
@@ -35,6 +39,18 @@ HANDLERS: dict[str, callable] = {}
 # RUNNING_TIMEOUT is presumed orphaned. Handler runtime itself is unbounded.
 HEARTBEAT_EVERY = timedelta(minutes=1)
 RUNNING_TIMEOUT = timedelta(minutes=10)
+
+
+class Shutdown(BaseException):
+    """Raised into a running handler when the worker is asked to stop.
+    A BaseException, so handlers' `except Exception` blocks don't eat it."""
+
+
+# Set when the worker should stop: run_due claims nothing more. `in_handler`
+# tells the signal handler whether raising Shutdown lands inside run_due's
+# try (safe to hand the job back) or should wait for the next claim check.
+STOP = threading.Event()
+in_handler = False
 
 
 def handler(job_type: str):
@@ -74,21 +90,40 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> int:
-    """Recover jobs whose worker died mid-run. Returns how many were reaped."""
+def reap_stale(session: Session, timeout: timedelta = RUNNING_TIMEOUT) -> dict:
+    """Recover jobs whose worker died mid-run. Returns {"reaped": n} plus
+    {"failed": m} for those out of attempts, so callers count them as failures."""
     cutoff = _utcnow() - timeout
     stale = session.exec(
         select(Job)
         .where(Job.status == "running", Job.updated_at < cutoff)
         .with_for_update(skip_locked=True)
     ).all()
+    out: dict = {}
     for job in stale:
         job.error = f"timed out after {timeout} in running (worker died?)"
         job.status = "failed" if job.attempts >= job.max_attempts else "pending"
         job.available_at = job.updated_at = _utcnow()
         session.add(job)
+        if job.status == "failed":
+            out["failed"] = out.get("failed", 0) + 1
     session.commit()
-    return len(stale)
+    if stale:
+        out["reaped"] = len(stale)
+    return out
+
+
+def prune_finished(session: Session, older_than: timedelta) -> int:
+    """Delete completed/failed jobs last touched before `older_than` ago.
+    Returns how many were deleted."""
+    pruned = session.execute(
+        delete(Job).where(
+            Job.status.in_(("completed", "failed")),
+            Job.updated_at < _utcnow() - older_than,
+        )
+    ).rowcount
+    session.commit()
+    return pruned
 
 
 def _claim_next(session: Session) -> Job | None:
@@ -172,11 +207,13 @@ def _finish(session: Session, job_id, claim: int, **values) -> bool:
 
 def run_due(session: Session, limit: int = 5) -> dict:
     """Claim and execute up to `limit` due pending jobs. Returns a summary."""
+    global in_handler
     summary: dict = {"completed": 0, "failed": 0, "retried": 0}
-    reaped = reap_stale(session)
-    if reaped:
-        summary["reaped"] = reaped
+    for key, n in reap_stale(session).items():
+        summary[key] = summary.get(key, 0) + n
     for _ in range(limit):
+        if STOP.is_set():
+            break
         job = _claim_next(session)
         if job is None:
             break
@@ -186,11 +223,24 @@ def run_due(session: Session, limit: int = 5) -> dict:
         try:
             if fn is None:
                 raise ValueError(f"no handler for job type {job.type!r}")
-            with _Heartbeat(session.get_bind(), job_id, claim):
-                result = fn(session, payload)
+            in_handler = True
+            try:
+                if STOP.is_set():  # SIGTERM landed during the claim
+                    raise Shutdown("stop requested before handler start")
+                with _Heartbeat(session.get_bind(), job_id, claim):
+                    result = fn(session, payload)
+            finally:
+                in_handler = False
             outcome = "completed"
             values = {"status": "completed", "error": None,
                       "payload": {**payload, "result": result}}
+        except (Shutdown, KeyboardInterrupt):
+            # Stopping mid-job: hand it straight back, attempt refunded, so
+            # the next worker runs it now rather than after the lease lapses.
+            session.rollback()
+            _finish(session, job_id, claim, status="pending", attempts=claim - 1,
+                    available_at=_utcnow(), error="interrupted by worker shutdown")
+            raise
         except Exception as e:  # noqa: BLE001 — recorded on the row, never dropped
             session.rollback()  # a DB error inside the handler poisons the txn
             values = {"error": f"{type(e).__name__}: {e}"[:2000]}

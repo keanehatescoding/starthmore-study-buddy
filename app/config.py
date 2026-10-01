@@ -2,8 +2,10 @@ import os
 import warnings
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.dburl import normalize_database_url
 
 INSECURE_SECRET_KEY = "dev-insecure-change-me"
 
@@ -38,12 +40,18 @@ class Settings(BaseSettings):
     dev: bool = False  # local development: allows the public default SECRET_KEY
     # comma-separated addresses and/or "@domain" entries; empty = any Google account
     allowed_emails: str = "@strathmore.edu"
-    healthcheck_ping_url: str = ""  # e.g. healthchecks.io ping on worker success
+    healthcheck_ping_url: str = ""  # e.g. healthchecks.io; the worker pings it every pass
+    job_retention_days: int = 30  # finished (completed/failed) jobs older than this are pruned
     timezone: str = "Africa/Nairobi"  # IANA zone whose midnight starts a study day
 
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @field_validator("database_url")
+    @classmethod
+    def _psycopg_driver(cls, v: str) -> str:
+        return normalize_database_url(v)
 
     @model_validator(mode="after")
     def _require_known_timezone(self):

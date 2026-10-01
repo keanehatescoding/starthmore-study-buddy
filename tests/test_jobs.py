@@ -1,6 +1,8 @@
 """Job queue tests: ordering, success, retry-with-backoff, terminal failure,
-stale-running reaper, and the worker's single notify path."""
+stale-running reaper, pruning, graceful shutdown, and the worker's single
+notify path and loop."""
 
+import signal
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,8 +10,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import jobs, worker
-from app.jobs import HANDLERS, RUNNING_TIMEOUT, enqueue, run_due
+from app.jobs import HANDLERS, RUNNING_TIMEOUT, Shutdown, enqueue, prune_finished, run_due
 from app.models import Job
+
+
+@pytest.fixture(autouse=True)
+def _no_stop():
+    jobs.STOP.clear()
+    yield
+    jobs.STOP.clear()
 
 
 @pytest.fixture()
@@ -153,7 +162,7 @@ def worker_engine(monkeypatch):
     )
     SQLModel.metadata.create_all(engine)
     monkeypatch.setattr(worker, "engine", engine)
-    monkeypatch.setattr(worker, "ping_healthcheck", lambda: None)
+    monkeypatch.setattr(worker, "ping_healthcheck", lambda fail=False: None)
     return engine
 
 
@@ -276,3 +285,153 @@ def test_worker_replaces_orphaned_notify_job_same_pass(worker_engine, monkeypatc
     assert calls == [1] and out["reaped"] == 1
     with Session(worker_engine) as s:
         assert sorted(j.status for j in s.exec(select(Job)).all()) == ["completed", "failed"]
+
+
+def test_shutdown_hands_running_job_back_with_attempt_refunded(session, monkeypatch):
+    def interrupted(s, payload):
+        raise Shutdown("SIGTERM")
+
+    monkeypatch.setitem(HANDLERS, "long", interrupted)
+    job = enqueue(session, "long", {})
+    with pytest.raises(Shutdown):
+        run_due(session)
+    row = session.get(Job, job.id)
+    session.refresh(row)
+    assert row.status == "pending" and row.attempts == 0
+    assert row.error == "interrupted by worker shutdown"
+    assert not jobs.in_handler
+
+
+def test_stop_during_claim_hands_job_back_unrun(session, fake_handler, monkeypatch):
+    claim = jobs._claim_next
+
+    def claim_then_sigterm(s):
+        job = claim(s)
+        jobs.STOP.set()  # signal lands mid-claim, before in_handler is set
+        return job
+
+    monkeypatch.setattr(jobs, "_claim_next", claim_then_sigterm)
+    job = enqueue(session, "fake", {"n": 1})
+    with pytest.raises(Shutdown):
+        run_due(session)
+    assert fake_handler == []
+    row = session.get(Job, job.id)
+    session.refresh(row)
+    assert row.status == "pending" and row.attempts == 0
+
+
+def test_stop_flag_stops_claiming(session, fake_handler):
+    enqueue(session, "fake", {"n": 1})
+    jobs.STOP.set()
+    assert run_due(session) == {"completed": 0, "failed": 0, "retried": 0}
+    assert fake_handler == []
+
+
+def test_signal_interrupts_only_inside_a_handler(monkeypatch):
+    worker._request_stop(signal.SIGTERM, None)  # between jobs: just flag it
+    assert jobs.STOP.is_set()
+    monkeypatch.setattr(jobs, "in_handler", True)
+    with pytest.raises(Shutdown):
+        worker._request_stop(signal.SIGTERM, None)
+
+
+def test_prune_finished_drops_only_old_finished_jobs(session):
+    old = datetime.now(timezone.utc) - timedelta(days=31)
+    rows = {}
+    for status in ("completed", "failed", "pending", "running"):
+        rows[status] = enqueue(session, "fake", {})
+        _set(session, rows[status], status=status, updated_at=old)
+    recent = enqueue(session, "fake", {})
+    _set(session, recent, status="completed")
+    assert prune_finished(session, timedelta(days=30)) == 2
+    left = sorted(j.status for j in session.exec(select(Job)).all())
+    assert left == ["completed", "pending", "running"]
+
+
+def test_worker_pings_fail_when_a_job_fails(worker_engine, monkeypatch):
+    pings: list = []
+    monkeypatch.setattr(worker, "ping_healthcheck", lambda fail=False: pings.append(fail))
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: None)
+    monkeypatch.setitem(HANDLERS, "bad", lambda s, p: 1 / 0)
+    with Session(worker_engine) as s:
+        enqueue(s, "bad", {}, max_attempts=1)
+    assert worker.run_once()["failed"] == 1
+    worker.run_once()
+    assert pings == [True, False]
+
+
+def test_worker_pings_fail_only_when_a_reaped_job_fails(worker_engine, monkeypatch):
+    pings: list = []
+    monkeypatch.setattr(worker, "ping_healthcheck", lambda fail=False: pings.append(fail))
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: None)
+    monkeypatch.setitem(HANDLERS, "fake", lambda s, p: None)
+    old = datetime.now(timezone.utc) - RUNNING_TIMEOUT - timedelta(minutes=1)
+    with Session(worker_engine) as s:
+        _set(s, enqueue(s, "fake", {}), status="running", attempts=1, updated_at=old)
+    out = worker.run_once()  # requeued and rerun: healthy
+    assert out["reaped"] == 1 and out["failed"] == 0
+    with Session(worker_engine) as s:
+        _set(s, enqueue(s, "fake", {}, max_attempts=1),
+             status="running", attempts=1, updated_at=old)
+    out = worker.run_once()  # out of attempts: a terminal failure
+    assert out["reaped"] == 1 and out["failed"] == 1
+    assert pings == [False, True]
+
+
+def test_worker_pings_fail_when_the_pass_crashes(worker_engine, monkeypatch):
+    pings: list = []
+    monkeypatch.setattr(worker, "ping_healthcheck", lambda fail=False: pings.append(fail))
+
+    def db_down(session):
+        raise ConnectionError("postgres restarting")
+
+    monkeypatch.setattr(worker, "reap_stale", db_down)
+    with pytest.raises(ConnectionError):
+        worker.run_once()
+    assert pings == [True]
+
+
+class _InstantStop(type(jobs.STOP)):
+    def wait(self, timeout=None):  # don't really sleep between passes
+        return self.is_set()
+
+
+def _main(monkeypatch, *argv):
+    monkeypatch.setattr("sys.argv", ["app.worker", *argv])
+    monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(jobs, "STOP", _InstantStop())
+    worker.main()
+
+
+def test_loop_survives_a_failed_pass(monkeypatch):
+    calls: list = []
+
+    def run_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("postgres restarting")
+        if len(calls) == 3:
+            jobs.STOP.set()  # SIGTERM between passes
+        return {}
+
+    monkeypatch.setattr(worker, "run_once", run_once)
+    _main(monkeypatch, "--loop", "60")
+    assert len(calls) == 3
+
+
+def test_single_pass_still_raises(monkeypatch):
+    def run_once():
+        raise ConnectionError("postgres restarting")
+
+    monkeypatch.setattr(worker, "run_once", run_once)
+    with pytest.raises(ConnectionError):
+        _main(monkeypatch)
+
+
+def test_main_exits_cleanly_when_a_job_is_interrupted(monkeypatch):
+    def run_once():
+        jobs.STOP.set()
+        raise Shutdown("SIGTERM")
+
+    monkeypatch.setattr(worker, "run_once", run_once)
+    _main(monkeypatch, "--loop", "60")  # no exception escapes

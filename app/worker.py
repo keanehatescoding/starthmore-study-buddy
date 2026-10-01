@@ -1,59 +1,87 @@
 """Background worker: drain the job queue, including one notify pass.
 
 Usage: python -m app.worker [--loop SECONDS]
-One pass = reap orphaned jobs, enqueue a send_notifications job (unless one
-is already queued), then run due jobs until none are left. Due syncs are
-claimed before the notify job, so their new-material events go out in the
-same pass.
-Schedule with cron (daily) or run --loop for a persistent worker.
+One pass = reap orphaned jobs, prune old finished ones, enqueue a
+send_notifications job (unless one is already queued), then run due jobs
+until none are left. Due syncs are claimed before the notify job, so their
+new-material events go out in the same pass.
+Schedule with cron (daily) or run --loop for a persistent worker. In --loop
+mode a failed pass (e.g. Postgres restarting) is logged and retried next
+interval rather than ending the worker. SIGTERM/SIGINT stop it cleanly: a
+running job is handed back to the queue with its attempt refunded.
 """
 
 from __future__ import annotations
 
 import argparse
-import time
+import logging
+import signal
 import urllib.request
+from datetime import timedelta
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session
 
+from app import jobs
 from app.config import settings
 from app.db import engine
-from app.jobs import enqueue, reap_stale, run_due
+from app.jobs import Shutdown, enqueue, prune_finished, reap_stale, run_due
+
+log = logging.getLogger("app.worker")
 
 
-def ping_healthcheck() -> None:
-    """Notify a dead-man's-switch monitor (e.g. healthchecks.io) on success.
-    Monitoring must never fail the run."""
+def ping_healthcheck(fail: bool = False) -> None:
+    """Notify a dead-man's-switch monitor (e.g. healthchecks.io): the plain
+    URL on success, URL + "/fail" when jobs failed or the pass crashed, so
+    failures alert immediately. Monitoring must never fail the run."""
     url = settings.healthcheck_ping_url
     if not url:
         return
+    if fail:
+        url = url.rstrip("/") + "/fail"
     try:
         urllib.request.urlopen(url, timeout=10).read()
     except Exception:
         pass
 
 
-def run_once() -> dict:
+def _drain() -> dict:
     totals: dict = {"completed": 0, "failed": 0, "retried": 0}
     with Session(engine) as session:
         # Reap first: a notify job orphaned by a crashed worker would
         # otherwise block this pass's enqueue and then be failed unrun.
-        reaped = reap_stale(session)
-        if reaped:
-            totals["reaped"] = reaped
+        for key, n in reap_stale(session).items():
+            totals[key] = totals.get(key, 0) + n
+        pruned = prune_finished(session, timedelta(days=settings.job_retention_days))
+        if pruned:
+            totals["pruned"] = pruned
         try:
             enqueue(session, "send_notifications", max_attempts=1)
         except IntegrityError:  # uq_jobs_active_notify: one is already queued
             session.rollback()
-        while True:  # drain; failed jobs back off, so this terminates
+        while not jobs.STOP.is_set():  # drain; failed jobs back off, so this terminates
             batch = run_due(session)
             for key, n in batch.items():
                 totals[key] = totals.get(key, 0) + n
             if not any(batch.values()):
                 break
-    ping_healthcheck()
     return totals
+
+
+def run_once() -> dict:
+    try:
+        totals = _drain()
+    except Exception:
+        ping_healthcheck(fail=True)
+        raise
+    ping_healthcheck(fail=totals["failed"] > 0)
+    return totals
+
+
+def _request_stop(signum, frame) -> None:
+    jobs.STOP.set()
+    if jobs.in_handler:  # interrupt the job now; run_due hands it back
+        raise Shutdown(signal.Signals(signum).name)
 
 
 def main() -> None:
@@ -61,11 +89,23 @@ def main() -> None:
     parser.add_argument("--loop", type=int, default=0,
                         help="repeat every N seconds (0 = single pass)")
     args = parser.parse_args()
-    while True:
-        print(run_once(), flush=True)
-        if not args.loop:
-            break
-        time.sleep(args.loop)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        while not jobs.STOP.is_set():
+            try:
+                print(run_once(), flush=True)
+            except Exception:
+                if not args.loop:
+                    raise  # a one-off (cron) run should exit non-zero
+                log.exception("worker pass failed; retrying in %ss", args.loop)
+            if not args.loop or jobs.STOP.wait(args.loop):
+                break
+    except Shutdown:
+        pass  # the interrupted job is already back in the queue
+    if jobs.STOP.is_set():
+        log.info("worker stopped on signal")
 
 
 if __name__ == "__main__":

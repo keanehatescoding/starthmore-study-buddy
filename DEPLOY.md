@@ -8,8 +8,9 @@
    API and the Drive API in that Google Cloud project, since Classroom materials
    are Drive files read with `drive.readonly`), `LLM_*`, `RESEND_API_KEY`,
    `EMAIL_FROM`, `EMAIL_TO`, `APP_BASE_URL` (the public web URL, used in
-   email links). Note: `DATABASE_URL` must use the `psycopg`
-   driver as-is; no code change needed.
+   email links). `DATABASE_URL` can stay as the plugin sets it: a
+   bare `postgres://` / `postgresql://` URL is switched to the installed
+   `psycopg` (v3) driver automatically.
 3. Services — five in all, counting Postgres:
 
    | Service | Start command | Schedule |
@@ -132,8 +133,16 @@ Backups (nightly pg_dump, 14-day retention):
   15 minutes per account and per Moodle username, so it can't be used to
   guess another student's password. Like the POST limit, it is per-process.
 - Cron observability: set `HEALTHCHECK_PING_URL` (e.g. a healthchecks.io
-  check) — the worker pings it after every successful pass, so a silent
-  6am failure pages you instead of showing up as missing quizzes.
+  check) — the worker pings it after every pass, and pings `<url>/fail`
+  when a job failed for good or the pass itself crashed, so a 6am failure
+  pages you instead of showing up as missing quizzes. With `--loop`, a
+  crashed pass (e.g. Postgres restarting) is logged and retried next
+  interval; the worker keeps running.
+- Redeploys: the worker stops cleanly on SIGTERM. A job it was running goes
+  straight back to the queue with its attempt refunded, and the new worker
+  picks it up on its first pass.
+- Completed and failed jobs are deleted after `JOB_RETENTION_DAYS`
+  (default 30), so the `jobs` table stays small.
 - Web UI requires Google sign-in (`/login`). Generate a real secret:
   `openssl rand -hex 32` → `SECRET_KEY`. Every service refuses to start
   with the public default key unless `DEV=1` is set, which is for local
