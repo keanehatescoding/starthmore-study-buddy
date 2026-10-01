@@ -674,7 +674,9 @@ def test_settings_revoke_google_button(testapp, monkeypatch):
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout: _Resp())
     client = testapp["client"]
     page = client.get("/settings/moodle").text
-    assert "Revoke Google access" in page
+    title = re.search(r"<title>(.*?)</title>", page, re.S).group(1)
+    assert title == "Settings — Strathmore Study Buddy"
+    assert page.count("Revoke Google access") == 1
     token = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
     r = client.post("/settings/google/disconnect", data={"csrf_token": token},
                     follow_redirects=False)

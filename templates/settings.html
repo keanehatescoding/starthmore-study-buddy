@@ -1,32 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Settings — Strathmore Study Buddy
-<div class="card settings-card">
-  <div class="card-header">
-    <h2 class="card-title">Google Classroom</h2>
-    {% if google_connected %}
-      <span class="badge status-ok">Connected</span>
-    {% else %}
-      <span class="badge status-off">Not connected</span>
-    {% endif %}
-  </div>
-  {% if google_connected %}
-    <p class="settings-text">
-      Your Google key is stored encrypted and lets Study Buddy read your Classroom classes and their Drive files.
-      Revoking it stops Classroom syncs; signing in again reconnects.
-    </p>
-    <form method="post" action="/settings/google/disconnect">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button type="submit" class="btn btn-sm btn-outline">Revoke Google access</button>
-    </form>
-  {% elif google_shared %}
-    <p class="settings-text">You're using the app's shared Google key. Sign out and in again to connect your own.</p>
-  {% elif google_stale %}
-    <p class="settings-text">Your saved Google key can't be read any more. Sign out and in again to reconnect.</p>
-  {% else %}
-    <p class="settings-text">Not connected. Sign out and in again to grant Classroom access.</p>
-  {% endif %}
-</div>
-{% endblock %}
+{% block title %}Settings — Strathmore Study Buddy{% endblock %}
 
 {% block body %}
 <section class="page-hero">
