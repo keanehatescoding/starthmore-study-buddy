@@ -198,3 +198,15 @@ def test_quiz_copies_only_the_requested_attempt(session):
     assert copy_quiz(session, own, attempt=3) is None
     assert {i.generation_key for i in _items(session, b)} == {
         f"{own.id}:2:0", f"{own.id}:2:1"}
+
+
+def test_extraction_looks_past_blank_donors(session):
+    for i in range(3):  # random ids: the good donor's position varies
+        _copy_of(session, f"blank{i}@x", status="extracted", extracted_text=" \n")
+    _copy_of(session, "a@x", status="extracted", extracted_text=TEXT)
+    course, r = _copy_of(session, "b@x")
+
+    run_extraction(session, no_download, course.id)
+
+    session.refresh(r)
+    assert r.extracted_text == TEXT

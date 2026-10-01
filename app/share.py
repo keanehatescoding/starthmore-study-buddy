@@ -25,8 +25,8 @@ from sqlmodel import Session, select
 from app.models import Chunk, QuizAttempt, QuizItem, Resource
 
 
-def _same_material(r: Resource):
-    return select(Resource).where(
+def _same_material(r: Resource, *cols):
+    return select(*(cols or (Resource,))).where(
         Resource.content_hash == r.content_hash, Resource.source == r.source,
         Resource.type == r.type, Resource.id != r.id,
     ).order_by(Resource.id)
@@ -36,14 +36,18 @@ def copy_extraction(session: Session, r: Resource) -> bool:
     """Take a donor's extracted text; True when one was found. Uncommitted."""
     if r.content_hash is None:
         return False
-    for donor in session.exec(_same_material(r).where(
+    # streamed text only: a blank donor must not end the search, and every
+    # matching copy carries a whole document
+    texts = session.exec(_same_material(r, Resource.extracted_text).where(
         Resource.status == "extracted", Resource.extracted_text.is_not(None),
-    )):
-        if donor.extracted_text.strip():
-            r.extracted_text = donor.extracted_text
-            r.status = "extracted"
-            r.error = None
-            return True
+    ).execution_options(yield_per=1))
+    with texts:  # closes the server-side cursor when a donor is found early
+        for text in texts:
+            if text.strip():
+                r.extracted_text = text
+                r.status = "extracted"
+                r.error = None
+                return True
     return False
 
 
@@ -58,7 +62,7 @@ def copy_chunks(session: Session, r: Resource) -> int:
     donor = session.exec(_same_material(r).where(
         Resource.status == "extracted", Resource.extracted_text == r.extracted_text,
         has_chunks,
-    )).first()
+    ).limit(1)).first()
     if donor is None:
         return 0
     chunks = session.exec(
@@ -88,7 +92,7 @@ def copy_quiz(session: Session, chunk: Chunk, attempt: int = 1) -> list[QuizItem
         select(Chunk).join(Resource, Resource.id == Chunk.resource_id).where(
             Resource.content_hash == r.content_hash, Resource.source == r.source,
             Chunk.id != chunk.id, Chunk.content == chunk.content, tried,
-        ).order_by(Chunk.id)
+        ).order_by(Chunk.id).limit(1)
     ).first()
     if donor is None:
         return None
