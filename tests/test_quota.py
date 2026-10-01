@@ -5,12 +5,13 @@ import json
 import urllib.error
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel
 
 import app.llm as llm_mod
 from app.llm import LLMClient, LLMError, QuotaExhaustedError
 from app.models import Chunk, Resource
 from app.pipeline import run_quiz
+from tests.dbutil import make_engine
 
 
 @pytest.fixture(autouse=True)
@@ -233,7 +234,7 @@ def _bare_chunks(session, n=2):
 
 
 def test_run_quiz_aborts_on_quota():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         _bare_chunks(s, 2)

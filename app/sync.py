@@ -13,7 +13,7 @@ Assignments are upserted separately and never become Resources.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -21,7 +21,14 @@ from sqlmodel import Session, delete, func, select, update
 
 from app.extract import MAX_DOWNLOAD_BYTES, too_large_message, youtube_video_id
 from app.models import (
-    Assignment, Chunk, Course, QuizAttempt, QuizItem, Resource, ReviewState, Topic,
+    Assignment,
+    Chunk,
+    Course,
+    QuizAttempt,
+    QuizItem,
+    Resource,
+    ReviewState,
+    Topic,
 )
 
 

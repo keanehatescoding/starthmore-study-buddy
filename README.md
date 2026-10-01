@@ -26,10 +26,10 @@ Moodle / Classroom → sync → extract text → LLM chunking → quiz generatio
 
 ## Quickstart
 
-Requirements: Python 3.11–3.13, podman or docker.
+Requirements: Python 3.11–3.13, [uv](https://docs.astral.sh/uv/), podman or docker.
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -e .
+uv sync                # .venv from uv.lock, dev tools (pytest, ruff) included
 cp .env.example .env   # fill in MOODLE_TOKEN etc.; uncomment DEV=1 (or set SECRET_KEY)
 podman-compose up -d db
 .venv/bin/alembic upgrade head
@@ -62,8 +62,15 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_TO` | Notifications (Resend free tier) |
 | `APP_BASE_URL` | Public origin for links in emails (default `http://localhost:8000`) |
 | `TIMEZONE` | IANA zone for study days: streaks start at local midnight (default `Africa/Nairobi`) |
-| `SECRET_KEY`, `DEV` | Signs sessions and encrypts stored tokens; the public default is refused unless `DEV=1` (local only) |
+| `SECRET_KEY` | Signs sessions and encrypts stored tokens (`openssl rand -hex 32`); every service needs the same value |
+| `DEV` | Local development only: accepts the public default `SECRET_KEY` (never on a server) |
+| `SESSION_SECURE_COOKIE` | `true` behind HTTPS so the session cookie is never sent over plain HTTP |
 | `SESSION_MAX_AGE` | Seconds a sign-in lasts without use (default 7 days) |
+| `ALLOWED_EMAILS` | Who may sign in: addresses and/or `@domain` entries, comma-separated (default `@strathmore.edu`; empty = any Google account) |
+| `FORWARDED_ALLOW_IPS` | Proxies trusted for `X-Forwarded-For`/`-Proto`, IPs or CIDRs (default `*`; see DEPLOY.md) |
+| `HEALTHCHECK_PING_URL` | Dead-man's switch: the worker pings it after each pass, `<url>/fail` on failure (empty = off) |
+| `JOB_RETENTION_DAYS` | Days finished jobs are kept before the worker deletes them (default 30) |
+| `LLM_GRADE_TIMEOUT`, `LLM_GRADE_ATTEMPTS` | Short-answer grading budget inside a web request (default 30 s, 2 tries) |
 
 ## Layout
 
@@ -75,5 +82,9 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 - `app/main.py`, `templates/` — server-rendered UI
 - `alembic/versions/` — migrations (canonical schema)
 
-`python -m pytest` runs the suite (SQLite, no network).
+`.venv/bin/python -m pytest` runs the suite on in-memory SQLite, no network.
+With `TEST_DATABASE_URL` pointing at a **scratch** Postgres database it runs
+on Postgres instead, wiping that database's `public` schema before every
+test — CI runs both, plus `ruff check .` and a full migration
+upgrade → downgrade → upgrade round-trip.
 See `DEPLOY.md` for Railway/VPS deployment.

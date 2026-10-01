@@ -3,13 +3,14 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel
 
 from app.config import settings
 from app.db import get_session
 from app.dburl import normalize_database_url
 from app.main import app
 from app.worker import ping_healthcheck
+from tests.dbutil import make_engine
 
 
 def _client(engine):
@@ -25,7 +26,7 @@ def _client(engine):
 
 
 def _engine(with_tables: bool):
-    engine = create_engine(
+    engine = make_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,

@@ -5,6 +5,7 @@ Revises: 0005_normalize_auth
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0006_active_notify_job"

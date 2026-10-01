@@ -22,10 +22,21 @@ from sqlmodel import Session, func, select
 
 from app.llm import LLMClient
 from app.models import (
-    Chunk, Course, QuizItem, Resource, ReviewLog, ReviewState, Topic, User,
+    Chunk,
+    Course,
+    QuizItem,
+    Resource,
+    ReviewLog,
+    ReviewState,
+    Topic,
+    User,
 )
 from app.srs import (
-    PASS_CREDIT, initial_ease_factor, next_interval_days, partial_credit_to_quality, verdict,
+    PASS_CREDIT,
+    initial_ease_factor,
+    next_interval_days,
+    partial_credit_to_quality,
+    verdict,
 )
 
 MAX_ANSWER_CHARS = 4000

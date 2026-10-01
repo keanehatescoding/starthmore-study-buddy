@@ -25,9 +25,33 @@ jobs:
       DEV: "1"  # the public default SECRET_KEY is fine for tests
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
+          version: "0.12.21"
           python-version: "3.12"
-      - run: pip install -e .
-      - run: alembic upgrade head && alembic check
-      - run: python -m pytest -q
+      # --locked: fails if uv.lock is out of date with pyproject.toml
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - name: migrations (upgrade, check, full downgrade, upgrade again)
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check
+      - name: tests on Postgres (wipes the schema per test)
+        run: uv run python -m pytest -q
+        env:
+          TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+      - name: tests on SQLite
+        run: uv run python -m pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t study-buddy .
+      - name: runs as non-root and imports
+        run: |
+          test "$(docker run --rm study-buddy id -u)" != 0
+          docker run --rm -e DEV=1 study-buddy python -c "import app.main, app.worker"

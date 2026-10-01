@@ -7,11 +7,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 from app import jobs, worker
 from app.jobs import HANDLERS, RUNNING_TIMEOUT, Shutdown, enqueue, prune_finished, run_due
 from app.models import Job
+from tests.dbutil import make_engine
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +24,7 @@ def _no_stop():
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s
@@ -67,7 +68,9 @@ def test_failure_retries_then_completes(session, fake_handler):
     assert out["retried"] == 1
     row = session.get(Job, job.id)
     assert row.status == "pending" and row.attempts == 1
-    assert "boom" in (row.error or "") and row.available_at > datetime(2020, 1, 1)
+    # naive on SQLite, aware on Postgres
+    assert "boom" in (row.error or "")
+    assert row.available_at.replace(tzinfo=None) > datetime(2020, 1, 1)
     # make it due again with a fixed payload -> succeeds
     row.available_at = datetime(2000, 1, 1)
     row.payload = {}
@@ -155,7 +158,7 @@ def test_handler_db_error_rolled_back_and_recorded(session, monkeypatch):
 def worker_engine(monkeypatch):
     from sqlalchemy.pool import StaticPool
 
-    engine = create_engine(
+    engine = make_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
@@ -228,7 +231,7 @@ def test_only_one_active_notify_job(session):
 
 @pytest.fixture()
 def file_engine(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}")
+    engine = make_engine(f"sqlite:///{tmp_path / 'jobs.db'}")
     SQLModel.metadata.create_all(engine)
     return engine
 

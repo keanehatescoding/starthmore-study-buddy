@@ -5,15 +5,16 @@ import urllib.error
 import uuid
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 import app.notify as notify
 from app.models import Chunk, Course, NotificationEvent, QuizItem, Resource, Topic, User
+from tests.dbutil import TEST_DATABASE_URL, make_engine
 
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s
@@ -177,6 +178,7 @@ def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
     assert [e["to"] for e in calls[0]] == [["other@x.edu"]]
 
 
+@pytest.mark.skipif(bool(TEST_DATABASE_URL), reason="the users FK rules out a missing user")
 def test_send_without_recipient_stays_queued(session, monkeypatch):
     calls = _fake_batches(monkeypatch)
     # stale reference: user row gone, no fallback -> cannot deliver

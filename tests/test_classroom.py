@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 from app.classroom import (
     UNTAGGED_TITLE,
@@ -13,6 +13,7 @@ from app.classroom import (
 )
 from app.models import Resource, Topic, User
 from app.sync import content_hash, sync_course
+from tests.dbutil import make_engine
 
 
 class _Request:
@@ -144,7 +145,7 @@ def test_drive_file_uses_inner_title_and_id_marker():
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s

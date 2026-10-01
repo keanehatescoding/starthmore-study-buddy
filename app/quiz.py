@@ -14,11 +14,11 @@ Guardrails (from plan):
 
 from __future__ import annotations
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from app.llm import LLMClient
 from app.models import QuizAttempt, QuizItem
-from sqlalchemy import or_
 
 SYSTEM = """You write quiz questions testing study material the lecturer covered.
 Rules:
