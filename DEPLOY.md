@@ -89,7 +89,13 @@ The quiz/chunk runners abort early with `quota_exhausted` when the LLM
 quota is gone; re-run the same command later to resume (completed chunks
 are skipped via generation keys).
 
-Backups (nightly pg_dump, 14-day retention):
+`docker-compose.yml` publishes Postgres on 127.0.0.1 only, since its default
+password is public; set `POSTGRES_PASSWORD` (and `POSTGRES_BIND`) before
+exposing it anywhere else.
+
+Backups (nightly pg_dump, 14-day retention). Dumps are written `0600` and
+only renamed into place once `pg_dump` succeeds; the password is passed via
+`PGPASSWORD`, not the command line:
 
 ```
 0 2 * * * /srv/study-buddy/scripts/backup.sh >> /var/log/study-buddy-backup.log 2>&1
@@ -115,8 +121,15 @@ Backups (nightly pg_dump, 14-day retention):
 - CSP: scripts and `<style>` elements need the per-response nonce
   (`{{ request.state.csp_nonce }}` in templates); no `unsafe-inline`.
   `style="…"` attributes are blocked — add a class to `static/css/app.css`.
-- CI (`.github/workflows/ci.yml`) runs migrations + `alembic check` + the
-  full suite on Postgres 16 for every push/PR.
+- CI (`.github/workflows/ci.yml`) runs on every push/PR: `uv sync --locked`
+  (fails if `uv.lock` is stale — run `uv lock` after editing dependencies),
+  `ruff check .`, migrations upgrade → `alembic check` → downgrade to base →
+  upgrade again on Postgres 16, the full suite on Postgres 16 and on SQLite,
+  and a Docker image build.
+- The Docker image installs exactly `uv.lock` (no dev tools) and runs as an
+  unprivileged user. Its `HEALTHCHECK` polls `/health` on `$PORT`; Railway
+  ignores it, but under plain docker/podman start worker and cron containers
+  from the image with `--no-healthcheck`, since they serve no HTTP.
 - `/health` checks Postgres and returns 503 when unreachable — safe to use
   for platform restart decisions.
 - Sign-in is limited by `ALLOWED_EMAILS` (default `@strathmore.edu`): a

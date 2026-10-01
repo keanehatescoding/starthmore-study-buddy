@@ -3,7 +3,7 @@
 import io
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 from app.chunk import chunk_resource, locate, presplit
 from app.extract import (
@@ -18,6 +18,7 @@ from app.extract import (
 from app.models import Chunk, Course, Resource, Topic
 from app.moodle import MoodleError
 from app.pipeline import quiz_chunk_ids, run_chunking, run_extraction
+from tests.dbutil import make_engine
 
 
 class FakeLLM:
@@ -33,7 +34,7 @@ class FakeLLM:
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s

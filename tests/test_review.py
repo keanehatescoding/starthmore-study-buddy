@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from sqlmodel import select
 
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
+from tests.dbutil import make_engine
 
 
 def _seed(Session):
@@ -340,12 +341,12 @@ def test_streak_keeps_days_whose_items_were_answered_again(testapp):
 def test_streak_days_are_local_dates():
     from zoneinfo import ZoneInfo
 
-    from sqlmodel import Session, SQLModel, create_engine
+    from sqlmodel import Session, SQLModel
 
     from app.stats import compute_stats
 
     nairobi = ZoneInfo("Africa/Nairobi")  # UTC+3
-    engine = create_engine("sqlite://")
+    engine = make_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         user = User(email="s@x.edu")

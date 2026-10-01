@@ -5,6 +5,7 @@ Revises: 0007_notify_batch_key
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0008_review_result_fields"

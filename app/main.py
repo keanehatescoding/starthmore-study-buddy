@@ -1,27 +1,39 @@
-from pathlib import Path
-from uuid import UUID
-
 import hmac
 import secrets
 import time
+from pathlib import Path
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session, func, select
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import auth as auth_mod
 from app.config import settings
 from app.db import get_session
 from app.grade import (
-    MAX_ANSWER_CHARS, InvalidAnswer, NotDue, due_count, due_items, submit_answer, user_owns_item,
+    MAX_ANSWER_CHARS,
+    InvalidAnswer,
+    NotDue,
+    due_count,
+    due_items,
+    submit_answer,
+    user_owns_item,
 )
 from app.llm import LLMClient, LLMError
 from app.models import (
-    Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic, User,
+    Assignment,
+    Chunk,
+    Course,
+    QuizItem,
+    Resource,
+    ReviewState,
+    Topic,
+    User,
 )
 from app.security import RateLimitMiddleware, SecurityHeadersMiddleware, hit_table
 from app.stats import compute_stats

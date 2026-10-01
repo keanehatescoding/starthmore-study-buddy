@@ -5,6 +5,7 @@ Revises: 0008_review_result_fields
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0009_review_log"

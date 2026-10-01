@@ -3,17 +3,18 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 import app.auth as auth_mod
 from app.config import settings
 from app.db import get_session
 from app.main import app
 from app.models import Course, User
+from tests.dbutil import make_engine
 
 
 def test_unauthenticated_redirects_to_login():
-    engine = create_engine(
+    engine = make_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
@@ -45,7 +46,7 @@ def test_login_url_requests_offline_classroom_scopes():
 
 
 def _memory_session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     return Session(engine)
 
@@ -245,11 +246,11 @@ def _callback_client(email: str, monkeypatch, **session_data):
     """TestClient with a signed session holding oauth_state + mocked Google."""
     from fastapi.testclient import TestClient
     from sqlalchemy.pool import StaticPool
-    from sqlmodel import Session, SQLModel, create_engine
+    from sqlmodel import Session, SQLModel
 
     from app.db import get_session
 
-    engine = create_engine(
+    engine = make_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
@@ -539,7 +540,7 @@ def test_revoke_sessions_ends_existing_sessions(monkeypatch):
 def test_overlapping_revocations_both_count(tmp_path):
     # two revocations load the same session_version N; a read-modify-write
     # would leave N+1 and keep alive a cookie issued between the commits
-    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    engine = make_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         s.add(User(email="owner@x.edu"))

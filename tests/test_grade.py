@@ -3,14 +3,20 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 from app import grade
 from app.grade import (
-    InvalidAnswer, NotDue, due_count, due_items, grade_short_answer, submit_answer,
+    InvalidAnswer,
+    NotDue,
+    due_count,
+    due_items,
+    grade_short_answer,
+    submit_answer,
     user_owns_item,
 )
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
+from tests.dbutil import TEST_DATABASE_URL, make_engine
 
 
 class FakeLLM:
@@ -43,11 +49,12 @@ def _make_due(s, user, item):
 
 @pytest.fixture()
 def setup():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         user = User(email="s@x.edu")
         s.add(user)
+        s.commit()
         course = Course(user_id=user.id, source="moodle", source_id="c1", name="C")
         s.add(course)
         s.commit()
@@ -197,6 +204,9 @@ def test_not_due_item_rejected_before_grading(setup):
     assert state.repetitions == 1 and state.interval_days == first["interval_days"]
 
 
+# On Postgres the user-row lock held through grading makes the second submit
+# wait for the first; run on one thread, that wait never ends.
+@pytest.mark.skipif(bool(TEST_DATABASE_URL), reason="needs locks that don't block")
 def test_concurrent_first_answer_loses_without_500(setup, monkeypatch):
     s, user, mcq, _ = setup
     # another request inserted and answered while this one was grading

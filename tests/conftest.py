@@ -12,17 +12,24 @@ os.environ.setdefault("DEV", "1")
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel
 
 from app.db import get_session
 from app.main import app, current_user
 from app.models import User
 from app.security import hit_table
+from tests.dbutil import TEST_DATABASE_URL, make_engine, reset_postgres
+
+
+@pytest.fixture(autouse=True)
+def _fresh_postgres():
+    if TEST_DATABASE_URL:
+        reset_postgres()
 
 
 @pytest.fixture()
 def testapp():
-    engine = create_engine(
+    engine = make_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,

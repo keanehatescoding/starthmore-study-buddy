@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
 from app.models import Assignment, Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
 from app.sync import (
@@ -16,6 +16,7 @@ from app.sync import (
     sync_all,
     sync_course,
 )
+from tests.dbutil import make_engine
 
 
 class FakeAdapter:
@@ -50,7 +51,7 @@ class FakeAdapter:
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s

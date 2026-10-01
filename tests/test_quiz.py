@@ -3,10 +3,11 @@
 import uuid
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, select
 
-from app.models import Chunk, QuizItem, Resource, Topic, Course
+from app.models import Chunk, Course, QuizItem, Resource, Topic
 from app.quiz import chunk_needs_quiz, generate_for_chunk
+from tests.dbutil import make_engine
 
 
 class FakeLLM:
@@ -38,7 +39,7 @@ GOOD = [
 
 @pytest.fixture()
 def setup():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         course = Course(source="moodle", source_id="c1", name="C")

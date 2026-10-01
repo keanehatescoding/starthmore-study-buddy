@@ -1,17 +1,36 @@
-FROM python:3.12-slim
+# Pinned to a patch release; bump deliberately (and rebuild for OS fixes).
+ARG PYTHON_IMAGE=docker.io/library/python:3.12.14-slim-trixie
 
+FROM ghcr.io/astral-sh/uv:0.12.21 AS uv
+
+# Dependencies only, from uv.lock: this layer is rebuilt when pyproject.toml
+# or uv.lock change, not on every code change.
+FROM ${PYTHON_IMAGE} AS build
+COPY --from=uv /uv /bin/uv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /srv
-ENV PYTHONUNBUFFERED=1
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project --no-cache
 
-# Override at build time if your network to PyPI is slow.
-ARG PIP_INDEX_URL=https://pypi.org/simple
-
-COPY pyproject.toml alembic.ini ./
-COPY app/ app/
+FROM ${PYTHON_IMAGE}
+RUN useradd --system --uid 10001 --no-create-home --home-dir /srv app
+COPY --from=build /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
+WORKDIR /srv
+# The app runs from the source tree (uvicorn/alembic/python -m import from
+# the working directory), so the project itself isn't installed.
+COPY alembic.ini ./
 COPY alembic/ alembic/
 COPY templates/ templates/
 COPY static/ static/
+COPY app/ app/
+USER app
 
-RUN pip install --no-cache-dir --index-url $PIP_INDEX_URL .
+# Platforms with their own checks (Railway) ignore this; plain docker/podman
+# use it. Non-web services started from this image (worker, crons) should
+# override it with --no-healthcheck / healthcheck.disable.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT', '8000'), timeout=4)"
 
 CMD alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}"

@@ -5,6 +5,7 @@ Revises: 0006_active_notify_job
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0007_notify_batch_key"

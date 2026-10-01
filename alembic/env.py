@@ -3,11 +3,11 @@
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
 import app.models  # noqa: F401 -- ensures metadata is populated
+from alembic import context
 from app.dburl import normalize_database_url
 
 config = context.config

@@ -114,8 +114,8 @@ def test_pipeline_downloads_as_course_owner(testapp, shared_token):
             topic = Topic(course_id=course.id, source_id="t", title="T")
             s.add(topic)
             s.commit()
-            r = Resource(topic_id=topic.id, source="moodle", source_id="r", type="file", title="notes",
-                         raw_url="https://m.example/f.txt", status="pending")
+            r = Resource(topic_id=topic.id, source="moodle", source_id="r", type="file",
+                         title="notes", raw_url="https://m.example/f.txt", status="pending")
             s.add(r)
             s.commit()
             resources[owner.email] = r.id

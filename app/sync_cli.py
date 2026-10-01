@@ -2,9 +2,9 @@
                        python -m app.sync_cli --source moodle --all-users --enqueue
 
 Moodle uses the user's own connected token (Settings → Moodle), falling back
-to MOODLE_TOKEN only for MOODLE_TOKEN_OWNER (see app.moodle_tokens). Classroom reuses the Google refresh token
-stored on the user row at login, falling back to GOOGLE_REFRESH_TOKEN only
-for GOOGLE_REFRESH_TOKEN_OWNER.
+to MOODLE_TOKEN only for MOODLE_TOKEN_OWNER (see app.moodle_tokens).
+Classroom reuses the Google refresh token stored on the user row at login,
+falling back to GOOGLE_REFRESH_TOKEN only for GOOGLE_REFRESH_TOKEN_OWNER.
 """
 
 from __future__ import annotations
@@ -35,9 +35,8 @@ def build_adapter(source: str, user: User):
             )
         return MoodleAdapter(MoodleClient(settings.moodle_base_url, token))
     if source == "classroom":
-        from app.classroom import ClassroomAdapter, ClassroomClient, build_service
-
         from app.auth import classroom_token_for
+        from app.classroom import ClassroomAdapter, ClassroomClient, build_service
 
         refresh = classroom_token_for(user)
         if not refresh:

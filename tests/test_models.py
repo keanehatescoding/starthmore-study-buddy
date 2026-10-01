@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel
 
 from app.models import (
     Assignment,
@@ -25,11 +25,12 @@ from app.srs import (
     partial_credit_to_quality,
     verdict,
 )
+from tests.dbutil import make_engine
 
 
 @pytest.fixture()
 def session():
-    engine = create_engine("sqlite:///:memory:")
+    engine = make_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s
