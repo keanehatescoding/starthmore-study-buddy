@@ -107,12 +107,12 @@ def test_extraction_copies_a_donors_text(session):
 def test_extraction_ignores_unlike_donors(session, donor):
     kw = {"status": "extracted", "extracted_text": TEXT, **donor}
     _copy_of(session, "a@x", **kw)
-    course, r = _copy_of(session, "b@x", type="page_text")
+    course, r = _copy_of(session, "b@x")
 
     run_extraction(session, lambda r: (b"own text", "text/plain"), course.id)
 
     session.refresh(r)
-    assert r.extracted_text != TEXT
+    assert (r.status, r.extracted_text) == ("extracted", "own text")
 
 
 def test_extraction_without_a_token_stays_pending(session):
