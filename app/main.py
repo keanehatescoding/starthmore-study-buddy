@@ -5,11 +5,17 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, func, select
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import auth as auth_mod
@@ -39,8 +45,37 @@ from app.security import RateLimitMiddleware, SecurityHeadersMiddleware, hit_tab
 from app.stats import compute_stats
 
 app = FastAPI(title="Strathmore Study Buddy")
-app.add_middleware(SecurityHeadersMiddleware)
+templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+
+ERROR_MESSAGES = {
+    400: ("Bad request", "That link or form wasn't quite right. Go back and try again."),
+    403: ("Not allowed", "This page may have been open too long. Reload it and try again."),
+    404: ("Not found", "We couldn't find that page. It may have been removed."),
+    500: ("Something went wrong", "That's on us, and it has been logged. Try again in a moment."),
+}
+
+
+def error_page(request: Request, status_code: int, headers: dict | None = None):
+    """The HTML error page for `status_code` (JSON under /api)."""
+    title, message = ERROR_MESSAGES.get(
+        status_code, ("Something went wrong", "Go back and try again."))
+    if request.url.path.startswith("/api"):
+        return JSONResponse({"detail": title}, status_code=status_code, headers=headers)
+    try:
+        return templates.TemplateResponse(
+            request, "error.html",
+            {"status_code": status_code, "title": title, "message": message},
+            status_code=status_code, headers=headers,
+        )
+    except Exception:  # never let the error page itself fail
+        return PlainTextResponse(title, status_code=status_code, headers=headers)
+
+
+# Middleware added last runs first: sessions, then security headers (so the
+# limiter's 429 and the 500 page carry them), then the rate limiter.
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(
+    SecurityHeadersMiddleware, error_response=lambda request: error_page(request, 500))
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.secret_key,
@@ -48,7 +83,6 @@ app.add_middleware(
     https_only=settings.session_secure_cookie,
     max_age=settings.session_max_age,
 )
-templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
 static_dir = Path(__file__).parent.parent / "static"
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -139,6 +173,21 @@ async def unauthorized(request: Request, exc: HTTPException):
     return _login_redirect(request)
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException):
+    if request.url.path.startswith("/api"):
+        return await http_exception_handler(request, exc)
+    return error_page(request, exc.status_code, getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    # e.g. /courses/not-a-uuid: a bad link, not a 422 JSON dump
+    if request.url.path.startswith("/api"):
+        return await request_validation_exception_handler(request, exc)
+    return error_page(request, 400)
+
+
 @app.get("/health")
 def health(session: Session = Depends(get_session)):
     # Platform restart decisions use this: verify Postgres is actually reachable.
@@ -163,11 +212,18 @@ def login_page(request: Request):
 def login_google(request: Request):
     state = auth_mod.new_state()
     request.session["oauth_state"] = state
-    redirect_uri = str(request.url_for("auth_callback"))
+    redirect_uri = oauth_redirect_uri()
     return RedirectResponse(
         auth_mod.login_url(settings.google_client_id, redirect_uri, state),
         status_code=303,
     )
+
+
+def oauth_redirect_uri() -> str:
+    """The callback registered with Google, from APP_BASE_URL rather than the
+    request's Host header: a proxy that rewrites Host (or an attacker-chosen
+    Host) can't change where Google sends the code."""
+    return settings.app_base_url.rstrip("/") + "/auth/callback"
 
 
 def _login_failed(request: Request, text: str, status_code: int = 303):
@@ -186,7 +242,7 @@ def auth_callback(
         return _login_failed(request, "Google sign-in was cancelled. Try again when you're ready.")
     if not code or not expected_state or state != expected_state:
         return _login_failed(request, "That sign-in link expired. Please sign in again.")
-    redirect_uri = str(request.url_for("auth_callback"))
+    redirect_uri = oauth_redirect_uri()
     try:
         tokens = auth_mod.exchange_code(
             settings.google_client_id, settings.google_client_secret, code, redirect_uri
@@ -517,6 +573,7 @@ def moodle_settings(
     from app.moodle_tokens import decrypt_token, token_for
 
     own = decrypt_token(user.moodle_token) is not None
+    google_own = auth_mod.refresh_token_for(user) is not None
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -524,6 +581,9 @@ def moodle_settings(
             "connected": own,
             "shared": not own and token_for(user) is not None,
             "stale": bool(user.moodle_token) and not own,
+            "google_connected": google_own,
+            "google_shared": not google_own and auth_mod.classroom_token_for(user) is not None,
+            "google_stale": bool(user.google_refresh_token) and not google_own,
             "moodle_url": settings.moodle_base_url,
             "flash": request.session.pop("flash", None),
             "csrf_token": csrf_token(request),
@@ -637,4 +697,20 @@ async def moodle_disconnect(
     await run_in_threadpool(_disconnect_moodle, session, user)
     _flash(request, "success",
            "Disconnected. Already-synced courses stay; new material won't sync.")
+    return RedirectResponse("/settings/moodle", status_code=303)
+
+
+@app.post("/settings/google/disconnect")
+async def google_disconnect(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    await checked_form(request)
+    if await run_in_threadpool(auth_mod.revoke_google_access, session, user):
+        _flash(request, "success", "Google access revoked. Already-synced Classroom "
+               "courses stay; sign in again to reconnect.")
+    else:
+        _flash(request, "error", "We've deleted your Google key, but couldn't reach Google "
+               "to revoke it. Remove Study Buddy at myaccount.google.com/permissions.")
     return RedirectResponse("/settings/moodle", status_code=303)

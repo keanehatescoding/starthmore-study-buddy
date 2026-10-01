@@ -115,3 +115,64 @@ def test_templates_have_no_inline_style_attributes():
         if re.search(r"\sstyle=", line)
     ]
     assert offenders == []
+
+
+def _assert_hardened(r):
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in r.headers["Content-Security-Policy"]
+
+
+def test_rate_limited_429_carries_security_headers(testapp):
+    client = testapp["client"]
+    hit_table(app).clear()
+    app.state.rate_limit = (1, 60)
+    try:
+        client.post("/logout")
+        r = client.post("/logout")
+        assert r.status_code == 429
+        _assert_hardened(r)
+    finally:
+        del app.state.rate_limit
+        hit_table(app).clear()
+
+
+def test_unhandled_error_is_an_html_500_with_security_headers(testapp, caplog):
+    from app.main import current_user
+
+    def boom():
+        raise RuntimeError("kaboom")
+
+    app.dependency_overrides[current_user] = boom
+    r = testapp["client"].get("/stats")
+    assert r.status_code == 500
+    assert r.headers["content-type"].startswith("text/html")
+    assert "Something went wrong" in r.text and "kaboom" not in r.text
+    _assert_hardened(r)
+    assert "kaboom" in caplog.text  # logged, not swallowed
+
+
+def test_page_errors_are_html(testapp):
+    client = testapp["client"]
+    for url, status, title in [
+        ("/courses/00000000-0000-0000-0000-000000000000", 404, "Not found"),
+        ("/no-such-page", 404, "Not found"),
+        ("/courses/not-a-uuid", 400, "Bad request"),
+    ]:
+        r = client.get(url)
+        assert r.status_code == status, url
+        assert r.headers["content-type"].startswith("text/html"), url
+        assert f"<h1 class=\"hero-title\">{title}</h1>" in r.text, url
+        _assert_hardened(r)
+    r = client.post("/settings/google/disconnect", data={"csrf_token": "wrong"})
+    assert r.status_code == 403 and "Not allowed" in r.text
+
+
+def test_api_errors_stay_json(testapp):
+    r = testapp["client"].get("/api/no-such-thing")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Not Found"}
+
+
+def test_405_keeps_its_allow_header(testapp):
+    r = testapp["client"].put("/login")
+    assert r.status_code == 405 and "GET" in r.headers["allow"]

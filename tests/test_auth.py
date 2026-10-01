@@ -581,3 +581,105 @@ def test_concurrent_first_sign_in_updates_the_winner(monkeypatch):
         user = auth_mod.sign_in(s, "race@x.edu", refresh_token="rt")
         assert len(s.exec(select(User)).all()) == 1
         assert auth_mod.refresh_token_for(user) == "rt" and len(calls) == 2
+
+
+def test_oauth_redirect_uri_comes_from_app_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "app_base_url", "https://study.example.edu/")
+    client = TestClient(app, follow_redirects=False)
+    r = client.get("/login/google", headers={"Host": "evil.example.com"})
+    assert "redirect_uri=https%3A%2F%2Fstudy.example.edu%2Fauth%2Fcallback" in r.headers["location"]
+    assert "evil" not in r.headers["location"]
+
+
+def test_callback_exchanges_with_app_base_url_redirect(monkeypatch):
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    monkeypatch.setattr(settings, "app_base_url", "https://study.example.edu")
+    client = _callback_client("new@x.edu", monkeypatch)
+    seen = []
+    monkeypatch.setattr(auth_mod, "exchange_code",
+                        lambda cid, secret, code, uri: seen.append(uri) or {"access_token": "t"})
+    try:
+        assert client.get("/auth/callback", params={"code": "c", "state": "s1"}).status_code == 303
+        assert seen == ["https://study.example.edu/auth/callback"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+class _Resp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _user_with_google_token(s):
+    from app.crypto import seal
+
+    user = User(email="g@x.edu", google_refresh_token=seal("google-refresh-token", "rt-1"))
+    s.add(user)
+    s.commit()
+    s.refresh(user)
+    return user
+
+
+@pytest.mark.parametrize("outcome, revoked", [
+    ("ok", True), ("invalid_token", True), ("unreachable", False)])
+def test_revoke_google_access_always_forgets_the_token(monkeypatch, outcome, revoked):
+    import urllib.error
+
+    sent = []
+
+    def fake_urlopen(req, timeout):
+        sent.append((req.full_url, req.data))
+        if outcome == "invalid_token":
+            raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, None)
+        if outcome == "unreachable":
+            raise urllib.error.URLError("down")
+        return _Resp()
+
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
+    engine = make_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        user = _user_with_google_token(s)
+        assert auth_mod.revoke_google_access(s, user) is revoked
+        s.refresh(user)
+        assert user.google_refresh_token is None
+    assert sent == [(auth_mod.REVOKE_URL, b"token=rt-1")]
+
+
+def test_revoke_without_a_token_skips_google(monkeypatch):
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("called Google"))
+    engine = make_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        user = User(email="none@x.edu")
+        s.add(user)
+        s.commit()
+        assert auth_mod.revoke_google_access(s, user) is True
+
+
+def test_settings_revoke_google_button(testapp, monkeypatch):
+    import re
+
+    from app.crypto import seal
+
+    with testapp["Session"]() as s:
+        user = s.get(User, testapp["user_id"])
+        user.google_refresh_token = seal("google-refresh-token", "rt-1")
+        s.add(user)
+        s.commit()
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout: _Resp())
+    client = testapp["client"]
+    page = client.get("/settings/moodle").text
+    assert "Revoke Google access" in page
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+    r = client.post("/settings/google/disconnect", data={"csrf_token": token},
+                    follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/settings/moodle"
+    with testapp["Session"]() as s:
+        assert s.get(User, testapp["user_id"]).google_refresh_token is None
+    page = client.get("/settings/moodle").text
+    assert "Google access revoked" in page and "Revoke Google access" not in page
