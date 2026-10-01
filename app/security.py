@@ -7,6 +7,7 @@ see DEPLOY.md.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -15,6 +16,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
 
 from app.config import settings
+
+log = logging.getLogger(__name__)
 
 DEFAULT_POST_LIMIT = (120, 60)  # 120 POSTs per 60s per client
 MAX_TRACKED_CLIENTS = 10_000  # LRU bound on the hit table
@@ -33,24 +36,42 @@ def csp_header(nonce: str) -> str:
     )
 
 
+def apply_security_headers(response, nonce: str):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=()"
+    )
+    response.headers["Content-Security-Policy"] = csp_header(nonce)
+    if settings.session_secure_cookie:
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Headers on every response, including the 500 for an unhandled error:
+    that is rendered here by `error_response(request)` (and logged), since
+    Starlette's own 500 handler sits outside every middleware."""
+
+    def __init__(self, app, error_response=None):
+        super().__init__(app)
+        self.error_response = error_response or (
+            lambda request: PlainTextResponse("Internal Server Error", status_code=500)
+        )
+
     async def dispatch(self, request, call_next):
         # Templates read request.state.csp_nonce for inline <script>/<style>.
         nonce = secrets.token_urlsafe(16)
         request.state.csp_nonce = nonce
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=()"
-        )
-        response.headers["Content-Security-Policy"] = csp_header(nonce)
-        if settings.session_secure_cookie:
-            response.headers["Strict-Transport-Security"] = (
-                "max-age=31536000; includeSubDomains"
-            )
-        return response
+        try:
+            response = await call_next(request)
+        except Exception:
+            log.exception("unhandled error on %s %s", request.method, request.url.path)
+            response = self.error_response(request)
+        return apply_security_headers(response, nonce)
 
 
 class HitTable:

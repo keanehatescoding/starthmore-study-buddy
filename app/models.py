@@ -85,7 +85,7 @@ class Assignment(SQLModel, table=True):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     course_id: uuid.UUID = Field(foreign_key="courses.id", index=True)
-    topic_id: Optional[uuid.UUID] = Field(default=None, foreign_key="topics.id")
+    topic_id: Optional[uuid.UUID] = Field(default=None, foreign_key="topics.id", index=True)
     source: str = Field(default="moodle")
     source_id: str = Field(index=True)
     title: str

@@ -60,7 +60,7 @@ topics → resources/chunks, plus `/review` (due queue) and `/stats`.
 | `LLM_CHUNK_MODEL`, `LLM_QUIZ_MODEL`, `LLM_GRADE_MODEL` | Per-stage models (cheap → quality) |
 | `LLM_PACE` | Seconds between pipeline LLM calls (default 0; `--pace` overrides) |
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_TO` | Notifications (Resend free tier) |
-| `APP_BASE_URL` | Public origin for links in emails (default `http://localhost:8000`) |
+| `APP_BASE_URL` | Public origin for email links and the Google sign-in redirect `APP_BASE_URL/auth/callback` (default `http://localhost:8000`) |
 | `TIMEZONE` | IANA zone for study days: streaks start at local midnight (default `Africa/Nairobi`) |
 | `SECRET_KEY` | Signs sessions and encrypts stored tokens (`openssl rand -hex 32`); every service needs the same value |
 | `DEV` | Local development only: accepts the public default `SECRET_KEY` (never on a server) |

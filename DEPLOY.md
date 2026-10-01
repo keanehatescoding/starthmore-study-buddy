@@ -8,7 +8,7 @@
    API and the Drive API in that Google Cloud project, since Classroom materials
    are Drive files read with `drive.readonly`), `LLM_*`, `RESEND_API_KEY`,
    `EMAIL_FROM`, `EMAIL_TO`, `APP_BASE_URL` (the public web URL, used in
-   email links). `DATABASE_URL` can stay as the plugin sets it: a
+   email links and as the Google sign-in redirect). `DATABASE_URL` can stay as the plugin sets it: a
    bare `postgres://` / `postgresql://` URL is switched to the installed
    `psycopg` (v3) driver automatically.
 3. Services — five in all, counting Postgres:
@@ -27,7 +27,7 @@
    web happens to redeploy. It is a no-op at head, and concurrent runs
    serialize on a Postgres advisory lock. Point all services at the same
    repo and branch, so a merge redeploys them together.
-4. Each user connects their own Moodle account at **Moodle** in the nav
+4. Each user connects their own Moodle account at **Settings** in the nav
    (`/settings/moodle`: sign in once via `login/token.php`, or paste their
    mobile web service key). Tokens are stored encrypted with a key derived
    from `SECRET_KEY` — rotating `SECRET_KEY` means everyone reconnects, and
@@ -160,6 +160,7 @@ only renamed into place once `pg_dump` succeeds; the password is passed via
   `openssl rand -hex 32` → `SECRET_KEY`. Every service refuses to start
   with the public default key unless `DEV=1` is set, which is for local
   development only — never set it on a server. Set `SESSION_SECURE_COOKIE=true`
-  behind HTTPS. The Google OAuth consent screen must list your production
-  origin as an authorized redirect (`.../auth/callback`).
+  behind HTTPS. The Google OAuth client must list `APP_BASE_URL/auth/callback`
+  as an authorized redirect: sign-in always sends Google there, whatever
+  Host the request came in on, so open the app at that origin.
 - Never commit `.env` (gitignored). Rotate Moodle/Google credentials if exposed.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -27,6 +28,7 @@ LOGIN_SCOPES = ["openid", "email", "profile", *CLASSROOM_SCOPES, DRIVE_SCOPE]
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _REFRESH_PURPOSE = "google-refresh-token"
 
 
@@ -108,6 +110,34 @@ def classroom_token_for(user: User | None) -> str | None:
     if settings.google_refresh_token and is_owner(user, settings.google_refresh_token_owner):
         return settings.google_refresh_token
     return None
+
+
+def revoke_google_access(session: Session, user: User) -> bool:
+    """Revoke the user's Google grant and forget their refresh token.
+
+    The stored token is cleared even when Google can't be reached, so we
+    stop using it either way; returns False then, since the grant may
+    still be listed at myaccount.google.com until they remove it there."""
+    token = refresh_token_for(user)
+    revoked = True
+    if token:
+        req = urllib.request.Request(
+            REVOKE_URL, data=urllib.parse.urlencode({"token": token}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30):
+                pass
+        except urllib.error.HTTPError as e:
+            # 400 invalid_token: already revoked or expired, so it's gone
+            revoked = e.code == 400
+        except Exception:
+            revoked = False
+    user.google_refresh_token = None
+    session.add(user)
+    session.commit()
+    return revoked
 
 
 def find_user(session: Session, email: str) -> User | None:
