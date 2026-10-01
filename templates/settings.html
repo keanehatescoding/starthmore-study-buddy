@@ -98,4 +98,22 @@
     <p class="settings-text">Not connected. Sign out and in again to grant Classroom access.</p>
   {% endif %}
 </div>
+
+<div class="card settings-card">
+  <div class="card-header"><h2 class="card-title">Time zone</h2></div>
+  <p class="settings-text">
+    Your study day starts at midnight here: reviews fall due then, the daily
+    new-item limit resets, and streaks count these days. Assignment due times show in this zone.
+  </p>
+  <form method="post" action="/settings/timezone">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field-label" for="timezone">Time zone</label>
+    <select class="text-input" id="timezone" name="timezone">
+      {% for z in timezones %}
+        <option value="{{ z }}"{% if z == user_timezone %} selected{% endif %}>{{ z }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn btn-primary">Save time zone</button>
+  </form>
+</div>
 {% endblock %}

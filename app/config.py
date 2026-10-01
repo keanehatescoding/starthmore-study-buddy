@@ -48,6 +48,16 @@ class Settings(BaseSettings):
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
 
+    def zone(self, name: str | None) -> ZoneInfo:
+        """The IANA zone `name`, or the app's TIMEZONE when it's unset or unknown
+        (a zone dropped from the system tzdata shouldn't break the user's pages)."""
+        if name:
+            try:
+                return ZoneInfo(name)
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+        return self.tz
+
     @field_validator("database_url")
     @classmethod
     def _psycopg_driver(cls, v: str) -> str:

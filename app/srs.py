@@ -3,7 +3,7 @@ scheduling stay in sync: grading returns partial_credit 0.0-1.0,
 SM-2 expects quality 0-5."""
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 
 # One pair of thresholds for both the verdict shown and the schedule: credit at
 # or above PASS_CREDIT is a pass (SM-2 quality >= 3), below it a lapse.
@@ -50,6 +50,15 @@ def next_interval_days(
     return interval, repetitions + 1, ease
 
 
-def next_review_date(interval_days: int, now: datetime | None = None) -> datetime:
-    now = now or datetime.now(timezone.utc)
-    return now + timedelta(days=interval_days)
+def local_day_start(now: datetime, tz: tzinfo, days: int = 0) -> datetime:
+    """Midnight in `tz` starting the local day `days` after `now`'s, as UTC."""
+    day = now.astimezone(tz).date() + timedelta(days=days)
+    return datetime.combine(day, time.min, tzinfo=tz).astimezone(timezone.utc)
+
+
+def next_review_date(
+    interval_days: int, now: datetime | None = None, tz: tzinfo = timezone.utc
+) -> datetime:
+    """Due at the start of the local day `interval_days` ahead, so a card
+    answered in the evening is waiting in the morning, not at that evening hour."""
+    return local_day_start(now or datetime.now(timezone.utc), tz, interval_days)
