@@ -1,8 +1,10 @@
 import hmac
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
+from zoneinfo import available_timezones
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import (
@@ -150,6 +152,22 @@ def csrf_token(request: Request) -> str:
 
 
 templates.env.globals["session_csrf_token"] = csrf_token
+
+# Region/City zones only; the bare aliases ("EST", "Etc/GMT+3") just clutter the picker.
+TIMEZONES = sorted({settings.timezone} | {
+    z for z in available_timezones()
+    if "/" in z and not z.startswith(("Etc/", "SystemV/", "US/", "posix/", "right/"))
+})
+
+
+def local_time(value: datetime, user: User) -> str:
+    """A stored UTC instant as wall-clock time in the user's zone."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(settings.zone(user.timezone)).strftime("%Y-%m-%d %H:%M %Z")
+
+
+templates.env.filters["local_time"] = local_time
 
 
 async def checked_form(request: Request):
@@ -585,6 +603,8 @@ def moodle_settings(
             "google_shared": not google_own and auth_mod.classroom_token_for(user) is not None,
             "google_stale": bool(user.google_refresh_token) and not google_own,
             "moodle_url": settings.moodle_base_url,
+            "timezones": TIMEZONES,
+            "user_timezone": settings.zone(user.timezone).key,
             "flash": request.session.pop("flash", None),
             "csrf_token": csrf_token(request),
             "user": user,
@@ -697,6 +717,26 @@ async def moodle_disconnect(
     await run_in_threadpool(_disconnect_moodle, session, user)
     _flash(request, "success",
            "Disconnected. Already-synced courses stay; new material won't sync.")
+    return RedirectResponse("/settings/moodle", status_code=303)
+
+
+@app.post("/settings/timezone")
+async def set_timezone(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    form = await checked_form(request)
+    name = str(form.get("timezone", ""))
+    if name not in TIMEZONES:
+        _flash(request, "error", "Pick a time zone from the list.")
+    else:
+        # the app default is stored as NULL, so it follows a later TIMEZONE change
+        user.timezone = None if name == settings.timezone else name
+        session.add(user)
+        session.commit()
+        _flash(request, "success", f"Time zone set to {name}. Reviews now fall due at "
+               "local midnight.")
     return RedirectResponse("/settings/moodle", status_code=303)
 
 

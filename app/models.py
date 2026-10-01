@@ -23,6 +23,8 @@ class User(SQLModel, table=True):
     moodle_token: Optional[str] = Field(default=None)
     # bumped to revoke every session: sessions carry the value they began with
     session_version: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
+    # IANA zone whose midnight starts this user's study day; NULL = settings.timezone
+    timezone: Optional[str] = Field(default=None)
     created_at: datetime = Field(
         default_factory=_utcnow, sa_column=Column(DateTime(timezone=True), nullable=False)
     )

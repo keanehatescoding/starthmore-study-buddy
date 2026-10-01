@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timezone, tzinfo
 
 from sqlalchemy import and_
 from sqlalchemy.dialects import postgresql, sqlite
@@ -35,7 +35,9 @@ from app.models import (
 from app.srs import (
     PASS_CREDIT,
     initial_ease_factor,
+    local_day_start,
     next_interval_days,
+    next_review_date,
     partial_credit_to_quality,
     verdict,
 )
@@ -53,6 +55,14 @@ Return JSON: {"correct": true|false, "partial_credit": 0.0-1.0, "feedback": "1-2
 def _aware(dt: datetime) -> datetime:
     """SQLite drops tzinfo — assume UTC for naive datetimes."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def user_zone(session: Session, user_id) -> tzinfo:
+    """The user's study-day zone (settings.timezone unless they picked one)."""
+    from app.config import settings
+
+    user = session.get(User, user_id)
+    return settings.zone(user.timezone if user else None)
 
 
 def grade_short_answer(llm: LLMClient, item: QuizItem, answer: str) -> dict:
@@ -204,7 +214,7 @@ def submit_answer(
     state.last_feedback = feedback
     if quality < 3:
         state.lapses += 1
-    state.next_review_date = now + timedelta(days=interval)
+    state.next_review_date = next_review_date(interval, now, user_zone(session, user_id))
     state.answered_at = now
     if is_new_item and state.first_answered_at is None:
         state.first_answered_at = now
@@ -261,8 +271,8 @@ def _overdue(user_id, now: datetime):
 
 
 def _new_allowance(session: Session, user_id, now: datetime) -> int:
-    """New items still allowed today (UTC day) under NEW_ITEMS_PER_DAY."""
-    day_start = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+    """New items still allowed today (the user's local day) under NEW_ITEMS_PER_DAY."""
+    day_start = local_day_start(now, user_zone(session, user_id))
     started = session.exec(
         select(func.count(ReviewState.id)).where(
             ReviewState.user_id == user_id, ReviewState.first_answered_at >= day_start

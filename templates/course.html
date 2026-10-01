@@ -48,7 +48,7 @@
     <li class="assignment-item">
       <span class="text-strong">{{ a.title }}</span>
       {% if a.due_date %}
-        <span class="due-pill">due {{ a.due_date.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+        <span class="due-pill">due {{ a.due_date|local_time(user) }}</span>
       {% endif %}
     </li>
     {% endfor %}

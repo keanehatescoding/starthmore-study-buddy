@@ -6,17 +6,15 @@ from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, func, select
 
-from app.grade import _aware, scoped_items
+from app.grade import _aware, scoped_items, user_zone
 from app.models import QuizItem, ReviewLog, ReviewState
 
 
 def compute_stats(session: Session, user_id, tz=None, now: datetime | None = None) -> dict:
     """Answered/accuracy/streak count every answer in review_logs, not just
-    each item's latest; streak days are local dates in `tz` (settings.tz)."""
+    each item's latest; streak days are local dates in `tz` (the user's zone)."""
     if tz is None:
-        from app.config import settings
-
-        tz = settings.tz
+        tz = user_zone(session, user_id)
     by_verdict = dict(session.exec(
         select(ReviewLog.verdict, func.count(ReviewLog.id))
         .where(ReviewLog.user_id == user_id)
