@@ -6,7 +6,7 @@ import secrets
 import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -294,6 +294,19 @@ def course_detail(
     )
 
 
+# The resource page shows only this much extracted text; Copy fetches the rest.
+RESOURCE_PREVIEW_CHARS = 20_000
+
+
+def _owned_resource(session: Session, user: User, resource_id: UUID):
+    resource = session.get(Resource, resource_id)
+    topic = session.get(Topic, resource.topic_id) if resource else None
+    course = session.get(Course, topic.course_id) if topic else None
+    if resource is None or course is None or course.user_id != user.id:
+        raise HTTPException(404, "resource not found")
+    return resource, topic, course
+
+
 @app.get("/resources/{resource_id}", response_class=HTMLResponse)
 def resource_detail(
     resource_id: UUID,
@@ -301,11 +314,7 @@ def resource_detail(
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
-    resource = session.get(Resource, resource_id)
-    topic = session.get(Topic, resource.topic_id) if resource else None
-    course = session.get(Course, topic.course_id) if topic else None
-    if resource is None or course is None or course.user_id != user.id:
-        raise HTTPException(404, "resource not found")
+    resource, topic, course = _owned_resource(session, user, resource_id)
     chunks = session.exec(
         select(Chunk).where(Chunk.resource_id == resource.id).order_by(Chunk.order)
     ).all()
@@ -317,10 +326,23 @@ def resource_detail(
             "topic": topic,
             "course": course,
             "chunks": chunks,
+            "preview_chars": RESOURCE_PREVIEW_CHARS,
             "user": user,
             "active_page": "courses",
         },
     )
+
+
+@app.get("/resources/{resource_id}/text", response_class=PlainTextResponse)
+def resource_text(
+    resource_id: UUID,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    resource, _, _ = _owned_resource(session, user, resource_id)
+    if not resource.extracted_text:
+        raise HTTPException(404, "no extracted text")
+    return PlainTextResponse(resource.extracted_text)
 
 
 @app.get("/review", response_class=HTMLResponse)
