@@ -7,12 +7,16 @@ pipeline copies a donor's results instead of redoing them:
 
 - extraction: a donor with the same (source, type, content_hash) whose text
   is extracted. Hashes are the source's change markers (app.sync), so equal
-  hashes mean the same file the user's own source listed to them.
+  hashes mean the same file the user's own source listed to them. Classroom
+  Drive files are the exception: they hash as their Drive id, which a course
+  can list without the user's grant being able to open the file, so those are
+  shared only when the user's own downloader confirms it can (`can_read`).
 - chunks: a donor with byte-identical extracted_text that is chunked, so the
   copied offsets are valid in the user's text.
-- quiz items: a donor chunk with identical content, under a resource with the
-  same hash, that has a QuizAttempt for the attempt (copied even when it
-  yielded no items, so nothing-quizzable chunks aren't re-billed either).
+- quiz items: a donor chunk with identical content, under a resource of the
+  same material (source, type, hash), that has a QuizAttempt for the
+  attempt (copied even when it yielded no items, so nothing-quizzable chunks
+  aren't re-billed either).
 
 Chunks and quiz items are only ever copied from text the user already has, so
 sharing them can't reveal anything new.
@@ -32,10 +36,17 @@ def _same_material(r: Resource, *cols):
     ).order_by(Resource.id)
 
 
-def copy_extraction(session: Session, r: Resource) -> bool:
-    """Take a donor's extracted text; True when one was found. Uncommitted."""
+def copy_extraction(session: Session, r: Resource, downloader=None) -> bool:
+    """Take a donor's extracted text; True when one was found. Uncommitted.
+
+    `downloader` is the one the user's own download would use; a Classroom
+    file is shared only when it has a `can_read` that approves the file."""
     if r.content_hash is None:
         return False
+    if r.source == "classroom" and r.type == "file":
+        can_read = getattr(downloader, "can_read", None)
+        if can_read is None or not _donor_exists(session, r) or not can_read(r.raw_url):
+            return False
     # streamed text only: a blank donor must not end the search, and every
     # matching copy carries a whole document
     texts = session.exec(_same_material(r, Resource.extracted_text).where(
@@ -49,6 +60,13 @@ def copy_extraction(session: Session, r: Resource) -> bool:
                 r.error = None
                 return True
     return False
+
+
+def _donor_exists(session: Session, r: Resource) -> bool:
+    """Cheap pre-check so the Drive call is only made when it could pay off."""
+    return session.exec(_same_material(r, Resource.id).where(
+        Resource.status == "extracted", Resource.extracted_text.is_not(None),
+    ).limit(1)).first() is not None
 
 
 def copy_chunks(session: Session, r: Resource) -> int:
@@ -94,7 +112,7 @@ def copy_quiz(session: Session, chunk: Chunk, attempt: int = 1) -> list[QuizItem
     donor = session.exec(
         select(Chunk).join(Resource, Resource.id == Chunk.resource_id).where(
             Resource.content_hash == r.content_hash, Resource.source == r.source,
-            Chunk.id != chunk.id, Chunk.content == chunk.content, tried,
+            Resource.type == r.type, Chunk.id != chunk.id, Chunk.content == chunk.content, tried,
         ).order_by(Chunk.id).limit(1)
     ).first()
     if donor is None:
