@@ -206,6 +206,16 @@ def lock_resource(session: Session, resource_id) -> bool:
     ).first() is not None
 
 
+def _relocate_chunks(session: Session, resource_id, text: str) -> None:
+    """Point kept chunks at the new text: re-find each one, NULL when it
+    no longer appears, so start_char/end_char never index the wrong text."""
+    from app.chunk import locate
+
+    for c in session.exec(select(Chunk).where(Chunk.resource_id == resource_id)):
+        c.start_char, c.end_char = locate(c.content, text)
+        session.add(c)
+
+
 def commit_if_current(session: Session, resource_id, seen_hash) -> bool:
     """Commit the pending work on a resource only if its content_hash is still
     the one it was built from; otherwise roll it back and return False.
@@ -401,8 +411,10 @@ def sync_course(
                   and existing.extracted_text != r.text):
                 # Same source content, better text from it (e.g. page HTML now
                 # converted to text): refresh the text, keep derived data.
+                lock_resource(session, existing.id)  # wait out a chunking commit
                 existing.extracted_text = r.text
                 session.add(existing)
+                _relocate_chunks(session, existing.id, r.text)
                 session.commit()
                 stats.resources_updated += 1
             else:

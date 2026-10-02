@@ -721,6 +721,24 @@ async def moodle_disconnect(
     return RedirectResponse("/settings/moodle", status_code=303)
 
 
+def _save_timezone(session: Session, user: User, name: str) -> None:
+    # the app default is stored as NULL, so it follows a later TIMEZONE change
+    user.timezone = None if name == settings.timezone else name
+    session.add(user)
+    session.commit()
+
+
+def _save_notify_email(session: Session, user: User, on: bool) -> None:
+    from app.notify import opt_out
+
+    if on:
+        user.notify_email = True
+        session.add(user)
+        session.commit()
+    else:
+        opt_out(session, user)
+
+
 @app.post("/settings/timezone")
 async def set_timezone(
     request: Request,
@@ -732,10 +750,7 @@ async def set_timezone(
     if name not in TIMEZONES:
         _flash(request, "error", "Pick a time zone from the list.")
     else:
-        # the app default is stored as NULL, so it follows a later TIMEZONE change
-        user.timezone = None if name == settings.timezone else name
-        session.add(user)
-        session.commit()
+        await run_in_threadpool(_save_timezone, session, user, name)
         _flash(request, "success", f"Time zone set to {name}. Reviews now fall due at "
                "local midnight.")
     return RedirectResponse("/settings/moodle", status_code=303)
@@ -747,15 +762,9 @@ async def set_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
-    from app.notify import opt_out
-
     form = await checked_form(request)
-    if form.get("notify_email") == "on":
-        user.notify_email = True
-        session.add(user)
-        session.commit()
-    else:
-        opt_out(session, user)
+    await run_in_threadpool(_save_notify_email, session, user,
+                            form.get("notify_email") == "on")
     _flash(request, "success", "Email notifications turned "
            + ("on." if user.notify_email else "off."))
     return RedirectResponse("/settings/moodle", status_code=303)

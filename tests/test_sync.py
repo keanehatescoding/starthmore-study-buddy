@@ -594,6 +594,33 @@ def test_page_stored_as_raw_html_gets_text_and_keeps_progress(session, user_id):
     assert stats.resources_updated == 1
 
 
+
+def test_better_text_relocates_kept_chunks(session, user_id):
+    """Chunk offsets index extracted_text, so a text refresh re-finds them."""
+    from app.moodle import MoodleAdapter
+
+    html = "<p>Trees &amp; <b>graphs</b></p>"
+    client = FakeMoodleClient()
+    client.call = lambda f, **p: {"pages": [{"coursemodule": 11, "content": html}]}
+    sync_all(session, MoodleAdapter(client), user_id)
+    page = _resource(session, "11")
+    page.extracted_text = html  # as the old code stored it
+    page.status = "chunked"
+    session.add_all([
+        page,
+        Chunk(resource_id=page.id, title="a", content="graphs", order=0,
+              start_char=html.find("graphs"), end_char=html.find("graphs") + 6),
+        Chunk(resource_id=page.id, title="b", content="Trees &amp;", order=1,
+              start_char=3, end_char=14),
+    ])
+    session.commit()
+    sync_all(session, MoodleAdapter(client), user_id)
+    session.expire_all()
+    found, gone = session.exec(select(Chunk).order_by(Chunk.order)).all()
+    text = _resource(session, "11").extracted_text
+    assert text[found.start_char:found.end_char] == "graphs"
+    assert (gone.start_char, gone.end_char) == (None, None)  # not in the new text
+
 @pytest.mark.parametrize("url, kind", [
     ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "video"),
     ("https://www.youtube.com/embed/dQw4w9WgXcQ", "video"),
