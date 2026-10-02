@@ -66,6 +66,22 @@ class DriveClient:
     def __init__(self, service):
         self.service = service
 
+    def __call__(self, url: str) -> tuple[bytes, str | None]:
+        return self.download(url)
+
+    def can_read(self, url: str | None) -> bool:
+        """Whether this grant can see the file (a metadata call, no bytes).
+        False on any failure: a caller only ever skips a shortcut on it."""
+        fid = file_id(url)
+        if fid is None:
+            return False
+        try:
+            self._call(self.service.files().get(fileId=fid, fields="id",
+                                                supportsAllDrives=True))
+        except (DriveError, ExtractError):
+            return False
+        return True
+
     def download(self, url: str) -> tuple[bytes, str | None]:
         """Downloader for app.extract: Drive URL -> (bytes, mime)."""
         fid = file_id(url)

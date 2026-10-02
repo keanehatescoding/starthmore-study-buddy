@@ -210,3 +210,102 @@ def test_extraction_looks_past_blank_donors(session):
 
     session.refresh(r)
     assert r.extracted_text == TEXT
+
+
+def test_quiz_needs_the_same_resource_type(session):
+    _, a = _copy_of(session, "a@x", type="link", status="extracted", extracted_text=TEXT)
+    _, b = _copy_of(session, "b@x", status="extracted", extracted_text=TEXT)
+    donor = Chunk(resource_id=a.id, title="C", content="same", order=0)
+    own = Chunk(resource_id=b.id, title="C", content="same", order=0)
+    session.add_all([donor, own])
+    session.commit()
+    session.add(QuizAttempt(chunk_id=donor.id, attempt=1))
+    session.commit()
+
+    assert copy_quiz(session, own) is None
+
+
+class Drive:
+    """A user's own Drive downloader: whether their grant sees the file."""
+
+    def __init__(self, readable):
+        self.readable, self.asked = readable, []
+
+    def can_read(self, url):
+        self.asked.append(url)
+        return self.readable
+
+    def __call__(self, url):
+        return b"own text", "text/plain"
+
+
+def _classroom_pair(session):
+    kw = {"source": "classroom", "content_hash": "drive:1AbCdEfGhIjKlMnOp",
+          "raw_url": "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOp/view"}
+    _copy_of(session, "a@x", status="extracted", extracted_text=TEXT, **kw)
+    return _copy_of(session, "b@x", **kw)
+
+
+@pytest.mark.parametrize("readable", [True, False])
+def test_classroom_files_are_shared_only_if_the_users_grant_sees_them(session, readable):
+    course, r = _classroom_pair(session)
+    drive = Drive(readable)
+
+    res = run_extraction(session, None, course.id, downloader_for=lambda r: drive)
+
+    session.refresh(r)
+    assert drive.asked == [r.raw_url]
+    assert res.counts["shared"] == int(readable)
+    assert r.extracted_text == (TEXT if readable else "own text")
+
+
+def test_classroom_files_need_a_downloader_that_can_check(session):
+    course, r = _classroom_pair(session)
+
+    run_extraction(session, lambda url: (b"own text", "text/plain"), course.id)
+
+    session.refresh(r)
+    assert r.extracted_text == "own text"
+
+
+def test_classroom_check_is_skipped_without_a_donor(session):
+    kw = {"source": "classroom", "content_hash": "drive:other"}
+    course, r = _copy_of(session, "b@x", **kw)
+    drive = Drive(True)
+
+    run_extraction(session, None, course.id, downloader_for=lambda r: drive)
+
+    assert drive.asked == []
+
+
+def _broken(*a, **kw):
+    raise RuntimeError("db hiccup")
+
+
+def test_a_failed_extraction_share_falls_back_to_downloading(session, monkeypatch):
+    import app.pipeline
+
+    monkeypatch.setattr(app.pipeline, "copy_extraction", _broken)
+    _copy_of(session, "a@x", status="extracted", extracted_text=TEXT)
+    course, r = _copy_of(session, "b@x")
+    _, other = _copy_of(session, "c@x", content_hash="fp:other")
+
+    res = run_extraction(session, lambda url: (b"own text", "text/plain"))
+
+    session.refresh(r)
+    session.refresh(other)
+    assert res.counts["share_errors"] == 2 and res.counts["extracted"] == 2
+    assert r.extracted_text == other.extracted_text == "own text"
+
+
+def test_a_failed_chunk_share_falls_back_to_chunking(session, monkeypatch):
+    import app.pipeline
+
+    monkeypatch.setattr(app.pipeline, "copy_chunks", _broken)
+    course, r = _copy_of(session, "b@x", status="extracted", extracted_text=TEXT)
+    llm = ChunkLLM()
+
+    res = run_chunking(session, llm, course.id)
+
+    assert res.counts["share_errors"] == 1 and llm.calls == 1
+    assert len(_chunks(session, r)) == 2

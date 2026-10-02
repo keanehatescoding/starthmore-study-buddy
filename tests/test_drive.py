@@ -126,3 +126,20 @@ def test_non_drive_url_fails_permanently():
     with pytest.raises(ExtractError, match="not a Drive"):
         client.download("https://example.com/notes.pdf")
     assert files.calls == []
+
+
+def test_can_read_asks_for_metadata_only():
+    client, files = _client(meta={"id": FID})
+    assert client.can_read(f"https://drive.google.com/file/d/{FID}/view")
+    assert files.calls == [("get", FID)]
+
+
+@pytest.mark.parametrize("fail", [404, 403, 500])
+def test_can_read_is_false_on_any_refusal(fail):
+    client, _ = _client(meta={}, fail=_http_error(fail))
+    assert not client.can_read(f"https://drive.google.com/file/d/{FID}/view")
+
+
+def test_can_read_rejects_non_drive_urls():
+    client, files = _client(meta={"id": FID})
+    assert not client.can_read("https://example.com/x.pdf") and files.calls == []

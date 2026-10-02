@@ -150,13 +150,24 @@ def classroom_downloader_for(session: Session):
         token = classroom_token_for(user)
         if not token:
             return None
+        # the client itself: callable as a downloader, and app.share asks its
+        # can_read before handing over another user's copy of a Drive file
         return DriveClient(build_service(
-            settings.google_client_id, settings.google_client_secret, token)).download
+            settings.google_client_id, settings.google_client_secret, token))
 
     return _owner_downloader_for(session, make)
 
 
 DOWNLOADERS_FOR = {"moodle": moodle_downloader_for, "classroom": classroom_downloader_for}
+
+
+def _share_failed(session: Session, rid, e: Exception, counts) -> Resource | None:
+    """Undo a failed share attempt and reload the resource (None if gone)."""
+    session.rollback()
+    counts["share_errors"] += 1
+    print(f"  share failed on resource {rid}: {type(e).__name__}: {str(e)[:120]}",
+          flush=True)
+    return session.get(Resource, rid)
 
 
 def run_extraction(session: Session, downloader, course_id=None,
@@ -172,7 +183,15 @@ def run_extraction(session: Session, downloader, course_id=None,
             # owner hasn't connected this source: leave pending, retry once they do
             counts["no_token"] += 1
             continue
-        if copy_extraction(session, r):
+        try:
+            shared = copy_extraction(session, r, dl)
+        except Exception as e:  # sharing is a shortcut: fall back to downloading
+            r = _share_failed(session, rid, e, counts)
+            if r is None or r.content_hash != seen_hash:
+                counts["changed"] += 1
+                continue
+            shared = False
+        if shared:
             _succeeded(r)
             session.add(r)
             if not commit_if_current(session, rid, seen_hash):
@@ -243,6 +262,12 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
         except ContentChanged:
             counts["changed"] += 1
             continue
+        except Exception as e:  # sharing is a shortcut: fall back to chunking
+            r = _share_failed(session, rid, e, counts)
+            if r is None or r.content_hash != seen_hash:
+                counts["changed"] += 1
+                continue
+            shared = 0
         if shared:
             if r.attempts or r.retry_after:
                 _succeeded(r)
