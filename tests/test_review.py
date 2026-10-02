@@ -3,6 +3,7 @@
 import re
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlmodel import select
 
 from app.models import Chunk, Course, QuizItem, Resource, ReviewState, Topic, User
@@ -429,3 +430,68 @@ def test_result_shows_short_answer_and_reference(testapp, monkeypatch):
     assert re.search(r"Reference answer</h3>\s*<p[^>]*>because</p>", r.text)
     with Session() as s:
         assert s.exec(select(ReviewState)).one().last_answer == "<b>since</b>"
+
+
+def test_result_links_to_source_passage(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    with Session() as s:
+        chunk = s.exec(select(Chunk)).one()
+        rid, cid = chunk.resource_id, chunk.id
+    page = client.get("/review/take").text
+    assert "?chunk=" not in page  # the passage would give the answer away
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "1", "csrf_token": _token(client)})
+    assert f'href="/resources/{rid}?chunk={cid}#source"' in r.text
+    assert "R — Ch" in r.text
+
+
+def _resource_page(testapp, text, start, end, content="chunk body"):
+    client, Session = testapp["client"], testapp["Session"]
+    with Session() as s:
+        course = Course(user_id=testapp["user_id"], source="moodle", source_id="c1", name="C")
+        s.add(course)
+        s.commit()
+        topic = Topic(course_id=course.id, source_id="t1", title="T")
+        s.add(topic)
+        s.commit()
+        res = Resource(topic_id=topic.id, source="moodle", source_id="r1", type="file",
+                       title="R", status="extracted", extracted_text=text)
+        s.add(res)
+        s.commit()
+        chunk = Chunk(resource_id=res.id, title="Ch", content=content, order=0,
+                      start_char=start, end_char=end)
+        s.add(chunk)
+        s.commit()
+        rid, cid = res.id, chunk.id
+    return client.get(f"/resources/{rid}?chunk={cid}").text, cid
+
+
+def test_source_passage_highlighted_with_context(testapp):
+    from app.main import SOURCE_CONTEXT_CHARS
+
+    text = "x" * 1000 + "<the passage>" + "y" * 1000
+    page, cid = _resource_page(testapp, text, 1000, 1013)
+    m = re.search(r'<pre class="text source-text">(.*?)<mark class="source-mark">(.*?)</mark>'
+                  r'(.*?)</pre>', page, re.S)
+    assert m.group(1) == "…" + "x" * SOURCE_CONTEXT_CHARS
+    assert m.group(2) == "&lt;the passage&gt;"  # escaped
+    assert m.group(3) == "y" * SOURCE_CONTEXT_CHARS + "…"
+    assert f'class="chunk-card is-source" id="chunk-{cid}"' in page
+
+
+@pytest.mark.parametrize("start,end", [(None, None), (5, 50)])
+def test_source_passage_without_offsets_shows_chunk(testapp, start, end):
+    # offsets reset by a text refresh, or past the end of the current text
+    page, _ = _resource_page(testapp, "short", start, end, content="stored chunk")
+    assert '<mark class="source-mark">stored chunk</mark>' in page
+    assert "be located in the current text" in page
+
+
+def test_unknown_source_chunk_ignored(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    _resource_page(testapp, "abc", 0, 3)
+    with Session() as s:
+        rid = s.exec(select(Resource)).one().id
+    r = client.get(f"/resources/{rid}?chunk=00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 200 and "source-mark" not in r.text

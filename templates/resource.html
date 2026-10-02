@@ -43,6 +43,22 @@
   {% endif %}
 </div>
 
+{% if passage %}
+<!-- The passage a question came from (?chunk= on the result page's link) -->
+<div class="reader-box source-box" id="source">
+  <div class="reader-header">
+    <h2 class="section-title">Source passage: {{ source.title }}</h2>
+    {% if passage.located %}
+    <span class="badge badge-meta">characters {{ source.start_char }}–{{ source.end_char }}</span>
+    {% endif %}
+  </div>
+  {% if not passage.located %}
+  <p class="section-note">The passage couldn't be located in the current text, so this is the chunk as it was stored.</p>
+  {% endif %}
+  <pre class="text source-text">{{ passage.before }}<mark class="source-mark">{{ passage.passage }}</mark>{{ passage.after }}</pre>
+</div>
+{% endif %}
+
 <!-- Extracted Text Section -->
 <div class="reader-box">
   <div class="reader-header">
@@ -86,7 +102,7 @@
 
   <div>
     {% for c in chunks %}
-    <div class="chunk-card">
+    <div class="chunk-card{% if source and c.id == source.id %} is-source{% endif %}" id="chunk-{{ c.id }}">
       <div class="chunk-title">
         <span><strong>{{ c.title }}</strong></span>
         <span class="badge badge-meta">

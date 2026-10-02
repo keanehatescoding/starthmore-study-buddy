@@ -929,6 +929,34 @@ pre.text {
   box-shadow: var(--shadow-sm);
 }
 
+.chunk-card.is-source {
+  border-color: var(--accent);
+  border-left-width: 4px;
+}
+
+.source-box {
+  border-color: var(--accent);
+}
+
+.source-mark {
+  background: var(--accent-light);
+  color: var(--text-main);
+  border-radius: 3px;
+  padding: 0.05em 0;
+  box-shadow: 0 0 0 1px var(--warning-border);
+}
+
+.source-link {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 1rem 0 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
 .chunk-title {
   font-weight: 700;
   font-size: 0.95rem;
