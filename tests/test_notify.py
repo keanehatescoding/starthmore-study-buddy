@@ -1,14 +1,27 @@
 """Phase 6 tests: batching, threshold, dedupe, delivery (fake sender)."""
 
 import io
+import re
 import urllib.error
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, select
 
 import app.notify as notify
-from app.models import Chunk, Course, NotificationEvent, QuizItem, Resource, Topic, User
+from app.main import app
+from app.models import (
+    Chunk,
+    Course,
+    NotificationEvent,
+    QuizItem,
+    Resource,
+    ReviewLog,
+    Topic,
+    User,
+)
 from tests.dbutil import TEST_DATABASE_URL, make_engine
 
 
@@ -179,7 +192,7 @@ def test_send_goes_to_event_owner_not_fallback(session, monkeypatch):
 
 
 @pytest.mark.skipif(bool(TEST_DATABASE_URL), reason="the users FK rules out a missing user")
-def test_send_without_recipient_stays_queued(session, monkeypatch):
+def test_send_without_recipient_fails_once(session, monkeypatch):
     calls = _fake_batches(monkeypatch)
     # stale reference: user row gone, no fallback -> cannot deliver
     orphan = NotificationEvent(user_id=uuid.UUID(int=0),
@@ -189,7 +202,11 @@ def test_send_without_recipient_stays_queued(session, monkeypatch):
     out = notify.send_pending(session, "key", "from@x", "")
     assert out == {"sent": 0, "failed": 1, "errors": {"no_recipient": 1}}
     assert calls == []
-    assert session.exec(select(NotificationEvent)).one().sent is False
+    event = session.exec(select(NotificationEvent)).one()
+    assert event.sent is False and event.failed_reason == "no_recipient"
+    # out of the queue: later passes don't re-render it forever
+    assert notify.send_pending(session, "key", "from@x", "") == {
+        "sent": 0, "failed": 0, "errors": {}}
 
 
 def test_render_review_due():
@@ -207,7 +224,8 @@ def test_render_uses_app_base_url_setting(monkeypatch):
     event = NotificationEvent(user_id=uuid.UUID(int=0), type="new_material",
                               payload={"course": "DS", "code": "CS", "new_items": 2})
     _, body = notify.render(event)
-    assert body.endswith("Review them: https://prod.example.com/review")
+    assert "Review them: https://prod.example.com/review\n" in body
+    assert "https://prod.example.com/unsubscribe/" in body
 
 
 def test_unowned_course_enqueues_nothing_and_creates_no_user(session):
@@ -550,3 +568,118 @@ def test_legacy_batch_other_409_keeps_legacy_key(session, monkeypatch):
     assert notify.send_pending(session, "key", "from@x")["failed"] == 2
     assert seen == ["batch-legacy"]
     assert all(e.batch_key == "batch-legacy" for e in events)
+
+
+def _set(s: Session, obj, **fields):
+    for k, v in fields.items():
+        setattr(obj, k, v)
+    s.add(obj)
+    s.commit()
+
+
+def test_review_due_skips_opted_out_user(session):
+    user, _ = _course_with_items(session, n_chunks=3)
+    _set(session, user, notify_email=False)
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+    _set(session, user, notify_email=True)
+    assert notify.check_review_due(session, user.id, threshold=3) is not None
+
+
+def test_new_material_skips_opted_out_owner(session):
+    user, course = _course_with_items(session)
+    _set(session, user, notify_email=False)
+    assert notify.enqueue_new_material(session, course.id, 5) is None
+
+
+def test_review_due_pauses_for_inactive_users(session):
+    user, course = _course_with_items(session, n_chunks=3)
+    old = datetime.now(timezone.utc) - notify.REVIEW_DUE_ACTIVE_WINDOW - timedelta(days=1)
+    # synced once and never studied: no reminder after the window
+    _set(session, user, created_at=old)
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+    # answered long ago: still inactive
+    item = session.exec(select(QuizItem)).first()
+    log = ReviewLog(user_id=user.id, quiz_item_id=item.id, answered_at=old,
+                    verdict="correct")
+    session.add(log)
+    session.commit()
+    assert notify.check_review_due(session, user.id, threshold=3) is None
+    # a recent answer makes them active again
+    _set(session, log, answered_at=datetime.now(timezone.utc))
+    assert notify.check_review_due(session, user.id, threshold=3) is not None
+
+
+def test_queued_events_of_opted_out_user_fail(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    user, course = _course_with_items(session, n_chunks=3)
+    notify.enqueue_new_material(session, course.id, 3)
+    _set(session, user, notify_email=False)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 0, "failed": 1, "errors": {"opted_out": 1}}
+    assert calls == []
+    assert session.exec(select(NotificationEvent)).one().failed_reason == "opted_out"
+    # opting back in later doesn't resurrect the stale event...
+    _set(session, user, notify_email=True)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 0
+    # ...and a failed review_due doesn't block a new one
+    failed = NotificationEvent(user_id=user.id, type="review_due",
+                               payload={"due_count": 3}, failed_reason="opted_out")
+    session.add(failed)
+    session.commit()
+    assert notify.check_review_due(session, user.id, threshold=3) is not None
+
+
+def test_emails_carry_one_click_unsubscribe(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    user, course = _course_with_items(session)
+    notify.enqueue_new_material(session, course.id, 2)
+    notify.send_pending(session, "key", "from@x", base_url="https://sb.example.com")
+    [[email]] = calls
+    url = email["headers"]["List-Unsubscribe"].strip("<>")
+    assert url.startswith("https://sb.example.com/unsubscribe/") and url in email["text"]
+    assert email["headers"]["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+    token = url.rsplit("/", 1)[1]
+    assert notify.unsubscribe_user(session, token).id == user.id
+
+
+def test_unsubscribe_token_is_signed(session):
+    user, _ = _course_with_items(session)
+    token = notify.unsubscribe_token(user.id, "secret-a")
+    assert notify.unsubscribe_user(session, token, "secret-a").id == user.id
+    assert notify.unsubscribe_user(session, token, "secret-b") is None
+    assert notify.unsubscribe_user(session, token[:-2] + "xx", "secret-a") is None
+    assert notify.unsubscribe_user(session, "garbage", "secret-a") is None
+
+
+def _notify_email(testapp) -> bool:
+    with testapp["Session"]() as s:
+        return s.get(User, testapp["user_id"]).notify_email
+
+
+def test_settings_toggles_notifications(testapp):
+    client = testapp["client"]
+    page = client.get("/settings/moodle").text
+    assert 'name="notify_email" checked' in page
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+    r = client.post("/settings/notifications", data={"csrf_token": token})  # unchecked
+    assert "notifications turned off" in r.text and not _notify_email(testapp)
+    client.post("/settings/notifications", data={"csrf_token": token, "notify_email": "on"})
+    assert _notify_email(testapp)
+    assert client.post("/settings/notifications",
+                       data={"csrf_token": "bogus"}).status_code == 403
+
+
+def test_unsubscribe_link(testapp):
+    client = TestClient(app)  # signed out: the token is the only credential
+    url = f"/unsubscribe/{notify.unsubscribe_token(testapp['user_id'])}"
+    page = client.get(url)
+    # GET only confirms, so link scanners can't unsubscribe anyone
+    assert page.status_code == 200 and "Unsubscribe?" in page.text
+    assert _notify_email(testapp)
+    # RFC 8058 one-click POST, as a mail client sends it
+    r = client.post(url, data={"List-Unsubscribe": "One-Click"})
+    assert r.status_code == 200 and "unsubscribed" in r.text
+    assert not _notify_email(testapp)
+    assert client.post(url).status_code == 200  # idempotent
+    assert client.get("/unsubscribe/forged").status_code == 404
+    assert client.post("/unsubscribe/forged").status_code == 404

@@ -116,4 +116,27 @@
     <button type="submit" class="btn btn-primary">Save time zone</button>
   </form>
 </div>
+
+<div class="card settings-card">
+  <div class="card-header">
+    <h2 class="card-title">Email notifications</h2>
+    {% if notify_email %}
+      <span class="badge status-ok">On</span>
+    {% else %}
+      <span class="badge status-off">Off</span>
+    {% endif %}
+  </div>
+  <p class="settings-text">
+    New-material emails when your courses gain quiz items, and a daily reminder when reviews
+    pile up. Reminders pause by themselves if you haven't studied in two weeks.
+  </p>
+  <form method="post" action="/settings/notifications">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="check-label">
+      <input type="checkbox" name="notify_email"{% if notify_email %} checked{% endif %}>
+      Email me about new material and due reviews
+    </label>
+    <button type="submit" class="btn btn-primary">Save</button>
+  </form>
+</div>
 {% endblock %}

@@ -605,6 +605,7 @@ def moodle_settings(
             "moodle_url": settings.moodle_base_url,
             "timezones": TIMEZONES,
             "user_timezone": settings.zone(user.timezone).key,
+            "notify_email": user.notify_email,
             "flash": request.session.pop("flash", None),
             "csrf_token": csrf_token(request),
             "user": user,
@@ -738,6 +739,52 @@ async def set_timezone(
         _flash(request, "success", f"Time zone set to {name}. Reviews now fall due at "
                "local midnight.")
     return RedirectResponse("/settings/moodle", status_code=303)
+
+
+@app.post("/settings/notifications")
+async def set_notifications(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    form = await checked_form(request)
+    user.notify_email = form.get("notify_email") == "on"
+    session.add(user)
+    session.commit()
+    _flash(request, "success", "Email notifications turned "
+           + ("on." if user.notify_email else "off."))
+    return RedirectResponse("/settings/moodle", status_code=303)
+
+
+def _unsubscribe_target(session: Session, token: str) -> User:
+    from app.notify import unsubscribe_user
+
+    user = unsubscribe_user(session, token)
+    if user is None:
+        raise HTTPException(404, "unknown unsubscribe link")
+    return user
+
+
+@app.get("/unsubscribe/{token}", response_class=HTMLResponse)
+def unsubscribe_page(request: Request, token: str, session: Session = Depends(get_session)):
+    """Confirmation only: mail scanners follow links, so GET changes nothing."""
+    user = _unsubscribe_target(session, token)
+    return templates.TemplateResponse(
+        request, "unsubscribe.html",
+        {"done": not user.notify_email, "email": user.email, "token": token})
+
+
+@app.post("/unsubscribe/{token}", response_class=HTMLResponse)
+def unsubscribe(request: Request, token: str, session: Session = Depends(get_session)):
+    """One-click unsubscribe (RFC 8058): the signed token is the credential,
+    so no session or CSRF token; mail clients POST here directly."""
+    user = _unsubscribe_target(session, token)
+    if user.notify_email:
+        user.notify_email = False
+        session.add(user)
+        session.commit()
+    return templates.TemplateResponse(
+        request, "unsubscribe.html", {"done": True, "email": user.email, "token": token})
 
 
 @app.post("/settings/google/disconnect")
