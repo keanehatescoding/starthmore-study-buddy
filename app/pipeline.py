@@ -15,11 +15,14 @@ Each stage first copies another user's results for the same material
 from __future__ import annotations
 
 import argparse
+import hashlib
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import text
 from sqlmodel import Session, func, or_, select
 
 from app.chunk import chunk_resource, needs_llm
@@ -32,6 +35,7 @@ from app.models import Chunk, Course, Resource, Topic, User
 from app.moodle import ForeignURLError, MoodleError
 from app.quiz import chunk_needs_quiz, generate_for_chunk
 from app.share import copy_chunks, copy_extraction, copy_quiz
+from app.sync import ContentChanged, commit_if_current
 
 
 @dataclass
@@ -162,6 +166,7 @@ def run_extraction(session: Session, downloader, course_id=None,
     ids = pending_resource_ids(session, course_id, source)
     for i, rid in enumerate(ids, 1):
         r = session.get(Resource, rid)
+        seen_hash = r.content_hash  # what the text will be of
         dl = downloader_for(r) if downloader_for else downloader
         if dl is None and r.type == "file" and downloader_for:
             # owner hasn't connected this source: leave pending, retry once they do
@@ -170,7 +175,9 @@ def run_extraction(session: Session, downloader, course_id=None,
         if copy_extraction(session, r):
             _succeeded(r)
             session.add(r)
-            session.commit()
+            if not commit_if_current(session, rid, seen_hash):
+                counts["changed"] += 1
+                continue
             counts["shared"] += 1
             print(f"  extract {i}/{len(ids)} shared: {r.title[:60]}", flush=True)
             continue
@@ -180,34 +187,39 @@ def run_extraction(session: Session, downloader, course_id=None,
             if r.extracted_text and r.extracted_text.strip():
                 r.status = "extracted"
                 r.error = None
-                counts["extracted"] += 1
+                outcome = "extracted"
             else:  # nothing to chunk or quiz on; don't bill a chunker call
                 r.status = "skipped"
                 r.error = "no text extracted"
-                counts["skipped"] += 1
+                outcome = "skipped"
         except SkipResource:
             r.status = "skipped"
             r.error = None
-            counts["skipped"] += 1
+            outcome = "skipped"
         except ForeignURLError as e:
             r.status = "failed"  # not a Moodle file; retrying can't help
             r.error = str(e)[:500]
-            counts["failed"] += 1
+            outcome = "failed"
         except (MoodleError, DriveError) as e:
             # network blip, rejected token or missing Drive grant: keep
             # pending, retried after a backoff instead of on every run
             _defer(r, str(e))
-            counts["download_errors"] += 1
+            outcome = "download_errors"
         except ExtractError as e:
             r.status = "failed"
             r.error = str(e)[:500]
-            counts["failed"] += 1
+            outcome = "failed"
         except Exception as e:  # parser crash on one bad file must not end the run
             r.status = "failed"
             r.error = f"{type(e).__name__}: {e}"[:500]
-            counts["failed"] += 1
+            outcome = "failed"
         session.add(r)
-        session.commit()
+        if not commit_if_current(session, rid, seen_hash):
+            # a sync replaced the content meanwhile: it is pending again
+            counts["changed"] += 1
+            print(f"  extract {i}/{len(ids)} changed meanwhile, dropped", flush=True)
+            continue
+        counts[outcome] += 1
         print(f"  extract {i}/{len(ids)} {r.status}: {r.title[:60]}", flush=True)
     return result
 
@@ -219,13 +231,18 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
     ids = chunkable_resource_ids(session, course_id, source)
     for i, rid in enumerate(ids, 1):
         r = session.get(Resource, rid)
+        seen_hash = r.content_hash
         has_chunks = session.exec(
             select(func.count()).select_from(Chunk).where(Chunk.resource_id == r.id)
         ).one()
         if has_chunks and r.status == "extracted":
             counts["cached"] += 1
             continue
-        shared = copy_chunks(session, r)
+        try:
+            shared = copy_chunks(session, r)
+        except ContentChanged:
+            counts["changed"] += 1
+            continue
         if shared:
             if r.attempts or r.retry_after:
                 _succeeded(r)
@@ -246,9 +263,18 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
                   flush=True)
             result.quota_exhausted = True
             break
+        except ContentChanged:
+            # a sync replaced the text mid-call: chunks of the old one dropped,
+            # the new content is chunked once extracted
+            counts["changed"] += 1
+            print(f"  chunk {i}/{len(ids)} changed meanwhile, dropped", flush=True)
+            continue
         except Exception as e:
             session.rollback()
             r = session.get(Resource, rid)
+            if r is None or r.content_hash != seen_hash:
+                counts["changed"] += 1  # failure was on content since replaced
+                continue
             _defer(r, f"{type(e).__name__}: {e}")
             if r.attempts >= MAX_CHUNK_ATTEMPTS:
                 r.status = "failed"  # existing chunks, if any, are kept
@@ -319,6 +345,35 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
     return result
 
 
+def _lock_key(source: str) -> int:
+    digest = hashlib.sha256(f"app.pipeline:{source}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)  # a Postgres bigint
+
+
+@contextmanager
+def single_run(source: str, bind=None):
+    """Yield whether this process holds the run for `source`: two runs over
+    the same resources (overlapping cron, a backfill by hand) would both chunk
+    and quiz them, duplicating chunks. A session-level Postgres advisory lock,
+    so it goes away with the process even if it dies; SQLite has no
+    concurrent runs to guard against and always gets it.
+    """
+    bind = bind or engine
+    if bind.dialect.name != "postgresql":
+        yield True
+        return
+    with bind.connect() as conn:
+        key = _lock_key(source)
+        got = conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar()
+        conn.commit()
+        try:
+            yield got
+        finally:
+            if got:  # pooled connections outlive this: release explicitly
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                conn.commit()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["moodle", "classroom"], default="moodle")
@@ -345,7 +400,10 @@ def main() -> None:
             settings.llm_base_url, settings.llm_api_key, settings.llm_quiz_model
         )
 
-    with Session(engine) as session:
+    with single_run(args.source) as got, Session(engine) as session:
+        if not got:
+            print(f"another {args.source} pipeline run is in progress; exiting")
+            return
         course_ids = [None]
         if args.course:
             # every user enrolled in the course has their own copy of it

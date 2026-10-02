@@ -53,8 +53,9 @@ def copy_extraction(session: Session, r: Resource) -> bool:
 
 def copy_chunks(session: Session, r: Resource) -> int:
     """Copy a chunked donor's chunks onto r, replacing what r has; returns the
-    number copied (0 = no donor, nothing touched). Commits."""
-    from app.sync import _purge_derived
+    number copied (0 = no donor, nothing touched). Commits; raises
+    ContentChanged (nothing kept) if a sync replaced r's content meanwhile."""
+    from app.sync import ContentChanged, _purge_derived, commit_if_current
 
     if r.content_hash is None or not (r.extracted_text or "").strip():
         return 0
@@ -72,10 +73,12 @@ def copy_chunks(session: Session, r: Resource) -> int:
     for c in chunks:
         session.add(Chunk(resource_id=r.id, title=c.title, content=c.content,
                           order=c.order, start_char=c.start_char, end_char=c.end_char))
+    seen_hash = r.content_hash
     r.status = "extracted"
     r.error = None
     session.add(r)
-    session.commit()
+    if not commit_if_current(session, r.id, seen_hash):
+        raise ContentChanged(r.id)
     return len(chunks)
 
 

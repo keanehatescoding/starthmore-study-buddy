@@ -128,9 +128,11 @@ def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> 
     Returns 0 without touching anything when cached, or when the text is long
     enough to need an LLM and none was given (extract-only runs must not mark
     resources failed or drop their existing chunks). LLM errors and an empty
-    result (ChunkingError) raise before any existing chunk is touched.
+    result (ChunkingError) raise before any existing chunk is touched, and
+    ContentChanged rolls everything back when a sync replaced the content
+    meanwhile (the chunks would be of the old text).
     """
-    from app.models import Resource  # noqa: F401 (type hint only)
+    from app.sync import ContentChanged, _purge_derived, commit_if_current
 
     existing = session.exec(
         select(Chunk).where(Chunk.resource_id == resource.id)
@@ -141,6 +143,7 @@ def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> 
         return 0  # leave as-is for a run that has an LLM
 
     text = resource.extracted_text or ""
+    seen_hash = resource.content_hash  # loaded with the text: what it is of
     if not text.strip():
         items = []
     elif needs_llm(resource):
@@ -149,8 +152,10 @@ def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> 
             raise ChunkingError("chunker produced no chunks")
     else:
         items = [{"title": text.strip()[:80], "content": text}]
-    for c in existing:  # content changed -> regenerate, don't version
-        session.delete(c)
+    # content changed -> regenerate, don't version; explicit purge so quiz
+    # items and reviews of the old chunks go too on SQLite (no FK cascade)
+    if existing:
+        _purge_derived(session, resource.id)
     for order, item in enumerate(items):
         start, end = locate(item["content"], text)
         session.add(
@@ -163,5 +168,7 @@ def chunk_resource(session: Session, resource, llm: LLMClient | None = None) -> 
     resource.status = "extracted" if items else "skipped"
     resource.error = None if items else "no text to chunk"
     session.add(resource)
-    session.commit()  # old chunks out, new ones in: one transaction
+    # old chunks out, new ones in: one transaction, kept only if still current
+    if not commit_if_current(session, resource.id, seen_hash):
+        raise ContentChanged(resource.id)
     return len(items)
