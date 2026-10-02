@@ -747,10 +747,15 @@ async def set_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
+    from app.notify import opt_out
+
     form = await checked_form(request)
-    user.notify_email = form.get("notify_email") == "on"
-    session.add(user)
-    session.commit()
+    if form.get("notify_email") == "on":
+        user.notify_email = True
+        session.add(user)
+        session.commit()
+    else:
+        opt_out(session, user)
     _flash(request, "success", "Email notifications turned "
            + ("on." if user.notify_email else "off."))
     return RedirectResponse("/settings/moodle", status_code=303)
@@ -778,11 +783,10 @@ def unsubscribe_page(request: Request, token: str, session: Session = Depends(ge
 def unsubscribe(request: Request, token: str, session: Session = Depends(get_session)):
     """One-click unsubscribe (RFC 8058): the signed token is the credential,
     so no session or CSRF token; mail clients POST here directly."""
+    from app.notify import opt_out
+
     user = _unsubscribe_target(session, token)
-    if user.notify_email:
-        user.notify_email = False
-        session.add(user)
-        session.commit()
+    opt_out(session, user)  # also when already off: fails anything still queued
     return templates.TemplateResponse(
         request, "unsubscribe.html", {"done": True, "email": user.email, "token": token})
 

@@ -683,3 +683,56 @@ def test_unsubscribe_link(testapp):
     assert client.post(url).status_code == 200  # idempotent
     assert client.get("/unsubscribe/forged").status_code == 404
     assert client.post("/unsubscribe/forged").status_code == 404
+
+
+def test_stale_review_due_fails_at_delivery(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    user, _ = _course_with_items(session, n_chunks=3)
+    event = notify.check_review_due(session, user.id, threshold=3)
+    # delivery delayed past the window: the user went inactive meanwhile
+    old = datetime.now(timezone.utc) - notify.REVIEW_DUE_ACTIVE_WINDOW - timedelta(days=1)
+    _set(session, user, created_at=old)
+    out = notify.send_pending(session, "key", "from@x")
+    assert out == {"sent": 0, "failed": 1, "errors": {"inactive": 1}}
+    assert calls == [] and event.failed_reason == "inactive"
+
+
+def test_opt_out_fails_queued_events(session, monkeypatch):
+    calls = _fake_batches(monkeypatch)
+    user, course = _course_with_items(session, n_chunks=3)
+    notify.enqueue_new_material(session, course.id, 3)
+    notify.opt_out(session, user)
+    # back on before the worker runs: what was queued while off stays unsent
+    _set(session, user, notify_email=True)
+    assert notify.send_pending(session, "key", "from@x")["sent"] == 0
+    assert calls == []
+    assert session.exec(select(NotificationEvent)).one().failed_reason == "opted_out"
+
+
+def _queue_event(testapp):
+    with testapp["Session"]() as s:
+        s.add(NotificationEvent(user_id=testapp["user_id"], type="review_due",
+                                payload={"due_count": 3}))
+        s.commit()
+
+
+def _failed_reasons(testapp):
+    with testapp["Session"]() as s:
+        return [e.failed_reason for e in s.exec(select(NotificationEvent))]
+
+
+def test_settings_off_then_on_drops_queued_events(testapp):
+    client = testapp["client"]
+    _queue_event(testapp)
+    token = re.search(r'name="csrf_token" value="([^"]+)"',
+                      client.get("/settings/moodle").text).group(1)
+    client.post("/settings/notifications", data={"csrf_token": token})
+    client.post("/settings/notifications", data={"csrf_token": token, "notify_email": "on"})
+    assert _notify_email(testapp) and _failed_reasons(testapp) == ["opted_out"]
+
+
+def test_unsubscribe_fails_queued_events(testapp):
+    _queue_event(testapp)
+    url = f"/unsubscribe/{notify.unsubscribe_token(testapp['user_id'])}"
+    assert TestClient(app).post(url).status_code == 200
+    assert _failed_reasons(testapp) == ["opted_out"]

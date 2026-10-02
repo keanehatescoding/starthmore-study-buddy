@@ -12,8 +12,8 @@
   isn't nagged forever.
 - Opt-out: users.notify_email (settings page, or the signed one-click
   unsubscribe link every email carries, with List-Unsubscribe headers).
-  Events that can never be delivered (opted out, no recipient, unknown type)
-  get failed_reason and leave the queue.
+  Events that can never be delivered (opted out, gone inactive, no
+  recipient, unknown type) get failed_reason and leave the queue.
 - Delivery: Resend batch REST API (stdlib only, free tier), up to 100 emails
   per request, backing off on 429. No key -> events stay queued; nothing is
   fake-marked sent.
@@ -267,13 +267,39 @@ def recipient_for(session: Session, event: NotificationEvent, fallback: str = ""
     return fallback
 
 
-def _opted_out(session: Session, event: NotificationEvent) -> bool:
+def opt_out(session: Session, user: User) -> None:
+    """Turn email off and fail the user's queued events, so turning it back
+    on before the next pass doesn't send what was queued while it was off."""
+    user.notify_email = False
+    session.add(user)
+    for event in session.exec(
+        select(NotificationEvent).where(
+            NotificationEvent.user_id == user.id,
+            NotificationEvent.sent == False,  # noqa: E712
+            NotificationEvent.failed_reason == None,  # noqa: E711
+        )
+    ):
+        event.failed_reason = "opted_out"
+        session.add(event)
+    session.commit()
+
+
+def _undeliverable(session: Session, event: NotificationEvent) -> str | None:
+    """Why the owner shouldn't get this event any more, else None."""
     user = session.get(User, event.user_id) if event.user_id is not None else None
-    return user is not None and not user.notify_email
+    if user is None:
+        return None  # recipient_for decides (fallback address)
+    if not user.notify_email:
+        return "opted_out"
+    # a reminder queued long enough (outage, no API key) for its user to
+    # go inactive is as stale as one check_review_due would now skip
+    if event.type == "review_due" and not _recently_active(session, user):
+        return "inactive"
+    return None
 
 
 # Reasons that will never change on retry: the event is marked failed, not requeued.
-PERMANENT_FAILURES = {"no_recipient", "unknown_event_type", "opted_out"}
+PERMANENT_FAILURES = {"no_recipient", "unknown_event_type", "opted_out", "inactive"}
 
 
 # Resend rejected the batch before sending anything: safe to split and resend.
@@ -328,8 +354,8 @@ def send_pending(
     for event in events:
         to_addr = recipient_for(session, event, fallback_to)
         try:
-            if _opted_out(session, event):
-                raise EmailError("recipient opted out", "opted_out")
+            if reason := _undeliverable(session, event):
+                raise EmailError(f"not sending: {reason}", reason)
             if not to_addr:
                 raise EmailError("no recipient", "no_recipient")
             subject, body = render(event, base_url)
