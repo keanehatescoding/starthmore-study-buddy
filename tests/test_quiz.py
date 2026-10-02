@@ -155,11 +155,15 @@ def test_mcq_options_are_shuffled_with_the_answer(setup):
 
 def test_shuffle_tracks_the_slot_not_the_text(setup):
     s, chunk = setup
-    item = dict(GOOD[1], options=["same", "same", "right", "same"], correct_answer=2)
+    # The answer's text is duplicated, so only the seeded permutation pins its slot;
+    # a text lookup would land on the first "same" and miss most of these.
+    item = dict(GOOD[1], options=["same", "same", "same", "right"], correct_answer=2)
+    expected_slots = {1: 2, 2: 1, 3: 2, 4: 0, 5: 3, 6: 1, 7: 3, 8: 1}
     for attempt in range(1, 9):
         row, = generate_for_chunk(s, chunk, FakeLLM([item]), attempt=attempt,
                                   rng=random.Random(attempt))
-        assert row.options[int(row.correct_answer)] == "right"
+        assert row.options[int(row.correct_answer)] == "same"
+        assert int(row.correct_answer) == expected_slots[attempt]
 
 
 def test_short_answer_is_not_shuffled(setup):
