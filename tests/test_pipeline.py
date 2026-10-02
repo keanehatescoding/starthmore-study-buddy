@@ -715,3 +715,86 @@ def test_single_run_excludes_a_second_run_of_the_same_source():
             assert other  # sources touch disjoint resources
     with single_run("moodle", b) as again:
         assert again  # released on exit
+
+
+@pytest.mark.parametrize("flag, stages, needs_llm", [
+    (None, ("extraction", "chunking", "quiz"), True),
+    ("--extract-only", ("extraction",), False),
+    ("--chunk-only", ("chunking",), True),
+    ("--quiz-only", ("quiz",), True),
+])
+def test_main_runs_the_stages_its_flags_pick(session, monkeypatch, flag, stages, needs_llm):
+    import app.pipeline as pipeline
+
+    ran: list = []
+    monkeypatch.setattr(pipeline, "engine", session.get_bind())
+    monkeypatch.setattr(pipeline, "llm_clients", lambda: ("chunk", "quiz"))
+    monkeypatch.setattr(pipeline, "run_course",
+                        lambda s, source, cid, c, q, pace, stages: ran.append((c, q, stages)))
+    monkeypatch.setattr("sys.argv", ["pipeline", "--source", "moodle", *([flag] if flag else [])])
+    pipeline.main()
+    llms = ("chunk", "quiz") if needs_llm else (None, None)
+    assert [(c, q, tuple(st)) for c, q, st in ran] == [(*llms, stages)]
+
+
+@pytest.mark.parametrize("job_running", [True, False])
+def test_main_waits_only_behind_a_pipeline_job(session, monkeypatch, capsys, job_running):
+    from contextlib import contextmanager
+
+    import app.pipeline as pipeline
+    from app.jobs import enqueue
+
+    if job_running:
+        job = enqueue(session, "pipeline", {"source": "moodle", "user_email": "s@x.edu"})
+        job.status = "running"
+        session.add(job)
+        session.commit()
+    calls, ran = [], []
+
+    @contextmanager
+    def single_run(source, bind=None, wait=False):
+        calls.append(wait)
+        yield wait  # the try fails; a blocking wait gets the lock
+
+    monkeypatch.setattr(pipeline, "engine", session.get_bind())
+    monkeypatch.setattr(pipeline, "single_run", single_run)
+    monkeypatch.setattr(pipeline, "run_course", lambda *a, **kw: ran.append(1))
+    monkeypatch.setattr("sys.argv", ["pipeline", "--source", "moodle", "--extract-only"])
+    pipeline.main()
+    if job_running:
+        assert calls == [False, True] and ran == [1]
+        assert "waiting for it" in capsys.readouterr().out
+    else:
+        assert calls == [False] and ran == []
+        assert "in progress; exiting" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="advisory locks need Postgres")
+def test_single_run_wait_blocks_until_the_holder_releases():
+    import threading
+
+    a, b = make_engine(), make_engine()
+    held, release, got = threading.Event(), threading.Event(), []
+
+    def holder():
+        with single_run("moodle", a) as first:
+            assert first
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    held.wait(5)
+
+    def waiter():
+        with single_run("moodle", b, wait=True) as second:
+            got.append(second)
+
+    w = threading.Thread(target=waiter)
+    w.start()
+    w.join(0.5)
+    assert got == []  # still blocked
+    release.set()
+    w.join(5)
+    t.join(5)
+    assert got == [True]

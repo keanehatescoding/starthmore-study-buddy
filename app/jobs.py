@@ -18,8 +18,12 @@ instead of blocking the CLI caller.
 - A worker told to stop (SIGTERM on redeploy) raises Shutdown into the
   running handler; the job goes straight back to pending with its attempt
   refunded, instead of waiting out the lease and burning a retry.
+- A handler that can't run yet raises Defer: the job goes back to pending
+  for a while with its attempt refunded.
 - prune_finished() deletes completed/failed jobs past their retention.
-- Job types: "sync" (Moodle/Classroom course sync), "send_notifications".
+- Job types: "sync" (Moodle/Classroom course sync), "pipeline" (extract,
+  chunk and quiz one user's courses after their first sync, so they needn't
+  wait for the daily pipeline cron), "send_notifications".
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from sqlalchemy import and_, delete, exists, or_, update
 from sqlalchemy.orm import aliased
 from sqlmodel import Session, select
 
-from app.models import Job, User
+from app.models import Chunk, Course, Job, Resource, Topic, User
 
 HANDLERS: dict[str, callable] = {}
 
@@ -39,6 +43,19 @@ HANDLERS: dict[str, callable] = {}
 # RUNNING_TIMEOUT is presumed orphaned. Handler runtime itself is unbounded.
 HEARTBEAT_EVERY = timedelta(minutes=1)
 RUNNING_TIMEOUT = timedelta(minutes=10)
+
+
+# A pipeline job that finds another run of its source going waits this long.
+PIPELINE_BUSY_RETRY = timedelta(minutes=30)
+
+
+class Defer(Exception):
+    """Raised by a handler that can't run yet (e.g. a lock is taken): the
+    job is retried after `delay` without spending an attempt."""
+
+    def __init__(self, delay: timedelta, reason: str):
+        super().__init__(reason)
+        self.delay = delay
 
 
 class Shutdown(BaseException):
@@ -72,18 +89,47 @@ def enqueue(
     return job
 
 
-def enqueue_sync_once(session: Session, source: str, user_email: str) -> Job | None:
-    """Queue a full sync of `source` for the user unless one is already
-    pending or running for them. Returns the new job, or None."""
+def _enqueue_once(session: Session, job_type: str, source: str, user_email: str,
+                  payload: dict) -> Job | None:
+    """Queue `job_type` unless one is already pending or running for this
+    source and user. Returns the new job, or None."""
     active = session.exec(
-        select(Job).where(Job.type == "sync", Job.status.in_(("pending", "running")))
+        select(Job).where(Job.type == job_type, Job.status.in_(("pending", "running")))
     ).all()
     if any(j.payload.get("source") == source and j.payload.get("user_email") == user_email
            for j in active):
         return None
-    return enqueue(session, "sync", {
-        "source": source, "course_id": None, "user_email": user_email,
-    })
+    return enqueue(session, job_type, {"source": source, "user_email": user_email, **payload})
+
+
+def enqueue_sync_once(session: Session, source: str, user_email: str) -> Job | None:
+    """Queue a full sync of `source` for the user unless one is already
+    pending or running for them. Returns the new job, or None."""
+    return _enqueue_once(session, "sync", source, user_email, {"course_id": None})
+
+
+def has_chunks(session: Session, user_id, source: str) -> bool:
+    """Whether any of the user's `source` courses has been chunked yet."""
+    return session.exec(
+        select(Chunk.id)
+        .join(Resource, Resource.id == Chunk.resource_id)
+        .join(Topic, Topic.id == Resource.topic_id)
+        .join(Course, Course.id == Topic.course_id)
+        .where(Course.user_id == user_id, Course.source == source)
+        .limit(1)
+    ).first() is not None
+
+
+def enqueue_first_pipeline(session: Session, source: str, user: User) -> Job | None:
+    """After a sync: queue a pipeline run over the user's `source` courses
+    if none of them has been chunked yet (a new user, or one whose earlier
+    run found nothing), so their first quizzes don't wait for the daily
+    cron. None when it isn't needed, already queued, or LLM_* is unset."""
+    from app.config import settings
+
+    if not settings.llm_api_key or has_chunks(session, user.id, source):
+        return None
+    return _enqueue_once(session, "pipeline", source, user.email, {})
 
 
 def _utcnow() -> datetime:
@@ -241,6 +287,11 @@ def run_due(session: Session, limit: int = 5) -> dict:
             _finish(session, job_id, claim, status="pending", attempts=claim - 1,
                     available_at=_utcnow(), error="interrupted by worker shutdown")
             raise
+        except Defer as e:
+            session.rollback()
+            outcome = "deferred"
+            values = {"status": "pending", "attempts": claim - 1, "error": str(e)[:2000],
+                      "available_at": _utcnow() + e.delay}
         except Exception as e:  # noqa: BLE001 — recorded on the row, never dropped
             session.rollback()  # a DB error inside the handler poisons the txn
             values = {"error": f"{type(e).__name__}: {e}"[:2000]}
@@ -252,7 +303,7 @@ def run_due(session: Session, limit: int = 5) -> dict:
                 values["status"] = "pending"  # retry with backoff
                 values["available_at"] = _utcnow() + timedelta(seconds=60 * claim)
         if _finish(session, job_id, claim, **values):
-            summary[outcome] += 1
+            summary[outcome] = summary.get(outcome, 0) + 1
         else:  # lease lapsed and the job was reaped; its new owner reports
             summary["lost"] = summary.get("lost", 0) + 1
     return summary
@@ -278,7 +329,43 @@ def run_sync_job(session: Session, payload: dict) -> dict:
         # nothing synced: fail the job so it retries; a partial sync
         # completes with each failed course's error in the result
         raise RuntimeError(f"every course failed, e.g. {results[failed[0]].error}")
+    enqueue_first_pipeline(session, payload["source"], user)
     return {course_id: stats.as_dict() for course_id, stats in results.items()}
+
+
+@handler("pipeline")
+def run_pipeline_job(session: Session, payload: dict) -> dict:
+    """payload: {source, user_email}. Extract, chunk and quiz the user's
+    `source` courses, paced by LLM_PACE. Waits (Defer) while another run of
+    the source, e.g. the pipeline cron, holds its lock. Quota running out
+    ends the job early; the next cron run resumes where it stopped."""
+    from app.auth import find_user
+    from app.config import settings
+    from app.pipeline import llm_clients, run_course, single_run
+
+    user = find_user(session, payload["user_email"])
+    if user is None:
+        raise ValueError(f"no such user {payload['user_email']}")
+    source = payload["source"]
+    course_ids = session.exec(
+        select(Course.id).where(Course.user_id == user.id, Course.source == source)
+        .order_by(Course.id)
+    ).all()
+    chunk_llm, quiz_llm = llm_clients()
+    out: dict = {}
+    with single_run(source, session.get_bind()) as got:
+        if not got:
+            raise Defer(PIPELINE_BUSY_RETRY, f"another {source} pipeline run is in progress")
+        for course_id in course_ids:
+            stages = run_course(session, source, course_id, chunk_llm, quiz_llm,
+                                pace=settings.llm_pace)
+            out[str(course_id)] = {
+                name: {**r.counts, **({"quota_exhausted": True} if r.quota_exhausted else {})}
+                for name, r in stages.items()
+            }
+            if any(r.quota_exhausted for r in stages.values()):
+                break  # the remaining courses would only hit the same wall
+    return out
 
 
 @handler("send_notifications")

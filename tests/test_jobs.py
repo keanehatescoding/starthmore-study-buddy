@@ -12,7 +12,7 @@ from sqlmodel import Session, SQLModel, select
 from app import jobs, worker
 from app.jobs import HANDLERS, RUNNING_TIMEOUT, Shutdown, enqueue, prune_finished, run_due
 from app.models import Job
-from tests.dbutil import make_engine
+from tests.dbutil import TEST_DATABASE_URL, make_engine
 
 
 @pytest.fixture(autouse=True)
@@ -438,3 +438,112 @@ def test_main_exits_cleanly_when_a_job_is_interrupted(monkeypatch):
 
     monkeypatch.setattr(worker, "run_once", run_once)
     _main(monkeypatch, "--loop", "60")  # no exception escapes
+
+
+def test_deferred_job_waits_with_attempt_refunded(session, monkeypatch):
+    def busy(s, payload):
+        raise jobs.Defer(timedelta(minutes=30), "lock taken")
+
+    monkeypatch.setitem(HANDLERS, "busy", busy)
+    job = enqueue(session, "busy", {})
+    assert run_due(session) == {"completed": 0, "failed": 0, "retried": 0, "deferred": 1}
+    row = session.get(Job, job.id)
+    session.refresh(row)
+    assert row.status == "pending" and row.attempts == 0 and row.error == "lock taken"
+    assert row.available_at.replace(tzinfo=timezone.utc) > (
+        datetime.now(timezone.utc) + timedelta(minutes=29))
+    # not due yet
+    assert run_due(session) == {"completed": 0, "failed": 0, "retried": 0}
+
+
+def test_worker_pass_ends_with_a_deferred_job(worker_engine, monkeypatch):
+    def busy(s, payload):
+        raise jobs.Defer(timedelta(minutes=30), "lock taken")
+
+    monkeypatch.setitem(HANDLERS, "busy", busy)
+    monkeypatch.setitem(HANDLERS, "send_notifications", lambda s, p: None)
+    with Session(worker_engine) as s:
+        enqueue(s, "busy", {})
+    out = worker.run_once()
+    assert out["deferred"] == 1 and out["completed"] == 1  # the notify pass
+
+
+@pytest.fixture()
+def pipeline_user(session):
+    from app.models import Course, User
+
+    user, other = User(email="s@x.edu"), User(email="o@x.edu")
+    session.add_all([user, other])
+    session.commit()
+    mine = [Course(source="moodle", source_id=f"c{i}", name="C", user_id=user.id)
+            for i in range(2)]
+    session.add_all([*mine,
+                     Course(source="classroom", source_id="g", name="G", user_id=user.id),
+                     Course(source="moodle", source_id="c0", name="C", user_id=other.id)])
+    session.commit()
+    return sorted(c.id for c in mine)
+
+
+def _fake_pipeline(monkeypatch, quota_on=None, got=True):
+    from contextlib import contextmanager
+
+    import app.pipeline as pipeline
+    from app.pipeline import StageResult
+
+    ran: list = []
+
+    def run_course(s, source, course_id, chunk_llm, quiz_llm, pace=0.0):
+        ran.append((source, course_id))
+        r = StageResult()
+        r.counts["chunks"] = 2
+        r.quota_exhausted = course_id == quota_on
+        return {"chunking": r}
+
+    @contextmanager
+    def single_run(source, bind=None):
+        yield got
+
+    monkeypatch.setattr(pipeline, "run_course", run_course)
+    monkeypatch.setattr(pipeline, "single_run", single_run)
+    monkeypatch.setattr(pipeline, "llm_clients", lambda: (None, None))
+    return ran
+
+
+def test_pipeline_job_runs_only_the_users_courses_of_its_source(
+        session, pipeline_user, monkeypatch):
+    ran = _fake_pipeline(monkeypatch)
+    out = jobs.run_pipeline_job(session, {"source": "moodle", "user_email": "s@x.edu"})
+    assert ran == [("moodle", cid) for cid in pipeline_user]
+    assert out == {str(cid): {"chunking": {"chunks": 2}} for cid in pipeline_user}
+
+
+def test_pipeline_job_stops_when_the_quota_runs_out(session, pipeline_user, monkeypatch):
+    ran = _fake_pipeline(monkeypatch, quota_on=pipeline_user[0])
+    out = jobs.run_pipeline_job(session, {"source": "moodle", "user_email": "s@x.edu"})
+    assert ran == [("moodle", pipeline_user[0])]
+    assert out[str(pipeline_user[0])]["chunking"]["quota_exhausted"] is True
+
+
+def test_pipeline_job_defers_while_another_run_holds_the_lock(
+        session, pipeline_user, monkeypatch):
+    ran = _fake_pipeline(monkeypatch, got=False)
+    job = enqueue(session, "pipeline", {"source": "moodle", "user_email": "s@x.edu"})
+    assert run_due(session)["deferred"] == 1
+    assert ran == []
+    row = session.get(Job, job.id)
+    session.refresh(row)
+    assert row.status == "pending" and "in progress" in row.error
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="advisory locks need Postgres")
+def test_pipeline_job_defers_behind_a_real_pipeline_lock(session, pipeline_user, monkeypatch):
+    import app.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "llm_clients", lambda: (None, None))
+    monkeypatch.setattr(pipeline, "run_course", lambda *a, **kw: {})
+    job = enqueue(session, "pipeline", {"source": "moodle", "user_email": "s@x.edu"})
+    with pipeline.single_run("moodle", make_engine()) as cron:  # e.g. the 06:00 run
+        assert cron
+        assert run_due(session)["deferred"] == 1
+    _set(session, session.get(Job, job.id), available_at=datetime.now(timezone.utc))
+    assert run_due(session)["completed"] == 1  # lock released: it runs

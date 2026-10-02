@@ -21,7 +21,11 @@
    | `pipeline-cron` | step 6 | `0 6 * * *` |
 
    The worker drains the job queue hourly: queued syncs (sign-in, the Sync
-   button) and the notification pass. Every service starts with `alembic
+   button), the notification pass, and a first pipeline run for each new
+   user (see below). The worker needs `LLM_*` for that run, including
+   `LLM_PACE` (e.g. `45` on the free Gemini tier, matching `pipeline-cron`'s
+   `--pace`); without `LLM_API_KEY` no such run is queued and new users wait
+   for `pipeline-cron`. Every service starts with `alembic
    upgrade head`: services deploy independently, and one running new code
    against an old schema fails (e.g. `column ... does not exist`) until
    web happens to redeploy. It is a no-op at head, and concurrent runs
@@ -83,10 +87,17 @@ Pipeline (daily 09:00, after the sync; paced LLM runs take hours):
 0 9 * * * cd /srv/study-buddy && .venv/bin/python -m app.pipeline --source moodle --pace 45 && .venv/bin/python -m app.pipeline --source classroom --pace 45
 ```
 
-The pipeline is not a queue job: it runs from cron (or by hand for a
-backfill), never inside the worker. Only one run per source goes at a
-time (a Postgres advisory lock): a run that starts while the previous one is
-still going prints "another … pipeline run is in progress" and exits 0. Work
+The pipeline runs from cron (or by hand for a backfill). The one exception
+is a user's first sync: when none of their courses for that source has been
+chunked yet, the sync job queues a `pipeline` job scoped to their courses
+(paced by `LLM_PACE`), so their first quizzes come within the hour rather
+than the next morning. It runs in the worker, which handles nothing else
+until it finishes; on shared course material it mostly copies another
+user's results. Only one run per source goes at a time (a Postgres advisory
+lock): a cron run that starts while the previous one is still going prints
+"another … pipeline run is in progress" and exits 0; one that finds a
+`pipeline` job running waits for it instead; and a `pipeline` job that
+finds the lock taken goes back to the queue for 30 minutes. Work
 on a resource whose content a sync replaced mid-run is dropped (`changed=` in
 the tallies) and redone from the new content.
 The quiz/chunk runners abort early with `quota_exhausted` when the LLM
