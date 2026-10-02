@@ -395,10 +395,32 @@ def _owned_resource(session: Session, user: User, resource_id: UUID):
     return resource, topic, course
 
 
+# Text shown on each side of a highlighted source passage
+SOURCE_CONTEXT_CHARS = 400
+
+
+def source_passage(text: str | None, chunk: Chunk) -> dict:
+    """The chunk's span in the resource text with some context around it, or
+    the chunk's own content when its offsets are missing or out of range."""
+    start, end = chunk.start_char, chunk.end_char
+    if (not text or start is None or end is None
+            or not 0 <= start < end <= len(text)):
+        return {"before": "", "passage": chunk.content, "after": "", "located": False}
+    lo = max(0, start - SOURCE_CONTEXT_CHARS)
+    hi = min(len(text), end + SOURCE_CONTEXT_CHARS)
+    return {
+        "before": ("…" if lo else "") + text[lo:start],
+        "passage": text[start:end],
+        "after": text[end:hi] + ("…" if hi < len(text) else ""),
+        "located": True,
+    }
+
+
 @app.get("/resources/{resource_id}", response_class=HTMLResponse)
 def resource_detail(
     resource_id: UUID,
     request: Request,
+    chunk: UUID | None = None,
     session: Session = Depends(get_session),
     user: User = Depends(current_user),
 ):
@@ -406,6 +428,8 @@ def resource_detail(
     chunks = session.exec(
         select(Chunk).where(Chunk.resource_id == resource.id).order_by(Chunk.order)
     ).all()
+    # ?chunk= from a question's "source" link; a stale or foreign id is ignored
+    source = next((c for c in chunks if c.id == chunk), None)
     return templates.TemplateResponse(
         request,
         "resource.html",
@@ -414,6 +438,8 @@ def resource_detail(
             "topic": topic,
             "course": course,
             "chunks": chunks,
+            "source": source,
+            "passage": source_passage(resource.extracted_text, source) if source else None,
             "preview_chars": RESOURCE_PREVIEW_CHARS,
             "user": user,
             "active_page": "courses",
@@ -567,6 +593,12 @@ def review_result(
     if item.question_type == "mcq":
         result["chosen"] = mcq_index(state.last_answer, item)
         result["correct_index"] = correct_mcq_index(item)
+    # where the question came from: shown only after answering, as the
+    # passage gives the answer away
+    chunk = session.get(Chunk, item.chunk_id)
+    resource = session.get(Resource, chunk.resource_id) if chunk else None
+    if resource is not None:
+        result["source"] = {"resource": resource, "chunk": chunk}
     return _take_page(request, session, user, item, result=result)
 
 
