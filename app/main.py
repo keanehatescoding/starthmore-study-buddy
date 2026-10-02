@@ -27,8 +27,10 @@ from app.grade import (
     MAX_ANSWER_CHARS,
     InvalidAnswer,
     NotDue,
+    correct_mcq_index,
     due_count,
     due_items,
+    mcq_index,
     submit_answer,
     user_owns_item,
 )
@@ -560,7 +562,11 @@ def review_result(
         "verdict": state.last_result,
         "feedback": state.last_feedback or "",
         "interval_days": state.interval_days,
+        "answer": state.last_answer,  # NULL on rows answered before 0017
     }
+    if item.question_type == "mcq":
+        result["chosen"] = mcq_index(state.last_answer, item)
+        result["correct_index"] = correct_mcq_index(item)
     return _take_page(request, session, user, item, result=result)
 
 

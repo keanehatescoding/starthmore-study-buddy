@@ -111,12 +111,21 @@ def _stored_mcq_index(value, n_options: int) -> int | None:
     return _mcq_index(str(int(number)), n_options) if number.is_integer() else None
 
 
+def mcq_index(value, item: QuizItem) -> int | None:
+    """A submitted answer as an index into the item's options, or None."""
+    return _mcq_index(value, len(item.options or []))
+
+
+def correct_mcq_index(item: QuizItem) -> int | None:
+    """The item's correct option, or None when the stored key is unusable."""
+    return _stored_mcq_index(item.correct_answer, len(item.options or []))
+
+
 def grade_mcq(item: QuizItem, answer: str) -> float:
-    n = len(item.options or [])
-    chosen = _mcq_index(answer, n)
+    chosen = mcq_index(answer, item)
     if chosen is None:
         raise InvalidAnswer("Pick one of the listed options.")
-    return 1.0 if chosen == _stored_mcq_index(item.correct_answer, n) else 0.0
+    return 1.0 if chosen == correct_mcq_index(item) else 0.0
 
 
 def _is_due(state: ReviewState | None, now: datetime) -> bool:
@@ -212,6 +221,7 @@ def submit_answer(
     state.ease_factor = ease
     state.last_result = verdict(partial)
     state.last_feedback = feedback
+    state.last_answer = answer
     if quality < 3:
         state.lapses += 1
     state.next_review_date = next_review_date(interval, now, user_zone(session, user_id))

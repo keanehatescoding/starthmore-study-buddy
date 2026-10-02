@@ -1091,6 +1091,98 @@ pre.text {
   color: #ffffff;
 }
 
+/* Result page: the options with the key and the user's pick marked */
+.reveal-options {
+  list-style: none;
+  padding: 0;
+}
+
+.reveal-option {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.95rem 1.2rem;
+  background: var(--surface-hover);
+  border: 2px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: 1rem;
+  font-weight: 500;
+  color: var(--text-main);
+}
+
+.reveal-option.is-key {
+  background: var(--success-bg);
+  border-color: var(--success);
+  font-weight: 600;
+}
+
+.reveal-option.is-key .option-badge {
+  background: var(--success);
+  color: #ffffff;
+}
+
+.reveal-option.is-wrong-pick {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+.reveal-option.is-wrong-pick .option-badge {
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.reveal-tag {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.reveal-option.is-key .reveal-tag {
+  color: var(--success);
+}
+
+.reveal-option.is-wrong-pick .reveal-tag {
+  color: var(--danger);
+}
+
+.reveal-answers {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1.75rem;
+}
+
+.reveal-block {
+  padding: 0.95rem 1.2rem;
+  background: var(--surface-hover);
+  border: 2px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.reveal-block.is-key {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+}
+
+.reveal-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  margin: 0 0 0.35rem;
+}
+
+.reveal-text {
+  margin: 0;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Short answer textarea */
 .answer-textarea {
   width: 100%;

@@ -359,3 +359,73 @@ def test_streak_days_are_local_dates():
         now = datetime(2026, 9, 30, 1, 0, tzinfo=nairobi)
         assert compute_stats(s, user.id, tz=nairobi, now=now)["streak_days"] == 2
         assert compute_stats(s, user.id, tz=timezone.utc, now=now)["streak_days"] == 1
+
+
+def _reveal(html):
+    """(classes, tags) per option on the result page."""
+    rows = re.findall(r'<li class="reveal-option([^"]*)">(.*?)</li>', html, re.S)
+    return [(cls.split(), re.findall(r'class="reveal-tag">([^<]+)<', body))
+            for cls, body in rows]
+
+
+def test_result_marks_key_and_wrong_pick(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "2", "csrf_token": _token(client)})
+    assert r.status_code == 200 and "Incorrect" in r.text
+    assert _reveal(r.text) == [
+        ([], []),
+        (["is-key"], ["Correct answer"]),
+        (["is-wrong-pick"], ["Your answer"]),
+        ([], []),
+    ]
+    assert 'name="answer"' not in r.text  # read-only: no radios to re-pick
+
+
+def test_result_correct_pick_is_the_key(testapp):
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "1", "csrf_token": _token(client)})
+    assert _reveal(r.text)[1] == (["is-key"], ["Correct answer", "Your answer"])
+    assert "is-wrong-pick" not in r.text
+
+
+def test_result_before_last_answer_was_stored(testapp):
+    # rows answered before migration 0017 have no last_answer: show the key only
+    client, Session = testapp["client"], testapp["Session"]
+    item_id = _seed(Session)
+    client.post(f"/review/{item_id}/answer", data={"answer": "0", "csrf_token": _token(client)})
+    with Session() as s:
+        state = s.exec(select(ReviewState)).one()
+        state.last_answer = None
+        s.add(state)
+        s.commit()
+    r = client.get(f"/review/{item_id}/result")
+    assert r.status_code == 200
+    assert [cls for cls, _ in _reveal(r.text)] == [[], ["is-key"], [], []]
+    assert "Your answer" not in r.text
+
+
+def test_result_shows_short_answer_and_reference(testapp, monkeypatch):
+    client, Session = testapp["client"], testapp["Session"]
+    _seed(Session)
+    item_id = _short(Session)
+    from app import main
+
+    class Partial:
+        def __init__(self, *a, **kw):
+            pass
+
+        def complete_json(self, *a, **k):
+            return {"correct": False, "partial_credit": 0.5, "feedback": "Half there."}
+
+    monkeypatch.setattr(main, "LLMClient", Partial)
+    r = client.post(f"/review/{item_id}/answer",
+                    data={"answer": "<b>since</b>", "csrf_token": _token(client)})
+    assert r.status_code == 200 and "Half there." in r.text
+    assert re.search(r"Your answer</h3>\s*<p[^>]*>&lt;b&gt;since&lt;/b&gt;</p>", r.text)
+    assert re.search(r"Reference answer</h3>\s*<p[^>]*>because</p>", r.text)
+    with Session() as s:
+        assert s.exec(select(ReviewState)).one().last_answer == "<b>since</b>"

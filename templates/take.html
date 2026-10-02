@@ -35,6 +35,36 @@
     <h1 class="quiz-question">{{ item.question }}</h1>
 
     {% if result %}
+    {% if item.question_type == "mcq" %}
+    <!-- The options again: the key and the user's pick -->
+    <ul class="options-group reveal-options">
+      {% set letters = ["A", "B", "C", "D", "E", "F"] %}
+      {% for o in item.options %}
+      {% set is_key = loop.index0 == result.correct_index %}
+      {% set is_pick = loop.index0 == result.chosen %}
+      <li class="reveal-option{% if is_key %} is-key{% elif is_pick %} is-wrong-pick{% endif %}">
+        <span class="option-badge">{{ letters[loop.index0] if loop.index0 < 6 else loop.index }}</span>
+        <span class="option-text">{{ o }}</span>
+        {% if is_key %}<span class="reveal-tag">Correct answer</span>{% endif %}
+        {% if is_pick %}<span class="reveal-tag">Your answer</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="reveal-answers">
+      {% if result.answer %}
+      <div class="reveal-block">
+        <h3 class="reveal-label">Your answer</h3>
+        <p class="reveal-text">{{ result.answer }}</p>
+      </div>
+      {% endif %}
+      <div class="reveal-block is-key">
+        <h3 class="reveal-label">Reference answer</h3>
+        <p class="reveal-text">{{ item.correct_answer }}</p>
+      </div>
+    </div>
+    {% endif %}
+
     <!-- Result / Evaluation Feedback Panel -->
     <div class="result-panel {% if result.correct %}correct{% elif result.verdict == 'partial' %}partial{% else %}incorrect{% endif %}">
       <h2 class="result-title">
