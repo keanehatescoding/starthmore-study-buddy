@@ -7,6 +7,9 @@ Chunking needs LLM_* in .env; extraction runs without it.
 A resource whose download or chunking fails is deferred with exponential
 backoff (Resource.attempts / retry_after, 1h doubling to 24h) rather than
 retried on every run; chunking gives up ("failed") after MAX_CHUNK_ATTEMPTS.
+
+Each stage first copies another user's results for the same material
+(app.share), counted as "shared", and only then downloads or calls the LLM.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from app.llm import QuotaExhaustedError
 from app.models import Chunk, Course, Resource, Topic, User
 from app.moodle import ForeignURLError, MoodleError
 from app.quiz import chunk_needs_quiz, generate_for_chunk
+from app.share import copy_chunks, copy_extraction, copy_quiz
 
 
 @dataclass
@@ -163,6 +167,13 @@ def run_extraction(session: Session, downloader, course_id=None,
             # owner hasn't connected this source: leave pending, retry once they do
             counts["no_token"] += 1
             continue
+        if copy_extraction(session, r):
+            _succeeded(r)
+            session.add(r)
+            session.commit()
+            counts["shared"] += 1
+            print(f"  extract {i}/{len(ids)} shared: {r.title[:60]}", flush=True)
+            continue
         try:
             r.extracted_text = extract_resource_text(r, dl)
             _succeeded(r)
@@ -213,6 +224,17 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
         ).one()
         if has_chunks and r.status == "extracted":
             counts["cached"] += 1
+            continue
+        shared = copy_chunks(session, r)
+        if shared:
+            if r.attempts or r.retry_after:
+                _succeeded(r)
+                session.add(r)
+                session.commit()
+            counts["chunks"] += shared
+            counts["resources"] += 1
+            counts["shared"] += 1
+            print(f"  chunk {i}/{len(ids)} shared +{shared}: {r.title[:60]}", flush=True)
             continue
         if llm is None and needs_llm(r):
             counts["needs_llm"] += 1  # left untouched for a run with LLM_* set
@@ -265,7 +287,12 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
             continue
         chunk = session.get(Chunk, chunk_id)
         try:
-            items = generate_for_chunk(session, chunk, llm, attempt)
+            items = copy_quiz(session, chunk, attempt)
+            shared = items is not None
+            if shared:
+                counts["shared"] += 1
+            else:
+                items = generate_for_chunk(session, chunk, llm, attempt)
         except QuotaExhaustedError as e:
             print(f"  quota exhausted, stopping run (resumable): {str(e)[:120]}",
                   flush=True)
@@ -284,7 +311,7 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
             course = course_of_chunk(session, chunk)
             if course is not None:
                 per_course[str(course.id)] += len(items)
-        if pace:
+        if pace and not shared:
             time.sleep(pace)
     for cid, n in per_course.items():
         if enqueue_new_material(session, UUID(cid), n) is not None:
