@@ -136,7 +136,8 @@ def test_async_routes_keep_db_work_off_the_event_loop():
                 offenders.append(f"{fn.name}: session.{f.attr}")
             # session passed straight to a helper, not via run_in_threadpool
             is_pool = isinstance(f, ast.Name) and f.id == "run_in_threadpool"
+            passed = [*node.args, *(k.value for k in node.keywords)]
             if not is_pool and any(isinstance(a, ast.Name) and a.id == "session"
-                                   for a in node.args):
+                                   for a in passed):
                 offenders.append(f"{fn.name}: {ast.unparse(f)}(session, ...)")
     assert offenders == []
