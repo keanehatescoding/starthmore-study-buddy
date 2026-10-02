@@ -110,3 +110,33 @@ def test_database_url_pinned_to_psycopg(url, expected, monkeypatch):
     assert normalize_database_url(url) == expected
     monkeypatch.setenv("DATABASE_URL", url)
     assert Settings().database_url == expected
+
+
+def test_async_routes_keep_db_work_off_the_event_loop():
+    """A sync Session call in an async route blocks every request (#29, #57):
+    async routes must hand DB work to run_in_threadpool."""
+    import ast
+    import inspect
+
+    import app.main
+
+    tree = ast.parse(inspect.getsource(app.main))
+    offenders = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        # awaited helpers are async functions, checked on their own
+        awaited = {id(n.value) for n in ast.walk(fn) if isinstance(n, ast.Await)}
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call) or id(node) in awaited:
+                continue
+            f = node.func
+            if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                    and f.value.id == "session"):
+                offenders.append(f"{fn.name}: session.{f.attr}")
+            # session passed straight to a helper, not via run_in_threadpool
+            is_pool = isinstance(f, ast.Name) and f.id == "run_in_threadpool"
+            if not is_pool and any(isinstance(a, ast.Name) and a.id == "session"
+                                   for a in node.args):
+                offenders.append(f"{fn.name}: {ast.unparse(f)}(session, ...)")
+    assert offenders == []
