@@ -3,7 +3,7 @@
 import io
 
 import pytest
-from sqlmodel import Session, SQLModel, select
+from sqlmodel import Session, SQLModel, select, update
 
 from app.chunk import chunk_resource, locate, presplit
 from app.extract import (
@@ -15,10 +15,17 @@ from app.extract import (
     extract_resource_text,
     extract_transcript,
 )
-from app.models import Chunk, Course, Resource, Topic
+from app.models import Chunk, Course, QuizItem, Resource, Topic
 from app.moodle import MoodleError
-from app.pipeline import quiz_chunk_ids, run_chunking, run_extraction
-from tests.dbutil import make_engine
+from app.pipeline import (
+    pending_resource_ids,
+    quiz_chunk_ids,
+    run_chunking,
+    run_extraction,
+    single_run,
+)
+from app.sync import ContentChanged, commit_if_current
+from tests.dbutil import TEST_DATABASE_URL, make_engine
 
 
 class FakeLLM:
@@ -585,3 +592,126 @@ def test_download_errors_back_off_but_stay_pending(session):
     assert run_extraction(session, lambda url: (b"notes", "text/plain")).counts["extracted"] == 1
     session.refresh(r)
     assert r.attempts == 0 and r.retry_after is None
+
+
+def _sync_replaces(session, rid):
+    """What sync does on a content_hash change, committed mid-call the way a
+    worker sync job commits while the pipeline waits on a download or LLM."""
+    from app.sync import _purge_derived, lock_resource
+
+    lock_resource(session, rid)
+    _purge_derived(session, rid)
+    session.exec(update(Resource).where(Resource.id == rid).values(
+        content_hash="new", extracted_text=None, status="pending"))
+    session.commit()
+
+
+class RacingLLM(FakeLLM):
+    def __init__(self, session, rid):
+        self.session, self.rid = session, rid
+
+    def complete_json(self, system, user, **kw):
+        _sync_replaces(self.session, self.rid)
+        return super().complete_json(system, user, **kw)
+
+
+def _assert_reset(session, rid):
+    session.expire_all()
+    r = session.get(Resource, rid)
+    assert (r.content_hash, r.status, r.extracted_text) == ("new", "pending", None)
+    assert session.exec(select(Chunk)).all() == []
+    assert rid in pending_resource_ids(session)  # extracted again next run
+
+
+def test_chunks_of_text_replaced_mid_call_are_dropped(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500,
+                  content_hash="old")
+    counts = run_chunking(session, RacingLLM(session, r.id)).counts
+    assert counts["changed"] == 1 and counts["chunks"] == 0
+    _assert_reset(session, r.id)
+
+
+def test_rechunk_replaced_mid_call_keeps_neither_old_nor_new_chunks(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500,
+                  content_hash="old")
+    assert chunk_resource(session, r, FakeLLM()) == 2
+    r.status = "pending"
+    session.add(r)
+    session.commit()
+    with pytest.raises(ContentChanged):
+        chunk_resource(session, r, RacingLLM(session, r.id))
+    _assert_reset(session, r.id)
+
+
+def test_text_downloaded_before_a_content_change_is_dropped(session):
+    r = _resource(session, raw_url="https://m.example/notes.txt", content_hash="old")
+    rid = r.id
+
+    def downloader(url):
+        _sync_replaces(session, rid)
+        return b"old notes", "text/plain"
+
+    counts = run_extraction(session, downloader).counts
+    assert counts["changed"] == 1 and counts["extracted"] == 0
+    _assert_reset(session, rid)
+
+
+def test_failure_on_replaced_content_does_not_back_off_the_new_one(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500,
+                  content_hash="old")
+
+    class RacingFailingLLM:
+        def complete_json(self, *a, **kw):
+            _sync_replaces(session, r.id)
+            raise RuntimeError("provider 500")
+
+    counts = run_chunking(session, RacingFailingLLM()).counts
+    assert counts["changed"] == 1 and "errors" not in counts
+    session.expire_all()
+    fresh = session.get(Resource, r.id)
+    assert fresh.attempts == 0 and fresh.retry_after is None
+
+
+def test_commit_if_current_rolls_back_on_a_new_hash(session):
+    r = _resource(session, content_hash="old")
+    r.title = "edited"
+    session.add(r)
+    assert commit_if_current(session, r.id, "old")
+    r.title = "lost"
+    session.add(r)
+    assert not commit_if_current(session, r.id, "other")
+    session.expire_all()
+    assert session.get(Resource, r.id).title == "edited"
+
+
+def test_rechunk_drops_quiz_items_of_the_old_chunks(session):
+    r = _resource(session, status="extracted", extracted_text="x" * 500)
+    chunk_resource(session, r, FakeLLM())
+    chunk = session.exec(select(Chunk)).first()
+    session.add(QuizItem(chunk_id=chunk.id, question="Q?", question_type="mcq",
+                         options=["a", "b"], correct_answer="0",
+                         generation_key="g-rechunk"))
+    session.commit()
+    r.status = "pending"
+    session.add(r)
+    session.commit()
+    assert chunk_resource(session, r, FakeLLM()) == 2
+    assert session.exec(select(QuizItem)).all() == []  # no orphans on SQLite
+
+
+def test_single_run_on_sqlite_always_runs(session):
+    with single_run("moodle", session.get_bind()) as got:
+        assert got
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="advisory locks need Postgres")
+def test_single_run_excludes_a_second_run_of_the_same_source():
+    a, b = make_engine(), make_engine()
+    with single_run("moodle", a) as first:
+        assert first
+        with single_run("moodle", b) as second:
+            assert not second
+        with single_run("classroom", b) as other:
+            assert other  # sources touch disjoint resources
+    with single_run("moodle", b) as again:
+        assert again  # released on exit

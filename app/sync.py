@@ -193,6 +193,38 @@ def _purge_derived(session: Session, resource_id) -> None:
     session.exec(delete(Chunk).where(Chunk.resource_id == resource_id))
 
 
+class ContentChanged(Exception):
+    """A sync replaced the resource's content while work on it was running."""
+
+
+def lock_resource(session: Session, resource_id) -> bool:
+    """Row-lock a resource until commit/rollback; False when it is gone.
+    Sync takes it before purging changed content and the pipeline before
+    committing work, so whichever comes second sees the other's result."""
+    return session.exec(
+        select(Resource.id).where(Resource.id == resource_id).with_for_update()
+    ).first() is not None
+
+
+def commit_if_current(session: Session, resource_id, seen_hash) -> bool:
+    """Commit the pending work on a resource only if its content_hash is still
+    the one it was built from; otherwise roll it back and return False.
+
+    The pipeline holds a Resource for minutes (downloads, LLM calls) while a
+    sync may replace its content: without this it would write the old text
+    or chunks over the reset and mark the new content done.
+    """
+    row = session.exec(
+        select(Resource.id, Resource.content_hash)
+        .where(Resource.id == resource_id).with_for_update()
+    ).first()
+    if row is None or row[1] != seen_hash:
+        session.rollback()
+        return False
+    session.commit()
+    return True
+
+
 def _progress(session: Session, resource_id) -> tuple[int, int]:
     """(review states, chunks) built from a resource: what retiring it loses."""
     chunk_ids = select(Chunk.id).where(Chunk.resource_id == resource_id)
@@ -346,6 +378,7 @@ def sync_course(
                     hash_changed = False
 
             if hash_changed:
+                lock_resource(session, existing.id)  # wait out a pipeline commit
                 _purge_derived(session, existing.id)
                 for k, v in meta.items():
                     setattr(existing, k, v)

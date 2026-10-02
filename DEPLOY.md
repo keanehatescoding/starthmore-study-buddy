@@ -84,7 +84,11 @@ Pipeline (daily 09:00, after the sync; paced LLM runs take hours):
 ```
 
 The pipeline is not a queue job: it runs from cron (or by hand for a
-backfill), never inside the worker.
+backfill), never inside the worker. Only one run per source goes at a
+time (a Postgres advisory lock): a run that starts while the previous one is
+still going prints "another … pipeline run is in progress" and exits 0. Work
+on a resource whose content a sync replaced mid-run is dropped (`changed=` in
+the tallies) and redone from the new content.
 The quiz/chunk runners abort early with `quota_exhausted` when the LLM
 quota is gone; re-run the same command later to resume (completed chunks
 are skipped via generation keys).
