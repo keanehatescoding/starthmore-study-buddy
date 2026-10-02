@@ -3,7 +3,8 @@
 Guardrails (from plan):
 - Strictly grounded in the chunk: never introduce outside facts.
 - Return FEWER items rather than invent filler for thin content.
-- MCQ: 4 options, distractors wrong in an instructive way.
+- MCQ: 4 options, distractors wrong in an instructive way. Options are
+  shuffled before storing, since models favour one slot for the answer.
 - Short-answer: grading_criteria as 2-4 key points (not a model answer).
 - Difficulty tagged recall|application|synthesis (feeds scheduler).
 - Idempotent: generation_key = chunk_id + attempt. A retried call after a
@@ -13,6 +14,8 @@ Guardrails (from plan):
 """
 
 from __future__ import annotations
+
+import random
 
 from sqlalchemy import or_
 from sqlmodel import Session, select
@@ -29,7 +32,8 @@ Rules:
 - MCQ: exactly 4 options; distractors must be plausible and wrong in an instructive way.
 - Short-answer: "grading_criteria" lists 2-4 key points an answer must hit (not a full model answer).
 - Tag each item "difficulty": recall (facts), application (use the concept), synthesis (connect ideas).
-- "explanation" briefly justifies the answer, grounded in the chunk.
+- "explanation" briefly justifies the answer, grounded in the chunk. Never refer to an
+  option by its letter or position ("B", "the second option"): options are shown shuffled.
 - Return JSON: {"items": [{"question": ..., "question_type": "mcq"|"short_answer",
   "options": [...4 strings, mcq only...], "correct_answer": <option index 0-3 for mcq, reference text for short_answer>,
   "grading_criteria": "...", "explanation": "...", "difficulty": "recall"|"application"|"synthesis"}]}"""
@@ -45,8 +49,20 @@ def _key_matches(column, key: str):
     return or_(column == key, column.like(f"{key}:%"))
 
 
+def _shuffle_options(item: dict, rng: random.Random) -> dict:
+    """Shuffle an MCQ's options and point correct_answer at its new slot.
+    Permutes indices, not values, so duplicate option text can't misroute it."""
+    if item["question_type"] != "mcq":
+        return item
+    order = list(range(len(item["options"])))
+    rng.shuffle(order)
+    return dict(item, options=[item["options"][i] for i in order],
+                correct_answer=str(order.index(int(item["correct_answer"]))))
+
+
 def generate_for_chunk(
-    session: Session, chunk, llm: LLMClient, attempt: int = 1
+    session: Session, chunk, llm: LLMClient, attempt: int = 1,
+    rng: random.Random | None = None,
 ) -> list[QuizItem]:
     """Generate quiz items for one chunk. Idempotent per (chunk, attempt)."""
     key = f"{chunk.id}:{attempt}"
@@ -61,7 +77,9 @@ def generate_for_chunk(
         SYSTEM, f"Write quiz questions for this study material:\n\n{chunk.content}",
         required_key="items",
     )
-    valid = [item.model_dump() for item in QuizReply.model_validate(data).items][:4]
+    rng = rng or random.Random()
+    valid = [_shuffle_options(item.model_dump(), rng)
+             for item in QuizReply.model_validate(data).items][:4]
     created = []
     single = len(valid) <= 1
     for i, item in enumerate(valid):

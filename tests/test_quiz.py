@@ -1,5 +1,6 @@
 """Phase 3 tests: generation validation + idempotency (FakeLLM)."""
 
+import random
 import uuid
 
 import pytest
@@ -67,8 +68,8 @@ def test_generates_and_filters_invalid(setup):
     assert len(items) == 2  # 2 invalid dropped
     assert llm.calls == 1
     mcq = s.exec(select(QuizItem).where(QuizItem.question_type == "mcq")).one()
-    assert mcq.options == ["array", "tree", "queue", "stack"]
-    assert mcq.correct_answer == "1"  # index stored as string
+    assert sorted(mcq.options) == ["array", "queue", "stack", "tree"]
+    assert mcq.options[int(mcq.correct_answer)] == "tree"  # index stored as string
     short = s.exec(select(QuizItem).where(QuizItem.question_type == "short_answer")).one()
     assert "hierarchy" in short.grading_criteria
     assert not chunk_needs_quiz(s, chunk.id)
@@ -128,14 +129,47 @@ def test_single_valid_item_gets_bare_key(setup):
     assert not chunk_needs_quiz(s, chunk.id)
 
 
-@pytest.mark.parametrize("raw, stored", [(2, "2"), (2.0, "2"), ("2.0", "2"), (" 2 ", "2"),
-                                         (True, None), (1.5, None), ("two", None)])
-def test_mcq_index_normalized(setup, raw, stored):
+@pytest.mark.parametrize("raw, valid", [(2, True), (2.0, True), ("2.0", True), (" 2 ", True),
+                                        (True, False), (1.5, False), ("two", False)])
+def test_mcq_index_normalized(setup, raw, valid):
     s, chunk = setup
     item = dict(GOOD[1], correct_answer=raw)
     generate_for_chunk(s, chunk, FakeLLM([item]))
     rows = s.exec(select(QuizItem)).all()
-    assert [r.correct_answer for r in rows] == ([stored] if stored else [])
+    assert [r.options[int(r.correct_answer)] for r in rows] == (["queue"] if valid else [])
+
+
+def test_mcq_options_are_shuffled_with_the_answer(setup):
+    # A model that always answers slot 0 should not make every answer "A".
+    s, chunk = setup
+    item = dict(GOOD[1], options=["right", "w1", "w2", "w3"], correct_answer=0)
+    slots = set()
+    for attempt in range(1, 41):
+        for row in generate_for_chunk(s, chunk, FakeLLM([item]), attempt=attempt,
+                                      rng=random.Random(attempt)):
+            assert row.options[int(row.correct_answer)] == "right"
+            assert sorted(row.options) == ["right", "w1", "w2", "w3"]
+            slots.add(row.correct_answer)
+    assert slots == {"0", "1", "2", "3"}
+
+
+def test_shuffle_tracks_the_slot_not_the_text(setup):
+    s, chunk = setup
+    # The answer's text is duplicated, so only the seeded permutation pins its slot;
+    # a text lookup would land on the first "same" and miss most of these.
+    item = dict(GOOD[1], options=["same", "same", "same", "right"], correct_answer=2)
+    expected_slots = {1: 2, 2: 1, 3: 2, 4: 0, 5: 3, 6: 1, 7: 3, 8: 1}
+    for attempt in range(1, 9):
+        row, = generate_for_chunk(s, chunk, FakeLLM([item]), attempt=attempt,
+                                  rng=random.Random(attempt))
+        assert row.options[int(row.correct_answer)] == "same"
+        assert int(row.correct_answer) == expected_slots[attempt]
+
+
+def test_short_answer_is_not_shuffled(setup):
+    s, chunk = setup
+    row, = generate_for_chunk(s, chunk, FakeLLM([GOOD[0]]))
+    assert row.options is None and row.correct_answer == "hierarchical data structure"
 
 
 def test_zero_item_chunk_is_not_billed_again(setup):
