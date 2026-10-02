@@ -70,17 +70,19 @@ class DriveClient:
         return self.download(url)
 
     def can_read(self, url: str | None) -> bool:
-        """Whether this grant can see the file (a metadata call, no bytes).
+        """Whether this grant could download the file itself (a metadata call,
+        no bytes). Seeing the file is not enough: an owner can let viewers open
+        a file but not download or export it, so canDownload must be set.
         False on any failure: a caller only ever skips a shortcut on it."""
         fid = file_id(url)
         if fid is None:
             return False
         try:
-            self._call(self.service.files().get(fileId=fid, fields="id",
-                                                supportsAllDrives=True))
+            meta = self._call(self.service.files().get(
+                fileId=fid, fields="capabilities/canDownload", supportsAllDrives=True))
         except (DriveError, ExtractError):
             return False
-        return True
+        return (meta.get("capabilities") or {}).get("canDownload") is True
 
     def download(self, url: str) -> tuple[bytes, str | None]:
         """Downloader for app.extract: Drive URL -> (bytes, mime)."""
