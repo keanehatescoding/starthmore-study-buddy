@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Column, DateTime, Index, Text, UniqueConstraint, text
+from sqlalchemy import JSON, Column, DateTime, Index, Text, UniqueConstraint, text, true
 from sqlmodel import Field, SQLModel
 
 
@@ -25,6 +25,8 @@ class User(SQLModel, table=True):
     session_version: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
     # IANA zone whose midnight starts this user's study day; NULL = settings.timezone
     timezone: Optional[str] = Field(default=None)
+    # email notifications at all; off from settings or an unsubscribe link
+    notify_email: bool = Field(default=True, sa_column_kwargs={"server_default": true()})
     created_at: datetime = Field(
         default_factory=_utcnow, sa_column=Column(DateTime(timezone=True), nullable=False)
     )
@@ -202,6 +204,9 @@ class NotificationEvent(SQLModel, table=True):
     # failure is retried as the same batch. "b2-..." only groups (the key is
     # derived from the payload); legacy "batch-..." was the Idempotency-Key.
     batch_key: Optional[str] = Field(default=None, index=True)
+    # set when the event can never be delivered (no recipient, opted out, ...);
+    # such events leave the queue instead of being retried every pass
+    failed_reason: Optional[str] = Field(default=None)
 
 
 ACTIVE_NOTIFY_WHERE = "type = 'send_notifications' AND status IN ('pending', 'running')"

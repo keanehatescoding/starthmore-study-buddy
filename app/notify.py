@@ -7,7 +7,13 @@
 - review_due: created only when due count >= threshold (avoids fatigue),
   never while an unsent one exists, and not within REVIEW_DUE_COOLDOWN of the
   last one's delivery (the worker runs hourly; the due count stays high until
-  the user reviews).
+  the user reviews), and not for users who haven't answered (or signed up)
+  within REVIEW_DUE_ACTIVE_WINDOW: a student who synced once and walked away
+  isn't nagged forever.
+- Opt-out: users.notify_email (settings page, or the signed one-click
+  unsubscribe link every email carries, with List-Unsubscribe headers).
+  Events that can never be delivered (opted out, gone inactive, no
+  recipient, unknown type) get failed_reason and leave the queue.
 - Delivery: Resend batch REST API (stdlib only, free tier), up to 100 emails
   per request, backing off on 429. No key -> events stay queued; nothing is
   fake-marked sent.
@@ -26,13 +32,16 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from sqlmodel import Session, select
+from itsdangerous import BadSignature, URLSafeSerializer
+from sqlmodel import Session, func, select
 
 from app.grade import _aware, due_count
-from app.models import Course, NotificationEvent, Resource, Topic, User
+from app.models import Course, NotificationEvent, Resource, ReviewLog, Topic, User
 
 REVIEW_DUE_THRESHOLD = 3
 REVIEW_DUE_COOLDOWN = timedelta(hours=23)  # daily, without drifting an hour a day
+REVIEW_DUE_ACTIVE_WINDOW = timedelta(days=14)
+UNSUBSCRIBE_SALT = "unsubscribe"
 RESEND_BATCH_URL = "https://api.resend.com/emails/batch"
 BATCH_SIZE = 100  # Resend's per-request batch limit
 MAX_RETRIES = 4
@@ -137,6 +146,9 @@ def enqueue_new_material(session: Session, course_id, new_items: int) -> Notific
     course = session.get(Course, course_id)
     if course is None or course.user_id is None:
         return None
+    owner = session.get(User, course.user_id)
+    if owner is None or not owner.notify_email:
+        return None
     event = NotificationEvent(
         user_id=course.user_id,
         type="new_material",
@@ -151,14 +163,19 @@ def enqueue_new_material(session: Session, course_id, new_items: int) -> Notific
 def check_review_due(
     session: Session, user_id, threshold: int = REVIEW_DUE_THRESHOLD
 ) -> NotificationEvent | None:
-    """Create a review_due event if due >= threshold, none is still unsent,
-    and the last one was delivered more than REVIEW_DUE_COOLDOWN ago."""
+    """Create a review_due event if the user wants email and is still
+    studying, due >= threshold, none is still queued, and the last one was
+    delivered more than REVIEW_DUE_COOLDOWN ago."""
+    user = session.get(User, user_id)
+    if user is None or not user.notify_email or not _recently_active(session, user):
+        return None
     due = due_count(session, user_id)
     if due < threshold:
         return None
     last = session.exec(
         select(NotificationEvent)
-        .where(NotificationEvent.user_id == user_id, NotificationEvent.type == "review_due")
+        .where(NotificationEvent.user_id == user_id, NotificationEvent.type == "review_due",
+               NotificationEvent.failed_reason == None)  # noqa: E711
         .order_by(NotificationEvent.created_at.desc())
     ).first()
     if last is not None and (
@@ -178,25 +195,65 @@ def check_review_due(
     return event
 
 
-def render(event: NotificationEvent, base_url: str | None = None) -> tuple[str, str]:
+def _recently_active(session: Session, user: User) -> bool:
+    """Answered something, or signed up, within REVIEW_DUE_ACTIVE_WINDOW."""
+    last_answer = session.exec(
+        select(func.max(ReviewLog.answered_at)).where(ReviewLog.user_id == user.id)
+    ).one()
+    since = datetime.now(timezone.utc) - REVIEW_DUE_ACTIVE_WINDOW
+    return any(_aware(t) > since for t in (last_answer, user.created_at) if t is not None)
+
+
+def _serializer(secret_key: str | None) -> URLSafeSerializer:
+    if secret_key is None:
+        from app.config import settings
+
+        secret_key = settings.secret_key
+    return URLSafeSerializer(secret_key, salt=UNSUBSCRIBE_SALT)
+
+
+def unsubscribe_token(user_id, secret_key: str | None = None) -> str:
+    """Signed, non-expiring token naming the user; it only ever turns email off."""
+    return _serializer(secret_key).dumps(str(user_id))
+
+
+def unsubscribe_user(session: Session, token: str,
+                     secret_key: str | None = None) -> User | None:
+    """The user a valid token names, else None."""
+    try:
+        user_id = uuid.UUID(_serializer(secret_key).loads(token))
+    except (BadSignature, ValueError, TypeError):
+        return None
+    return session.get(User, user_id)
+
+
+def unsubscribe_url(event: NotificationEvent, base_url: str,
+                    secret_key: str | None = None) -> str:
+    return f"{base_url.rstrip('/')}/unsubscribe/{unsubscribe_token(event.user_id, secret_key)}"
+
+
+def render(event: NotificationEvent, base_url: str | None = None,
+           secret_key: str | None = None) -> tuple[str, str]:
     if base_url is None:
         from app.config import settings
 
         base_url = settings.app_base_url
     review_url = f"{base_url.rstrip('/')}/review"
+    footer = ("\n\nTo stop these emails, unsubscribe: "
+              f"{unsubscribe_url(event, base_url, secret_key)}")
     if event.type == "new_material":
         p = event.payload
         return (
             f"New study material: {p.get('code') or p.get('course')}",
             f"{p['new_items']} new quiz items from {p.get('course')}.\n"
-            f"Review them: {review_url}",
+            f"Review them: {review_url}{footer}",
         )
     if event.type == "review_due":
         n = event.payload.get("due_count", 0)
         return (
             f"{n} reviews due",
             f"You have {n} quiz items due for review.\n"
-            f"Catch up: {review_url}",
+            f"Catch up: {review_url}{footer}",
         )
     raise EmailError(f"unknown event type {event.type!r}", "unknown_event_type")
 
@@ -208,6 +265,41 @@ def recipient_for(session: Session, event: NotificationEvent, fallback: str = ""
         if user is not None and user.email:
             return user.email
     return fallback
+
+
+def opt_out(session: Session, user: User) -> None:
+    """Turn email off and fail the user's queued events, so turning it back
+    on before the next pass doesn't send what was queued while it was off."""
+    user.notify_email = False
+    session.add(user)
+    for event in session.exec(
+        select(NotificationEvent).where(
+            NotificationEvent.user_id == user.id,
+            NotificationEvent.sent == False,  # noqa: E712
+            NotificationEvent.failed_reason == None,  # noqa: E711
+        )
+    ):
+        event.failed_reason = "opted_out"
+        session.add(event)
+    session.commit()
+
+
+def _undeliverable(session: Session, event: NotificationEvent) -> str | None:
+    """Why the owner shouldn't get this event any more, else None."""
+    user = session.get(User, event.user_id) if event.user_id is not None else None
+    if user is None:
+        return None  # recipient_for decides (fallback address)
+    if not user.notify_email:
+        return "opted_out"
+    # a reminder queued long enough (outage, no API key) for its user to
+    # go inactive is as stale as one check_review_due would now skip
+    if event.type == "review_due" and not _recently_active(session, user):
+        return "inactive"
+    return None
+
+
+# Reasons that will never change on retry: the event is marked failed, not requeued.
+PERMANENT_FAILURES = {"no_recipient", "unknown_event_type", "opted_out", "inactive"}
 
 
 # Resend rejected the batch before sending anything: safe to split and resend.
@@ -226,6 +318,8 @@ def send_pending(
     One commit per delivered batch. Failures stay queued; a rate limit that
     outlasts the retries stops the run so the rest wait for the next pass.
     `errors` counts failures by EmailError.reason for the job result.
+    Events that can never go out (PERMANENT_FAILURES) get failed_reason and
+    leave the queue.
 
     Duplicate safety: a multi-email batch gets a batch_key, committed before
     the request, so a failure that might have been delivered (network, 5xx,
@@ -244,7 +338,8 @@ def send_pending(
     errors: Counter[str] = Counter()  # reason token -> failed deliveries
     events = session.exec(
         select(NotificationEvent)
-        .where(NotificationEvent.sent == False)  # noqa: E712
+        .where(NotificationEvent.sent == False,  # noqa: E712
+               NotificationEvent.failed_reason == None)  # noqa: E711
         .order_by(NotificationEvent.created_at)
     ).all()
     if not api_key:  # nothing can be delivered; don't fake-mark or split batches
@@ -252,17 +347,32 @@ def send_pending(
         return _result(sent, errors)
     keyed: dict[str, list] = {}  # batch_key -> earlier batch, resent unchanged
     fresh: list = []
+    if base_url is None:
+        from app.config import settings
+
+        base_url = settings.app_base_url
     for event in events:
         to_addr = recipient_for(session, event, fallback_to)
         try:
+            if reason := _undeliverable(session, event):
+                raise EmailError(f"not sending: {reason}", reason)
             if not to_addr:
                 raise EmailError("no recipient", "no_recipient")
             subject, body = render(event, base_url)
         except EmailError as e:
             errors[e.reason] += 1
+            if e.reason in PERMANENT_FAILURES:
+                event.failed_reason = e.reason
+                session.add(event)
+                session.commit()
             continue
+        unsubscribe = unsubscribe_url(event, base_url)
         item = (event, {"from": from_addr, "to": [to_addr],
-                        "subject": subject, "text": body})
+                        "subject": subject, "text": body,
+                        "headers": {  # RFC 8058 one-click unsubscribe
+                            "List-Unsubscribe": f"<{unsubscribe}>",
+                            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                        }})
         if event.batch_key:
             keyed.setdefault(event.batch_key, []).append(item)
         else:
