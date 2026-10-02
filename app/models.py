@@ -164,6 +164,8 @@ class ReviewState(SQLModel, table=True):
     )
     # the grader's feedback on the last answer, shown on the result page
     last_feedback: Optional[str] = Field(default=None, sa_column=Column(Text))
+    # the answer as submitted (option index for an MCQ), shown beside the key
+    last_answer: Optional[str] = Field(default=None, sa_column=Column(Text))
 
 
 class ReviewLog(SQLModel, table=True):
