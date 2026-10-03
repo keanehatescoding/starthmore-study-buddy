@@ -36,19 +36,25 @@ class AuthError(RuntimeError):
     pass
 
 
-def login_url(client_id: str, redirect_uri: str, state: str) -> str:
-    params = urllib.parse.urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": " ".join(LOGIN_SCOPES),
-            "access_type": "offline",  # refresh token for Classroom sync
-            "prompt": "consent",
-            "state": state,
-        }
-    )
-    return f"{AUTH_URL}?{params}"
+def login_url(
+    client_id: str, redirect_uri: str, state: str,
+    consent: bool = False, login_hint: str | None = None,
+) -> str:
+    """Google's sign-in URL. Google only hands out a refresh token on a
+    consent screen, so `consent` forces one; otherwise returning users just
+    pick their account (new scopes still get a consent screen from Google)."""
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(LOGIN_SCOPES),
+        "access_type": "offline",  # refresh token for Classroom sync
+        "prompt": "consent" if consent else "select_account",
+        "state": state,
+    }
+    if login_hint:
+        params["login_hint"] = login_hint
+    return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
 def new_state() -> str:
