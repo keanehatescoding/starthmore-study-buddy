@@ -53,7 +53,12 @@
    until then their Drive files stay pending. Likewise, Classroom
    announcements need `classroom.announcements.readonly`: users who signed
    in before it was requested keep syncing materials and coursework, and
-   pick up announcement attachments after their next sign-in.
+   pick up announcement attachments after their next sign-in. Add
+   `https://www.googleapis.com/auth/classroom.announcements.readonly` to the
+   consent screen's Data Access list next to the other Classroom scopes. In
+   Testing mode that is enough for the listed test users; a published app
+   must finish Google's verification for the scope before production use,
+   or users see the unverified-app warning.
 6. `pipeline-cron`: a second cron service, daily at 06:00 UTC — a separate
    slot from the sync, since paced LLM runs take hours and the free Gemini
    tier rate-limits hard. It extracts, chunks and writes quizzes for what
