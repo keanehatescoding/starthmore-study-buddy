@@ -45,24 +45,28 @@ STREAK_WINDOW_DAYS = 32
 def _streak(session: Session, user_id, tz, now: datetime) -> int:
     """Consecutive local days with an answer, ending today (or yesterday).
 
-    Reads answer times one window of local days at a time, newest first,
-    doubling the window while the streak runs past it, so a long history
-    isn't loaded just to find this month's streak."""
+    Reads one window of local days at a time, newest first, doubling the
+    window while the streak runs past it, so a long history isn't read just
+    to find this month's streak. On Postgres each window comes back as its
+    distinct local dates rather than every answer's timestamp."""
     today = now.astimezone(tz).date()
+    zone = getattr(tz, "key", None) or ("UTC" if tz == timezone.utc else None)
+    in_db = zone is not None and session.get_bind().dialect.name == "postgresql"
     days: set = set()
     loaded = 0  # local days read so far, counting back from today
     span = STREAK_WINDOW_DAYS
     while True:
-        days |= {
-            _aware(at).astimezone(tz).date()
-            for at in session.exec(
-                select(ReviewLog.answered_at).where(
-                    ReviewLog.user_id == user_id,
-                    ReviewLog.answered_at >= local_day_start(now, tz, 1 - loaded - span),
-                    ReviewLog.answered_at < local_day_start(now, tz, 1 - loaded),
-                )
-            )
-        }
+        window = (
+            ReviewLog.user_id == user_id,
+            ReviewLog.answered_at >= local_day_start(now, tz, 1 - loaded - span),
+            ReviewLog.answered_at < local_day_start(now, tz, 1 - loaded),
+        )
+        if in_db:  # one row per local day, however many answers it had
+            local_day = func.date(func.timezone(zone, ReviewLog.answered_at))
+            days |= set(session.exec(select(local_day).where(*window).distinct()))
+        else:  # SQLite has no time zones: reduce the timestamps here
+            days |= {_aware(at).astimezone(tz).date()
+                     for at in session.exec(select(ReviewLog.answered_at).where(*window))}
         loaded += span
         cursor = today if today in days else today - timedelta(days=1)
         streak = 0

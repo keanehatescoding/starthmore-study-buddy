@@ -181,8 +181,10 @@ def test_0012_existing_users_start_at_session_version_zero(engine):
         assert c.execute(text("SELECT session_version FROM users")).scalars().all() == [0]
 
 
-def test_0018_backfills_attempts_for_legacy_quiz_items(engine):
+@pytest.mark.parametrize("batch", [1000, 2])  # 2: a chunk's items span pages
+def test_0018_backfills_attempts_for_legacy_quiz_items(engine, monkeypatch, batch):
     m = _migration("0018_backfill_quiz_attempts")
+    monkeypatch.setattr(m, "BATCH", batch)
     course, topic, resource, *chunks = (uuid.uuid4().hex for _ in range(7))
     with engine.begin() as c:
         c.execute(text("INSERT INTO courses (id, source, source_id, name) "

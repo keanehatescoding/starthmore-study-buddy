@@ -18,24 +18,36 @@ branch_labels = None
 depends_on = None
 
 
-def upgrade() -> None:
-    conn = op.get_bind()
-    done = {(str(c), a) for c, a in conn.execute(
-        sa.text("SELECT chunk_id, attempt FROM quiz_attempts"))}
+BATCH = 1000
+
+
+def _attempt(key: str) -> int | None:
     # generation_key is "<chunk_id>:<attempt>" or "<chunk_id>:<attempt>:<i>"
-    missing = set()
-    for chunk_id, key in conn.execute(
-            sa.text("SELECT chunk_id, generation_key FROM quiz_items")):
-        parts = key.split(":")
-        if len(parts) < 2 or not parts[1].isdigit():
+    parts = key.split(":")
+    return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+
+
+def upgrade() -> None:
+    """Pages through quiz_items by id so memory stays bounded by BATCH."""
+    conn = op.get_bind()
+    first = sa.text("SELECT id, chunk_id, generation_key FROM quiz_items "
+                    "ORDER BY id LIMIT :n")
+    after = sa.text("SELECT id, chunk_id, generation_key FROM quiz_items "
+                    "WHERE id > :last ORDER BY id LIMIT :n")
+    marked = sa.text("SELECT chunk_id, attempt FROM quiz_attempts "
+                     "WHERE chunk_id IN :ids").bindparams(sa.bindparam("ids", expanding=True))
+    insert = sa.text("INSERT INTO quiz_attempts (chunk_id, attempt) VALUES (:c, :a)")
+    last = None
+    while rows := conn.execute(after if last else first, {"last": last, "n": BATCH}).all():
+        last = rows[-1][0]
+        pairs = {(c, a) for _, c, key in rows if (a := _attempt(key)) is not None}
+        if not pairs:
             continue
-        if (str(chunk_id), int(parts[1])) not in done:
-            missing.add((chunk_id, int(parts[1])))
-    if missing:
-        conn.execute(
-            sa.text("INSERT INTO quiz_attempts (chunk_id, attempt) VALUES (:c, :a)"),
-            [{"c": c, "a": a} for c, a in sorted(missing, key=str)],
-        )
+        # markers inserted for earlier pages are visible here too
+        done = {(c, a) for c, a in conn.execute(marked, {"ids": list({c for c, _ in pairs})})}
+        missing = pairs - done
+        if missing:
+            conn.execute(insert, [{"c": c, "a": a} for c, a in missing])
 
 
 def downgrade() -> None:
