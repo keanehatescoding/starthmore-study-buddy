@@ -31,9 +31,9 @@ from app.db import engine
 from app.drive import DriveError
 from app.extract import ExtractError, SkipResource, extract_resource_text
 from app.llm import QuotaExhaustedError
-from app.models import Chunk, Course, Resource, Topic, User
+from app.models import Chunk, Course, QuizAttempt, Resource, Topic, User
 from app.moodle import ForeignURLError, MoodleError
-from app.quiz import chunk_needs_quiz, generate_for_chunk
+from app.quiz import generate_for_chunk
 from app.share import copy_chunks, copy_extraction, copy_quiz
 from app.sync import ContentChanged, commit_if_current
 
@@ -104,9 +104,16 @@ def chunkable_resource_ids(session: Session, course_id=None, source=None) -> lis
     return session.exec(_scoped(q, course_id, source)).all()
 
 
-def quiz_chunk_ids(session: Session, course_id=None, source=None) -> list:
+def quiz_chunk_ids(session: Session, course_id=None, source=None,
+                   attempt: int | None = None) -> list:
+    """Chunk ids in scope; with `attempt`, only those with no QuizAttempt for
+    it yet, found in one query rather than a lookup per chunk."""
     q = (select(Chunk.id).join(Resource, Resource.id == Chunk.resource_id)
          .order_by(Chunk.resource_id, Chunk.order))
+    if attempt is not None:
+        q = q.where(~select(QuizAttempt.chunk_id).where(
+            QuizAttempt.chunk_id == Chunk.id, QuizAttempt.attempt == attempt
+        ).exists())
     return session.exec(_scoped(q, course_id, source)).all()
 
 
@@ -332,11 +339,12 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
     result = StageResult(Counter(items=0, chunks=0, skipped=0))
     counts = result.counts
     per_course: Counter[str] = Counter()
-    ids = quiz_chunk_ids(session, course_id, source)
+    ids = quiz_chunk_ids(session, course_id, source, attempt)
+    counts["skipped"] = session.exec(_scoped(
+        select(func.count(Chunk.id)).join(Resource, Resource.id == Chunk.resource_id),
+        course_id, source,
+    )).one() - len(ids)
     for chunk_id in ids:
-        if not chunk_needs_quiz(session, chunk_id, attempt):
-            counts["skipped"] += 1
-            continue
         chunk = session.get(Chunk, chunk_id)
         try:
             items = copy_quiz(session, chunk, attempt)

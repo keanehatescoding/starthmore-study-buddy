@@ -179,3 +179,33 @@ def test_0012_existing_users_start_at_session_version_zero(engine):
     _run(engine, m.upgrade)
     with engine.connect() as c:
         assert c.execute(text("SELECT session_version FROM users")).scalars().all() == [0]
+
+
+def test_0018_backfills_attempts_for_legacy_quiz_items(engine):
+    m = _migration("0018_backfill_quiz_attempts")
+    course, topic, resource, *chunks = (uuid.uuid4().hex for _ in range(7))
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO courses (id, source, source_id, name) "
+                       "VALUES (:i, 'moodle', 'c', 'C')"), {"i": course})
+        c.execute(text("INSERT INTO topics (id, course_id, source_id, title, \"order\") "
+                       "VALUES (:i, :c, 't', 'T', 0)"), {"i": topic, "c": course})
+        c.execute(text("INSERT INTO resources (id, topic_id, source, source_id, type, title, "
+                       "status, attempts) VALUES (:i, :t, 'moodle', 'r', 'file', 'R', "
+                       "'extracted', 0)"), {"i": resource, "t": topic})
+        for i, ch in enumerate(chunks):
+            c.execute(text("INSERT INTO chunks (id, resource_id, title, content, \"order\") "
+                           "VALUES (:i, :r, 'c', 'x', :o)"), {"i": ch, "r": resource, "o": i})
+        items = [(chunks[0], f"{chunks[0]}:1:0"), (chunks[0], f"{chunks[0]}:1:1"),
+                 (chunks[0], f"{chunks[0]}:2"), (chunks[1], f"{chunks[1]}:1"),
+                 (chunks[2], f"{chunks[2]}:1"), (chunks[3], "unparsable")]
+        for ch, key in items:
+            c.execute(text("INSERT INTO quiz_items (id, chunk_id, question, question_type, "
+                           "correct_answer, grading_criteria, explanation, difficulty, "
+                           "generation_key) VALUES (:i, :c, 'q', 'short_answer', 'a', 'g', "
+                           "'e', 'recall', :k)"), {"i": uuid.uuid4().hex, "c": ch, "k": key})
+        c.execute(text("INSERT INTO quiz_attempts (chunk_id, attempt) VALUES (:c, 1)"),
+                  {"c": chunks[2]})  # already marked: left alone
+    _run(engine, m.upgrade)
+    with engine.connect() as c:
+        rows = sorted(c.execute(text("SELECT chunk_id, attempt FROM quiz_attempts")))
+    assert rows == sorted([(chunks[0], 1), (chunks[0], 2), (chunks[1], 1), (chunks[2], 1)])
