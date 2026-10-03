@@ -231,11 +231,18 @@ def login_page(request: Request):
 
 @app.get("/login/google")
 def login_google(request: Request):
+    return _google_redirect(request)
+
+
+def _google_redirect(request: Request, consent: bool = False, login_hint: str | None = None):
     state = auth_mod.new_state()
     request.session["oauth_state"] = state
-    redirect_uri = oauth_redirect_uri()
+    # the callback must know whether this round already showed the consent
+    # screen, so a missing refresh token re-prompts once, not forever
+    request.session["oauth_consent"] = consent
     return RedirectResponse(
-        auth_mod.login_url(settings.google_client_id, redirect_uri, state),
+        auth_mod.login_url(settings.google_client_id, oauth_redirect_uri(), state,
+                           consent=consent, login_hint=login_hint),
         status_code=303,
     )
 
@@ -258,6 +265,7 @@ def auth_callback(
     code: str = "", state: str = "", error: str = "",
 ):
     expected_state = request.session.pop("oauth_state", None)
+    consented = request.session.pop("oauth_consent", False)
     if error:
         # e.g. access_denied: they cancelled on Google's consent screen
         return _login_failed(request, "Google sign-in was cancelled. Try again when you're ready.")
@@ -277,6 +285,11 @@ def auth_callback(
     if not email_allowed(email):
         return _login_failed(
             request, f"{email} isn't allowed to sign in here. Use your university account.")
+    if (not tokens.get("refresh_token") and not consented
+            and not auth_mod.refresh_token_for(auth_mod.find_user(session, email))):
+        # Google skips the refresh token without a consent screen, and we
+        # have none stored (new user, or theirs was revoked): ask once more
+        return _google_redirect(request, consent=True, login_hint=email)
     user = auth_mod.sign_in(session, email, tokens.get("refresh_token"))
     if tokens.get("refresh_token"):
         # a fresh Classroom (+ Drive) grant: pull their classes now

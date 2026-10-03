@@ -262,8 +262,9 @@ def _callback_client(email: str, monkeypatch, **session_data):
             yield s
 
     app.dependency_overrides[get_session] = override
+    # a first sign-in: the consent screen hands out a refresh token
     monkeypatch.setattr(
-        auth_mod, "exchange_code", lambda *a: {"access_token": "tok"}
+        auth_mod, "exchange_code", lambda *a: {"access_token": "tok", "refresh_token": "rt"}
     )
     monkeypatch.setattr(auth_mod, "fetch_email", lambda tok: email)
     client = TestClient(app, follow_redirects=False)
@@ -355,6 +356,64 @@ def test_timezone_setting_must_be_an_iana_zone():
     assert str(Settings(_env_file=None).tz) == "Africa/Nairobi"
     with pytest.raises(ValueError, match="TIMEZONE"):
         Settings(_env_file=None, timezone="Mars/Olympus")
+
+
+def test_login_url_prompts_consent_only_when_asked():
+    url = auth_mod.login_url("cid", "https://x/cb", "s")
+    assert "prompt=select_account" in url and "consent" not in url
+    url = auth_mod.login_url("cid", "https://x/cb", "s", consent=True, login_hint="a@x.edu")
+    assert "prompt=consent" in url and "login_hint=a%40x.edu" in url
+
+
+def test_login_google_starts_with_account_chooser():
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app, follow_redirects=False)
+    r = client.get("/login/google")
+    assert r.status_code == 303 and "prompt=select_account" in r.headers["location"]
+    assert _session_data(client)["oauth_consent"] is False
+
+
+def _no_refresh_token(monkeypatch):
+    monkeypatch.setattr(auth_mod, "exchange_code", lambda *a: {"access_token": "tok"})
+
+
+def test_returning_user_with_stored_token_signs_in_without_consent(monkeypatch):
+    from app.db import get_session
+
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("back@x.edu", monkeypatch)
+    _no_refresh_token(monkeypatch)
+    try:
+        with next(app.dependency_overrides[get_session]()) as s:
+            auth_mod.sign_in(s, "back@x.edu", "stored-rt")
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        assert r.status_code == 303 and r.headers["location"] == "/"
+        assert "user_id" in _session_data(client)
+        with next(app.dependency_overrides[get_session]()) as s:
+            assert auth_mod.refresh_token_for(auth_mod.find_user(s, "back@x.edu")) == "stored-rt"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_missing_refresh_token_reprompts_with_consent_once(monkeypatch):
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    client = _callback_client("new@x.edu", monkeypatch)
+    _no_refresh_token(monkeypatch)
+    try:
+        r = client.get("/auth/callback", params={"code": "c", "state": "s1"})
+        loc = r.headers["location"]
+        assert r.status_code == 303 and loc.startswith(auth_mod.AUTH_URL)
+        assert "prompt=consent" in loc and "login_hint=new%40x.edu" in loc
+        data = _session_data(client)
+        assert "user_id" not in data and data["oauth_consent"] is True
+        # the consent round still came back without one: sign in anyway
+        state = data["oauth_state"]
+        r = client.get("/auth/callback", params={"code": "c2", "state": state})
+        assert r.status_code == 303 and r.headers["location"] == "/"
+        assert "user_id" in _session_data(client)
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_login_requests_drive_readonly():
