@@ -318,6 +318,7 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
         if n:
             counts["resources"] += 1
             if pace and needs_llm(r):
+                session.commit()  # don't sit idle in a transaction while paced
                 time.sleep(pace)
     return result
 
@@ -363,6 +364,7 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
             if course is not None:
                 per_course[str(course.id)] += len(items)
         if pace and not shared:
+            session.commit()  # don't sit idle in a transaction while paced
             time.sleep(pace)
     for cid, n in per_course.items():
         if enqueue_new_material(session, UUID(cid), n) is not None:
@@ -376,12 +378,13 @@ def _lock_key(source: str) -> int:
 
 
 @contextmanager
-def single_run(source: str, bind=None):
+def single_run(source: str, bind=None, wait: bool = False):
     """Yield whether this process holds the run for `source`: two runs over
     the same resources (overlapping cron, a backfill by hand) would both chunk
     and quiz them, duplicating chunks. A session-level Postgres advisory lock,
     so it goes away with the process even if it dies; SQLite has no
-    concurrent runs to guard against and always gets it.
+    concurrent runs to guard against and always gets it. `wait` blocks until
+    the lock is free instead of giving up.
     """
     bind = bind or engine
     if bind.dialect.name != "postgresql":
@@ -389,7 +392,12 @@ def single_run(source: str, bind=None):
         return
     with bind.connect() as conn:
         key = _lock_key(source)
-        got = conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar()
+        if wait:
+            conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": key})
+            got = True
+        else:
+            got = conn.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                               {"k": key}).scalar()
         conn.commit()
         try:
             yield got
@@ -397,6 +405,48 @@ def single_run(source: str, bind=None):
             if got:  # pooled connections outlive this: release explicitly
                 conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
                 conn.commit()
+
+
+STAGES = ("extraction", "chunking", "quiz")
+
+
+def pipeline_job_running(session: Session, source: str) -> bool:
+    """Whether the worker is running a queued `pipeline` job for `source`."""
+    from app.models import Job
+
+    running = session.exec(
+        select(Job).where(Job.type == "pipeline", Job.status == "running")
+    ).all()
+    return any(j.payload.get("source") == source for j in running)
+
+
+def llm_clients():
+    """(chunk LLM, quiz LLM) from LLM_*; raises LLMError when LLM_API_KEY is unset."""
+    from app.llm import LLMClient
+
+    return (
+        LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_chunk_model),
+        LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_quiz_model),
+    )
+
+
+def run_course(session: Session, source: str, course_id, chunk_llm=None, quiz_llm=None,
+               pace: float = 0.0, stages=STAGES) -> dict[str, StageResult]:
+    """Run `stages` in order over one course (None = every course of `source`),
+    printing each tally as it finishes. The caller holds single_run(source)."""
+    out: dict[str, StageResult] = {}
+    if "extraction" in stages:
+        out["extraction"] = run_extraction(session, None, course_id,
+                                           DOWNLOADERS_FOR[source](session), source=source)
+        print("extraction:", out["extraction"], flush=True)
+    if "chunking" in stages:
+        out["chunking"] = run_chunking(session, chunk_llm, course_id, pace=pace,
+                                       source=source)
+        print("chunking:", out["chunking"], flush=True)
+    if "quiz" in stages:
+        out["quiz"] = run_quiz(session, quiz_llm, course_id, pace=pace, source=source)
+        print("quiz:", out["quiz"], flush=True)
+    return out
 
 
 def main() -> None:
@@ -411,47 +461,41 @@ def main() -> None:
                              "raise it for free-tier rate limits)")
     args = parser.parse_args()
 
+    stages = [st for st, skip in zip(STAGES, (
+        args.chunk_only or args.quiz_only,
+        args.extract_only or args.quiz_only,
+        args.extract_only or args.chunk_only,
+    )) if not skip]
     chunk_llm = quiz_llm = None
-    if not args.extract_only and not args.quiz_only:
-        from app.llm import LLMClient
+    if "chunking" in stages or "quiz" in stages:
+        chunk_llm, quiz_llm = llm_clients()
 
-        chunk_llm = LLMClient(
-            settings.llm_base_url, settings.llm_api_key, settings.llm_chunk_model
-        )
-    if not args.extract_only and not args.chunk_only:
-        from app.llm import LLMClient
-
-        quiz_llm = LLMClient(
-            settings.llm_base_url, settings.llm_api_key, settings.llm_quiz_model
-        )
-
-    with single_run(args.source) as got, Session(engine) as session:
-        if not got:
-            print(f"another {args.source} pipeline run is in progress; exiting")
+    for wait in (False, True):
+        with single_run(args.source, wait=wait) as got, Session(engine) as session:
+            if not got:
+                if pipeline_job_running(session, args.source):
+                    # a new user's first run (app.jobs): short, so wait it out
+                    # rather than skip everyone else's day
+                    print(f"a {args.source} pipeline job is running; waiting for it",
+                          flush=True)
+                    continue
+                print(f"another {args.source} pipeline run is in progress; exiting")
+                return
+            course_ids = [None]
+            if args.course:
+                # every user enrolled in the course has their own copy of it
+                course_ids = session.exec(
+                    select(Course.id).where(
+                        Course.source == args.source, Course.source_id == args.course,
+                        Course.user_id.is_not(None),
+                    ).order_by(Course.id)
+                ).all()
+                if not course_ids:
+                    raise SystemExit(f"course {args.course} not synced — run sync_cli first")
+            for course_id in course_ids:
+                run_course(session, args.source, course_id, chunk_llm, quiz_llm,
+                           pace=args.pace, stages=stages)
             return
-        course_ids = [None]
-        if args.course:
-            # every user enrolled in the course has their own copy of it
-            course_ids = session.exec(
-                select(Course.id).where(
-                    Course.source == args.source, Course.source_id == args.course,
-                    Course.user_id.is_not(None),
-                ).order_by(Course.id)
-            ).all()
-            if not course_ids:
-                raise SystemExit(f"course {args.course} not synced — run sync_cli first")
-        src = args.source
-        for course_id in course_ids:
-            if not args.chunk_only and not args.quiz_only:
-                downloader_for = DOWNLOADERS_FOR[src](session)
-                print("extraction:", run_extraction(session, None, course_id,
-                                                    downloader_for, source=src))
-            if not args.extract_only and not args.quiz_only:
-                print("chunking:", run_chunking(session, chunk_llm, course_id,
-                                                pace=args.pace, source=src))
-            if not args.extract_only and not args.chunk_only:
-                print("quiz:", run_quiz(session, quiz_llm, course_id,
-                                        pace=args.pace, source=src))
 
 
 if __name__ == "__main__":

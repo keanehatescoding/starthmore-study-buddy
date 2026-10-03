@@ -631,3 +631,53 @@ def test_better_text_relocates_kept_chunks(session, user_id):
 ])
 def test_link_type_youtube_forms(url, kind):
     assert link_type(url) == kind
+
+
+@pytest.fixture()
+def llm_key(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "llm_api_key", "k")
+
+
+def _pipeline_jobs(session):
+    from app.models import Job
+
+    return session.exec(select(Job).where(Job.type == "pipeline")).all()
+
+
+def test_first_sync_queues_a_pipeline_run_once(session, user_id, monkeypatch, llm_key):
+    _sync_job(session, monkeypatch, FakeAdapter())
+    job, = _pipeline_jobs(session)
+    assert job.payload == {"source": "moodle", "user_email": "s@x.edu"}
+    _sync_job(session, monkeypatch, FakeAdapter())  # still pending: not queued twice
+    assert len(_pipeline_jobs(session)) == 1
+
+
+def test_no_pipeline_run_once_the_user_has_chunks(session, user_id, monkeypatch, llm_key):
+    sync_course(session, FakeAdapter(), "c1", user_id)
+    page = session.exec(select(Resource).where(Resource.source_id == "r-page")).one()
+    session.add(Chunk(resource_id=page.id, order=0, title="T", content="A tree is..."))
+    session.commit()
+    _sync_job(session, monkeypatch, FakeAdapter())
+    assert _pipeline_jobs(session) == []
+
+
+def test_no_pipeline_run_without_an_llm_key(session, user_id, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    _sync_job(session, monkeypatch, FakeAdapter())
+    assert _pipeline_jobs(session) == []
+
+
+def test_another_users_chunks_dont_count(session, user_id, monkeypatch, llm_key):
+    other = User(email="o@x.edu")
+    session.add(other)
+    session.commit()
+    sync_course(session, FakeAdapter(), "c1", other.id)
+    page = session.exec(select(Resource).where(Resource.source_id == "r-page")).first()
+    session.add(Chunk(resource_id=page.id, order=0, title="T", content="A tree is..."))
+    session.commit()
+    _sync_job(session, monkeypatch, FakeAdapter())
+    assert len(_pipeline_jobs(session)) == 1
