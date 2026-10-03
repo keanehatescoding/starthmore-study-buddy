@@ -318,6 +318,7 @@ def run_chunking(session: Session, llm, course_id=None, pace: float = 0.0,
         if n:
             counts["resources"] += 1
             if pace and needs_llm(r):
+                session.commit()  # don't sit idle in a transaction while paced
                 time.sleep(pace)
     return result
 
@@ -363,6 +364,7 @@ def run_quiz(session: Session, llm, course_id=None, attempt: int = 1,
             if course is not None:
                 per_course[str(course.id)] += len(items)
         if pace and not shared:
+            session.commit()  # don't sit idle in a transaction while paced
             time.sleep(pace)
     for cid, n in per_course.items():
         if enqueue_new_material(session, UUID(cid), n) is not None:

@@ -96,8 +96,11 @@ until it finishes; on shared course material it mostly copies another
 user's results. Only one run per source goes at a time (a Postgres advisory
 lock): a cron run that starts while the previous one is still going prints
 "another … pipeline run is in progress" and exits 0; one that finds a
-`pipeline` job running waits for it instead; and a `pipeline` job that
-finds the lock taken goes back to the queue for 30 minutes. Work
+`pipeline` job running waits for it instead (best effort: the job status
+and the lock are checked separately, so a cron run can still exit while a
+job is just starting or deferring; the next run picks the work up); and a
+`pipeline` job that finds the lock taken goes back to the queue for 30
+minutes. Work
 on a resource whose content a sync replaced mid-run is dropped (`changed=` in
 the tallies) and redone from the new content.
 The quiz/chunk runners abort early with `quota_exhausted` when the LLM
