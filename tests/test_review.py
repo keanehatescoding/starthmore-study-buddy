@@ -495,3 +495,19 @@ def test_unknown_source_chunk_ignored(testapp):
         rid = s.exec(select(Resource)).one().id
     r = client.get(f"/resources/{rid}?chunk=00000000-0000-0000-0000-000000000000")
     assert r.status_code == 200 and "source-mark" not in r.text
+
+
+@pytest.mark.parametrize("days, gap", [(40, None), (100, None), (70, 45), (40, 31), (40, 32)])
+def test_streak_runs_past_the_first_window(testapp, days, gap):
+    from app.stats import STREAK_WINDOW_DAYS, compute_stats
+
+    assert days > STREAK_WINDOW_DAYS
+    Session, user_id = testapp["Session"], testapp["user_id"]
+    now = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
+    with Session() as s:
+        for days_ago in range(days):
+            if days_ago != gap:
+                _log(s, user_id, now - timedelta(days=days_ago))
+        s.commit()
+        streak = compute_stats(s, user_id, tz=timezone.utc, now=now)["streak_days"]
+    assert streak == (gap if gap is not None else days)

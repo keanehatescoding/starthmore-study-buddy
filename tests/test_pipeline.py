@@ -798,3 +798,18 @@ def test_single_run_wait_blocks_until_the_holder_releases():
     w.join(5)
     t.join(5)
     assert got == [True]
+
+
+def test_quiz_candidates_exclude_attempted_chunks(session):
+    from app.models import QuizAttempt
+
+    r = _resource(session, source_id="q", status="extracted", extracted_text="t")
+    chunks = [Chunk(resource_id=r.id, title=f"c{i}", content="t", order=i) for i in range(3)]
+    session.add_all(chunks)
+    session.commit()
+    session.add_all([QuizAttempt(chunk_id=chunks[0].id, attempt=1),
+                     QuizAttempt(chunk_id=chunks[1].id, attempt=2)])
+    session.commit()
+    assert quiz_chunk_ids(session, attempt=1) == [chunks[1].id, chunks[2].id]
+    assert quiz_chunk_ids(session, attempt=2) == [chunks[0].id, chunks[2].id]
+    assert len(quiz_chunk_ids(session)) == 3

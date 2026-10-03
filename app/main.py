@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import defer
 from sqlmodel import Session, func, select
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -358,11 +359,13 @@ def course_detail(
     topics = session.exec(
         select(Topic).where(Topic.course_id == course.id).order_by(Topic.order)
     ).all()
-    resources_by_topic: dict[str, list] = {}
-    for t in topics:
-        resources_by_topic[str(t.id)] = session.exec(
-            select(Resource).where(Resource.topic_id == t.id).order_by(Resource.title)
-        ).all()
+    resources_by_topic: dict[str, list] = {str(t.id): [] for t in topics}
+    for r in session.exec(
+        select(Resource).join(Topic, Topic.id == Resource.topic_id)
+        .where(Topic.course_id == course.id).order_by(Resource.title)
+        .options(defer(Resource.extracted_text))  # the page lists titles only
+    ):
+        resources_by_topic[str(r.topic_id)].append(r)
     assignments = session.exec(
         select(Assignment)
         .where(Assignment.course_id == course.id)

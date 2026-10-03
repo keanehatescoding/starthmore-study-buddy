@@ -95,3 +95,37 @@ def test_full_text_hidden_from_other_users(testapp):
     client = testapp["client"]
     rid = _resource_with_text(testapp, "secret", owned=False)
     assert client.get(f"/resources/{rid}/text").status_code == 404
+
+
+def _course_page_selects(testapp, n_topics):
+    from sqlalchemy import event
+
+    client, Session = testapp["client"], testapp["Session"]
+    with Session() as s:
+        course = Course(user_id=testapp["user_id"], source="moodle",
+                        source_id=f"n{n_topics}", name="N+1")
+        s.add(course)
+        s.commit()
+        for i in range(n_topics):
+            topic = Topic(course_id=course.id, source_id=f"t{i}", title=f"Topic {i}", order=i)
+            s.add(topic)
+            s.commit()
+            for name in ("b", "a"):
+                s.add(Resource(topic_id=topic.id, source="moodle", source_id=f"r{i}{name}",
+                               type="file", title=f"{name}-{i}.pdf", status="pending"))
+        s.commit()
+        cid, engine = course.id, s.get_bind()
+    statements = []
+    listener = lambda *a: statements.append(a[2])  # noqa: E731
+    event.listen(engine, "before_cursor_execute", listener)
+    try:
+        page = client.get(f"/courses/{cid}").text
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+    for i in range(n_topics):  # each topic lists its own resources, by title
+        assert page.index(f"Topic {i}") < page.index(f"a-{i}.pdf") < page.index(f"b-{i}.pdf")
+    return sum(st.lstrip().upper().startswith("SELECT") for st in statements)
+
+
+def test_course_page_queries_do_not_grow_with_topics(testapp):
+    assert _course_page_selects(testapp, 1) == _course_page_selects(testapp, 5)
