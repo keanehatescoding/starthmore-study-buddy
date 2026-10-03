@@ -2,8 +2,9 @@
 
 Required scopes (coursework alone misses materials/topics):
   classroom.courses.readonly, classroom.coursework.me.readonly,
-  classroom.courseworkmaterials.readonly, classroom.topics.readonly
-  (+ optionally classroom.announcements.readonly)
+  classroom.courseworkmaterials.readonly, classroom.topics.readonly,
+  classroom.announcements.readonly (tokens granted before it was added skip
+  announcements until the owner signs in again)
 
 google-* imports are lazy so the module (and tests with fakes) load
 without the google libs installed.
@@ -13,19 +14,26 @@ Drive URL; the pipeline downloads them via app.drive under the owner's
 drive.readonly grant. Edits inside the same Drive file aren't seen as a
 change; swapping the attachment for another file (new id) or renaming it is.
 
-Materials with no topic, or whose topic was deleted, sync under a synthetic
-"Other materials" topic (UNTAGGED_TOPIC_ID) instead of being dropped.
+Attachments come from courseWorkMaterials, courseWork (slides posted on an
+assignment) and announcements. Materials and coursework with no topic, or
+whose topic was deleted, sync under a synthetic "Other materials" topic
+(UNTAGGED_TOPIC_ID) instead of being dropped; announcements have no topic and
+sync under a synthetic "Announcements" topic.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
     "https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly",
     "https://www.googleapis.com/auth/classroom.topics.readonly",
+    "https://www.googleapis.com/auth/classroom.announcements.readonly",
 ]
 
 
@@ -39,7 +47,10 @@ def build_service(client_id: str, client_secret: str, refresh_token: str):
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
-        scopes=SCOPES,
+        # No scopes: the refresh then mints a token for whatever was granted.
+        # Asking for SCOPES would fail with invalid_scope on every token
+        # granted before the announcements scope was added.
+        scopes=None,
     )
     return build("classroom", "v1", credentials=creds)
 
@@ -100,6 +111,29 @@ class ClassroomClient:
             self.service.courses().courseWork(), "courseWork", courseId=course_id
         )
 
+    def list_announcements(self, course_id: str) -> list[dict]:
+        """[] when the token lacks the announcements scope (granted before it
+        was requested); other errors propagate like any other list call."""
+        try:
+            return self._list_all(
+                self.service.courses().announcements(), "announcements",
+                courseId=course_id,
+            )
+        except Exception as e:
+            if _status(e) == 403 and b"insufficient" in (_content(e) or b"").lower():
+                log.info("course %s: token lacks the announcements scope", course_id)
+                return []
+            raise
+
+
+def _status(e: Exception) -> int | None:
+    resp = getattr(e, "resp", None)
+    return getattr(resp, "status", None)
+
+
+def _content(e: Exception) -> bytes | None:
+    return getattr(e, "content", None)
+
 
 # -- adapter -------------------------------------------------------------------
 
@@ -117,9 +151,12 @@ class ClassroomAdapter:
 
     def __init__(self, client: ClassroomClient):
         self.client = client
-        # course id -> (known topic ids, materials); refreshed by fetch_topics
-        # so each course sync lists materials once, not once per topic.
-        self._materials: dict[str, tuple[set[str], list[dict]]] = {}
+        # course id -> its resources across topics; built by fetch_topics so
+        # each course sync lists every collection once, not once per topic.
+        self._resources: dict[str, list[ResourceData]] = {}
+        # course id -> courseWork, listed by fetch_topics, reused by
+        # fetch_assignments
+        self._coursework: dict[str, list[dict]] = {}
 
     def fetch_courses(self) -> list[CourseData]:
         return [
@@ -137,67 +174,57 @@ class ClassroomAdapter:
             for i, t in enumerate(self.client.list_topics(course_source_id))
         ]
         known = {t.source_id for t in topics}
-        materials = self.client.list_materials(course_source_id)
-        self._materials[course_source_id] = (known, materials)
-        if any(_topic_of(m, known) == UNTAGGED_TOPIC_ID for m in materials):
-            topics.append(TopicData(UNTAGGED_TOPIC_ID, UNTAGGED_TITLE, len(topics)))
+        work = self.client.list_coursework(course_source_id)
+        self._coursework[course_source_id] = work
+        # Material ids keep their bare form so rows synced before coursework
+        # and announcements were read keep matching.
+        posts = [
+            (_topic_of(m, known), m["id"], m.get("title") or "Material",
+             m.get("materials", []))
+            for m in self.client.list_materials(course_source_id)
+        ]
+        posts += [
+            (_topic_of(w, known), f"work:{w['id']}", w.get("title") or "Coursework",
+             w["materials"])
+            for w in work if w.get("materials")
+        ]
+        posts += [
+            (ANNOUNCEMENTS_TOPIC_ID, f"ann:{a['id']}", _announcement_title(a),
+             a["materials"])
+            for a in self.client.list_announcements(course_source_id)
+            if a.get("materials")
+        ]
+        # Indexes count every attachment, so skipping one never renumbers
+        # the rest.
+        resources = [
+            r
+            for topic, prefix, title, attachments in posts
+            for i, mat in enumerate(attachments)
+            if (r := _resource(topic, f"{prefix}:{i}", title, mat)) is not None
+        ]
+        self._resources[course_source_id] = resources
+        # a synthetic topic only when something syncs into it
+        used = {r.topic_source_id for r in resources}
+        for sid, title in ((UNTAGGED_TOPIC_ID, UNTAGGED_TITLE),
+                           (ANNOUNCEMENTS_TOPIC_ID, ANNOUNCEMENTS_TITLE)):
+            if sid in used:
+                topics.append(TopicData(sid, title, len(topics)))
         return topics
 
     def fetch_resources(
         self, course_source_id: str, topic_source_id: str
     ) -> list[ResourceData]:
-        if course_source_id not in self._materials:
+        if course_source_id not in self._resources:
             self.fetch_topics(course_source_id)
-        known, materials = self._materials[course_source_id]
-        out: list[ResourceData] = []
-        for m in materials:
-            if _topic_of(m, known) != topic_source_id:
-                continue
-            for i, mat in enumerate(m.get("materials", [])):
-                sid = f"{m['id']}:{i}"
-                title = m.get("title") or "Material"
-                if "youtubeVideo" in mat:
-                    vid = mat["youtubeVideo"]
-                    url = vid.get("alternateLink") or (
-                        f"https://www.youtube.com/watch?v={vid.get('id')}"
-                    )
-                    out.append(
-                        ResourceData(
-                            topic_source_id, sid, "video", title,
-                            raw_url=url, content_bytes=f"yt:{vid.get('id')}".encode(),
-                        )
-                    )
-                elif "link" in mat:
-                    url = mat["link"]["url"]
-                    out.append(
-                        ResourceData(
-                            topic_source_id, sid, link_type(url), title,
-                            raw_url=url, content_bytes=url.encode(),
-                        )
-                    )
-                elif "driveFile" in mat:
-                    # SharedDriveFile{driveFile: DriveFile{id, title, alternateLink}}
-                    df = mat["driveFile"].get("driveFile") or {}
-                    out.append(
-                        ResourceData(
-                            topic_source_id, sid, "file", df.get("title") or title,
-                            raw_url=_drive_url(df),
-                            content_bytes=_drive_marker(df),
-                        )
-                    )
-                elif "form" in mat:
-                    url = mat["form"].get("formUrl", "")
-                    out.append(
-                        ResourceData(
-                            topic_source_id, sid, "link", mat["form"].get("title") or title,
-                            raw_url=url, content_bytes=url.encode(),
-                        )
-                    )
-        return out
+        return [r for r in self._resources[course_source_id]
+                if r.topic_source_id == topic_source_id]
 
     def fetch_assignments(self, course_source_id: str) -> list[AssignmentData]:
+        work = self._coursework.get(course_source_id)
+        if work is None:
+            work = self.client.list_coursework(course_source_id)
         out: list[AssignmentData] = []
-        for w in self.client.list_coursework(course_source_id):
+        for w in work:
             due = None
             if w.get("dueDate"):
                 d = w["dueDate"]
@@ -221,8 +248,58 @@ class ClassroomAdapter:
         return out
 
 
+def _resource(topic: str, sid: str, title: str, mat: dict) -> ResourceData | None:
+    """One Classroom Material (attachment) as a resource; None for kinds
+    there is nothing to fetch from."""
+    if "youtubeVideo" in mat:
+        vid = mat["youtubeVideo"]
+        url = vid.get("alternateLink") or (
+            f"https://www.youtube.com/watch?v={vid.get('id')}"
+        )
+        return ResourceData(
+            topic, sid, "video", title,
+            raw_url=url, content_bytes=f"yt:{vid.get('id')}".encode(),
+        )
+    if "link" in mat:
+        url = mat["link"]["url"]
+        return ResourceData(
+            topic, sid, link_type(url), title, raw_url=url, content_bytes=url.encode(),
+        )
+    if "driveFile" in mat:
+        # SharedDriveFile{driveFile: DriveFile{id, title, alternateLink}}
+        df = mat["driveFile"].get("driveFile") or {}
+        return ResourceData(
+            topic, sid, "file", df.get("title") or title,
+            raw_url=_drive_url(df), content_bytes=_drive_marker(df),
+        )
+    if "form" in mat:
+        url = mat["form"].get("formUrl", "")
+        return ResourceData(
+            topic, sid, "link", mat["form"].get("title") or title,
+            raw_url=url, content_bytes=url.encode(),
+        )
+    for kind in ("gem", "notebook"):  # Gemini Gems, NotebookLM notebooks
+        url = (mat.get(kind) or {}).get("url")
+        if url:
+            return ResourceData(
+                topic, sid, "link", mat[kind].get("title") or title,
+                raw_url=url, content_bytes=url.encode(),
+            )
+    return None
+
+
+def _announcement_title(announcement: dict) -> str:
+    """Announcements have no title: use the first line of the text."""
+    first = (announcement.get("text") or "").strip().split("\n", 1)[0].strip()
+    if not first:
+        return "Announcement"
+    return first if len(first) <= 80 else first[:79].rstrip() + "…"
+
+
 UNTAGGED_TOPIC_ID = "untagged"  # Classroom topic ids are numeric; can't collide
 UNTAGGED_TITLE = "Other materials"
+ANNOUNCEMENTS_TOPIC_ID = "announcements"
+ANNOUNCEMENTS_TITLE = "Announcements"
 
 
 def _topic_of(material: dict, known: set[str]) -> str:
