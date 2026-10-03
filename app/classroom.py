@@ -151,10 +151,9 @@ class ClassroomAdapter:
 
     def __init__(self, client: ClassroomClient):
         self.client = client
-        # course id -> [(topic source id, source id prefix, title, attachments)];
-        # built by fetch_topics so each course sync lists every collection
-        # once, not once per topic.
-        self._posts: dict[str, list[tuple[str, str, str, list[dict]]]] = {}
+        # course id -> its resources across topics; built by fetch_topics so
+        # each course sync lists every collection once, not once per topic.
+        self._resources: dict[str, list[ResourceData]] = {}
         # course id -> courseWork, listed by fetch_topics, reused by
         # fetch_assignments
         self._coursework: dict[str, list[dict]] = {}
@@ -195,8 +194,17 @@ class ClassroomAdapter:
             for a in self.client.list_announcements(course_source_id)
             if a.get("materials")
         ]
-        self._posts[course_source_id] = posts
-        used = {p[0] for p in posts if p[3]}
+        # Indexes count every attachment, so skipping one never renumbers
+        # the rest.
+        resources = [
+            r
+            for topic, prefix, title, attachments in posts
+            for i, mat in enumerate(attachments)
+            if (r := _resource(topic, f"{prefix}:{i}", title, mat)) is not None
+        ]
+        self._resources[course_source_id] = resources
+        # a synthetic topic only when something syncs into it
+        used = {r.topic_source_id for r in resources}
         for sid, title in ((UNTAGGED_TOPIC_ID, UNTAGGED_TITLE),
                            (ANNOUNCEMENTS_TOPIC_ID, ANNOUNCEMENTS_TITLE)):
             if sid in used:
@@ -206,17 +214,10 @@ class ClassroomAdapter:
     def fetch_resources(
         self, course_source_id: str, topic_source_id: str
     ) -> list[ResourceData]:
-        if course_source_id not in self._posts:
+        if course_source_id not in self._resources:
             self.fetch_topics(course_source_id)
-        out: list[ResourceData] = []
-        for topic, prefix, title, attachments in self._posts[course_source_id]:
-            if topic != topic_source_id:
-                continue
-            for i, mat in enumerate(attachments):
-                r = _resource(topic, f"{prefix}:{i}", title, mat)
-                if r is not None:
-                    out.append(r)
-        return out
+        return [r for r in self._resources[course_source_id]
+                if r.topic_source_id == topic_source_id]
 
     def fetch_assignments(self, course_source_id: str) -> list[AssignmentData]:
         work = self._coursework.get(course_source_id)
@@ -277,6 +278,13 @@ def _resource(topic: str, sid: str, title: str, mat: dict) -> ResourceData | Non
             topic, sid, "link", mat["form"].get("title") or title,
             raw_url=url, content_bytes=url.encode(),
         )
+    for kind in ("gem", "notebook"):  # Gemini Gems, NotebookLM notebooks
+        url = (mat.get(kind) or {}).get("url")
+        if url:
+            return ResourceData(
+                topic, sid, "link", mat[kind].get("title") or title,
+                raw_url=url, content_bytes=url.encode(),
+            )
     return None
 
 

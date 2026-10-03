@@ -341,3 +341,30 @@ def test_sync_stores_coursework_and_announcement_attachments(session):
                     "ann:a1:0": ANNOUNCEMENTS_TOPIC_ID}
     assert [a.source_id for a in session.exec(select(Assignment))] == ["w1"]
 
+
+
+def test_gem_and_notebook_attachments_sync_as_links():
+    service = _Service(announcements=[_announcement("a1", materials=[
+        {"gem": {"id": "g1", "title": "Tutor", "url": "https://gemini.google.com/gem/g1"}},
+        {"notebook": {"id": "n1", "url": "https://notebooklm.google.com/notebook/n1"}},
+    ])])
+    adapter = ClassroomAdapter(ClassroomClient(service))
+    adapter.fetch_topics("c1")
+    out = adapter.fetch_resources("c1", ANNOUNCEMENTS_TOPIC_ID)
+    assert [(r.source_id, r.title, r.type, r.raw_url) for r in out] == [
+        ("ann:a1:0", "Tutor", "link", "https://gemini.google.com/gem/g1"),
+        ("ann:a1:1", "Slides for today", "link",
+         "https://notebooklm.google.com/notebook/n1"),
+    ]
+
+
+def test_unsupported_attachments_add_no_synthetic_topic_or_renumber():
+    service = _Service(
+        materials=[_material("m1", materials=[
+            {"somethingNew": {}}, {"link": {"url": "https://ex.com/a"}}])],
+        announcements=[_announcement("a1", materials=[{"somethingNew": {}}])],
+    )
+    adapter = ClassroomAdapter(ClassroomClient(service))
+    assert [t.source_id for t in adapter.fetch_topics("c1")] == [UNTAGGED_TOPIC_ID]
+    [r] = adapter.fetch_resources("c1", UNTAGGED_TOPIC_ID)
+    assert r.source_id == "m1:1"  # keeps its index past the skipped attachment
