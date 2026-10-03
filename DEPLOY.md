@@ -50,7 +50,10 @@
    ```
    Signing in with Google also queues a Classroom sync for that user. Users
    who signed in before Drive access was requested must sign in once more;
-   until then their Drive files stay pending.
+   until then their Drive files stay pending. Likewise, Classroom
+   announcements need `classroom.announcements.readonly`: users who signed
+   in before it was requested keep syncing materials and coursework, and
+   pick up announcement attachments after their next sign-in.
 6. `pipeline-cron`: a second cron service, daily at 06:00 UTC — a separate
    slot from the sync, since paced LLM runs take hours and the free Gemini
    tier rate-limits hard. It extracts, chunks and writes quizzes for what
