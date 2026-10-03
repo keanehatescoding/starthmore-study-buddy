@@ -18,7 +18,9 @@ branch_labels = None
 depends_on = None
 
 
-BATCH = 1000
+# a page's distinct chunk ids go into one IN list; stay under SQLite's
+# 999-variable limit on builds older than 3.32
+BATCH = 500
 
 
 def _attempt(key: str) -> int | None:
